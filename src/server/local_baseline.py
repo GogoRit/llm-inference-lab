@@ -115,7 +115,8 @@ class LocalBaselineRunner:
 
         Args:
             prompt: Input text prompt
-            max_new_tokens: Maximum number of new tokens to generate (uses config if None)
+            max_new_tokens: Maximum number of new tokens to generate
+                (uses config if None)
 
         Returns:
             Dictionary containing device, latency_ms, and generated text
@@ -169,7 +170,8 @@ def main():
         "--max-tokens",
         type=int,
         default=None,
-        help="Maximum number of new tokens to generate (uses config default if not specified)",
+        help="Maximum number of new tokens to generate "
+        "(uses config default if not specified)",
     )
     parser.add_argument(
         "--model",

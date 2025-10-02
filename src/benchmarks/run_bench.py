@@ -10,7 +10,8 @@ Usage:
     python -m src.benchmarks.run_bench --prompt "Hello, world!" --iterations 5
 
     # HTTP server benchmarking
-    python -m src.benchmarks.run_bench --prompt "Hello, world!" --mode http --host 127.0.0.1 --port 8000
+    python -m src.benchmarks.run_bench --prompt "Hello, world!" --mode http \\
+        --host 127.0.0.1 --port 8000
 
     # Configuration-driven benchmarking
     python -m src.benchmarks.run_bench --config configs/baseline.yaml --iterations 10
@@ -19,21 +20,19 @@ Usage:
 import argparse
 import logging
 import statistics
-import time
+import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import yaml
 
 # Add src to path for imports
-import sys
-
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from server.local_baseline import LocalBaselineRunner
-from server.ping_vllm import VLLMPingClient
+from server.local_baseline import LocalBaselineRunner  # noqa: E402
+from server.ping_vllm import VLLMPingClient  # noqa: E402
 
 
 class BenchmarkRunner:
@@ -118,7 +117,8 @@ class BenchmarkRunner:
         warmup_iterations = self.config.get("warmup_iterations", 1)
 
         self.logger.info(
-            f"Starting {self.mode} benchmark: {iterations} iterations, {warmup_iterations} warmup"
+            f"Starting {self.mode} benchmark: {iterations} iterations, "
+            f"{warmup_iterations} warmup"
         )
         self.logger.info(f"Prompt: '{prompt}'")
 

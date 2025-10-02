@@ -5,7 +5,8 @@ OpenAI-compatible HTTP client for testing and benchmarking vLLM servers.
 Supports configurable endpoints, models, and request parameters.
 
 Usage:
-    python -m src.server.ping_vllm --host 127.0.0.1 --port 8000 --model llama-2-7b --prompt "Hello"
+    python -m src.server.ping_vllm --host 127.0.0.1 --port 8000 \\
+        --model llama-2-7b --prompt "Hello"
     python -m src.server.ping_vllm --config configs/vllm.yaml --prompt "Test prompt"
 """
 
@@ -14,7 +15,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import requests
 import yaml
@@ -181,7 +182,8 @@ class VLLMPingClient:
                     }
                 else:
                     self.logger.warning(
-                        f"Server returned status {response.status_code}: {response.text}"
+                        f"Server returned status {response.status_code}: "
+                        f"{response.text}"
                     )
                     if attempt < retry_attempts - 1:
                         self.logger.info(f"Retrying in {retry_delay} seconds...")
