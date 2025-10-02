@@ -83,12 +83,12 @@ def test_local_baseline_initialization():
 
         # Test that we can import the class
         assert LocalBaselineRunner is not None
-        
+
         # Test that the class has expected methods
-        assert hasattr(LocalBaselineRunner, '_select_device')
-        assert hasattr(LocalBaselineRunner, '_load_model')
-        assert hasattr(LocalBaselineRunner, 'run')
-        
+        assert hasattr(LocalBaselineRunner, "_select_device")
+        assert hasattr(LocalBaselineRunner, "_load_model")
+        assert hasattr(LocalBaselineRunner, "run")
+
         print("LocalBaselineRunner class structure validated")
 
     except Exception as e:

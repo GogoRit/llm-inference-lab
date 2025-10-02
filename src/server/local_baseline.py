@@ -47,12 +47,12 @@ class LocalBaselineRunner:
             "temperature": 0.7,
             "do_sample": True,
             "torch_dtype": "float32",
-            "device_priority": ["mps", "cuda", "cpu"]
+            "device_priority": ["mps", "cuda", "cpu"],
         }
-        
+
         if config_path and Path(config_path).exists():
             try:
-                with open(config_path, 'r') as f:
+                with open(config_path, "r") as f:
                     user_config = yaml.safe_load(f)
                 default_config.update(user_config)
                 self.logger.info(f"Loaded configuration from {config_path}")
@@ -61,13 +61,13 @@ class LocalBaselineRunner:
                 self.logger.info("Using default configuration")
         else:
             self.logger.info("Using default configuration")
-            
+
         return default_config
 
     def _select_device(self) -> str:
         """Select the best available device based on config priority."""
         device_priority = self.config.get("device_priority", ["mps", "cuda", "cpu"])
-        
+
         for device in device_priority:
             if device == "mps" and torch.backends.mps.is_available():
                 self.logger.info("Selected MPS device (Apple Silicon GPU)")
@@ -78,7 +78,7 @@ class LocalBaselineRunner:
             elif device == "cpu":
                 self.logger.info("Selected CPU device")
                 return "cpu"
-        
+
         # Fallback to CPU if nothing else works
         self.logger.warning("No preferred device available, falling back to CPU")
         return "cpu"
