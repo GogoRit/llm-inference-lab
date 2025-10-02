@@ -1,8 +1,8 @@
 """
 Local Baseline Runner for LLM Inference Lab
 
-A minimal Hugging Face Transformers runner that supports both CPU and MPS (Apple Silicon)
-for local testing and validation without requiring CUDA.
+A minimal Hugging Face Transformers runner that supports both CPU and MPS
+(Apple Silicon) for local testing and validation without requiring CUDA.
 
 Usage:
     python -m src.server.local_baseline --prompt "Hello, world!"
@@ -134,7 +134,7 @@ def main():
     result = runner.run(args.prompt, args.max_tokens)
 
     # Print results
-    print(f"\n=== Local Baseline Results ===")
+    print("\n=== Local Baseline Results ===")
     print(f"Device: {result['device']}")
     print(f"Latency: {result['latency_ms']:.2f} ms")
     print(f"Prompt: {result['prompt']}")

@@ -12,7 +12,6 @@ Scripts:
 - cleanup.py: Resource cleanup and maintenance
 """
 
-import os
 import sys
 from pathlib import Path
 
