@@ -34,7 +34,7 @@ jobs:
         run: |
           # Only run if Python files exist
           if find src/ tests/ scripts/ -name "*.py" -type f | grep -q .; then
-            black --check --diff src/ tests/ scripts/
+            black --check --diff --quiet src/ tests/ scripts/
           else
             echo "No Python files found to format"
           fi
@@ -83,7 +83,7 @@ jobs:
       - name: Install minimal dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          pip install pytest torch transformers
           
       - name: Run CPU-only tests
         run: |
@@ -108,7 +108,7 @@ jobs:
       - name: Install minimal dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          pip install pytest torch transformers
           
       - name: Run integration tests
         run: |

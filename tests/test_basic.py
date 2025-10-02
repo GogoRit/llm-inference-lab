@@ -5,9 +5,10 @@ These are placeholder tests to ensure the CI pipeline runs successfully.
 More comprehensive tests will be added as the project develops.
 """
 
-import pytest
 import sys
 from pathlib import Path
+
+import pytest
 
 # Add src to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent

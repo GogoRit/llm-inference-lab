@@ -12,10 +12,11 @@ Scripts:
 - cleanup.py: Resource cleanup and maintenance
 """
 
-# Script utilities and helpers
-import sys
 import os
+import sys
 from pathlib import Path
+
+# Script utilities and helpers
 
 # Add src to Python path for script execution
 SCRIPT_DIR = Path(__file__).parent

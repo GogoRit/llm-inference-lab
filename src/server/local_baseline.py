@@ -11,9 +11,10 @@ Usage:
 
 import argparse
 import time
+from typing import Any, Dict
+
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import Dict, Any
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class LocalBaselineRunner:

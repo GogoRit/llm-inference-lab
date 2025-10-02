@@ -5,10 +5,11 @@ Basic tests to validate the toolchain works on CPU/MPS without requiring CUDA.
 These tests ensure torch and transformers are properly installed and functional.
 """
 
-import pytest
-import torch
 import sys
 from pathlib import Path
+
+import pytest
+import torch
 
 # Add src to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -55,7 +56,7 @@ def test_tensor_operations():
 def test_transformers_import():
     """Test that transformers can be imported."""
     try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         assert AutoTokenizer is not None
         assert AutoModelForCausalLM is not None
