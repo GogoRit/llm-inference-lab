@@ -16,6 +16,5 @@ Test Categories:
 import pytest
 import torch
 
-# Skip GPU tests if CUDA is not available
-if not torch.cuda.is_available():
-    pytest.skip("CUDA not available", allow_module_level=True)
+# Note: GPU tests are marked with @pytest.mark.gpu and will be skipped
+# automatically if CUDA is not available. CPU/MPS tests should always run.

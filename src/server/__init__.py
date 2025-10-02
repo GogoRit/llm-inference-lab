@@ -13,7 +13,8 @@ Components:
 - Health checks and metrics endpoints
 """
 
-from .main import app, create_app
-from .models import InferenceRequest, InferenceResponse, HealthResponse
+# Import modules when they exist
+# from .main import app, create_app
+# from .models import InferenceRequest, InferenceResponse, HealthResponse
 
-__all__ = ["app", "create_app", "InferenceRequest", "InferenceResponse", "HealthResponse"]
+# __all__ = ["app", "create_app", "InferenceRequest", "InferenceResponse", "HealthResponse"]
