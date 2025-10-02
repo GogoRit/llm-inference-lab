@@ -110,6 +110,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# But allow requirements.txt in env/
+!env/requirements.txt
+
 # Spyder project settings
 .spyderproject
 .spyproject

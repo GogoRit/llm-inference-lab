@@ -1,0 +1,109 @@
+# LLM Inference Lab - Core Dependencies
+# Core ML and Deep Learning frameworks
+torch>=2.0.0,<3.0.0
+torchvision>=0.15.0,<1.0.0
+torchaudio>=2.0.0,<3.0.0
+
+# Transformers and model libraries
+transformers>=4.30.0,<5.0.0
+tokenizers>=0.13.0,<1.0.0
+accelerate>=0.20.0,<1.0.0
+datasets>=2.12.0,<3.0.0
+
+# High-performance inference engines
+vllm>=0.2.0,<1.0.0
+tensorrt-llm>=0.6.0,<1.0.0
+flash-attn>=2.3.0,<3.0.0
+
+# Web framework and API
+fastapi>=0.100.0,<1.0.0
+uvicorn[standard]>=0.22.0,<1.0.0
+websockets>=11.0.0,<12.0.0
+pydantic>=2.0.0,<3.0.0
+
+# Web interface
+streamlit>=1.25.0,<2.0.0
+plotly>=5.15.0,<6.0.0
+dash>=2.11.0,<3.0.0
+
+# Testing framework
+pytest>=7.4.0,<8.0.0
+pytest-asyncio>=0.21.0,<1.0.0
+pytest-cov>=4.1.0,<5.0.0
+pytest-mock>=3.11.0,<4.0.0
+
+# Development and debugging
+jupyter>=1.0.0,<2.0.0
+ipykernel>=6.25.0,<7.0.0
+notebook>=6.5.0,<7.0.0
+ipywidgets>=8.0.0,<9.0.0
+
+# Monitoring and observability
+prometheus-client>=0.17.0,<1.0.0
+grafana-api>=1.0.0,<2.0.0
+wandb>=0.15.0,<1.0.0
+tensorboard>=2.13.0,<3.0.0
+
+# Data processing and utilities
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+scipy>=1.10.0,<2.0.0
+scikit-learn>=1.3.0,<2.0.0
+
+# Configuration and environment
+python-dotenv>=1.0.0,<2.0.0
+pyyaml>=6.0.0,<7.0.0
+toml>=0.10.0,<1.0.0
+click>=8.1.0,<9.0.0
+
+# Async and concurrency
+asyncio>=3.4.3
+aiofiles>=23.1.0,<24.0.0
+aiohttp>=3.8.0,<4.0.0
+concurrent-futures>=3.1.1
+
+# Memory and performance optimization
+psutil>=5.9.0,<6.0.0
+memory-profiler>=0.60.0,<1.0.0
+line-profiler>=4.1.0,<5.0.0
+py-spy>=0.3.14,<1.0.0
+
+# CUDA and GPU utilities
+nvidia-ml-py3>=7.352.0,<8.0.0
+pynvml>=11.4.0,<12.0.0
+cupy-cuda11x>=12.0.0,<13.0.0  # Adjust CUDA version as needed
+
+# Serialization and storage
+h5py>=3.9.0,<4.0.0
+zarr>=2.16.0,<3.0.0
+lmdb>=1.4.0,<2.0.0
+redis>=4.6.0,<5.0.0
+
+# Logging and debugging
+loguru>=0.7.0,<1.0.0
+rich>=13.4.0,<14.0.0
+tqdm>=4.65.0,<5.0.0
+colorama>=0.4.6,<1.0.0
+
+# Security and authentication
+cryptography>=41.0.0,<42.0.0
+jwt>=1.3.1
+passlib[bcrypt]>=1.7.4,<2.0.0
+
+# Documentation
+sphinx>=7.0.0,<8.0.0
+sphinx-rtd-theme>=1.3.0,<2.0.0
+myst-parser>=2.0.0,<3.0.0
+
+# Code quality and formatting
+black>=23.7.0,<24.0.0
+isort>=5.12.0,<6.0.0
+flake8>=6.0.0,<7.0.0
+mypy>=1.5.0,<2.0.0
+pre-commit>=3.3.0,<4.0.0
+
+# Optional: Additional performance libraries
+# Uncomment as needed for specific optimizations
+# apex>=0.1  # NVIDIA Apex for mixed precision
+# deepspeed>=0.10.0,<1.0.0  # DeepSpeed for distributed training
+# fairscale>=0.4.0,<1.0.0  # FairScale for model parallelism
