@@ -13,8 +13,13 @@ Components:
 - Integration with main inference pipeline
 """
 
-from .draft_model import DraftModel
-from .speculative_decoder import SpeculativeDecoder
-from .verification import TokenVerifier
+# Import modules when they exist
+# from .draft_model import DraftModel
+# from .speculative_decoder import SpeculativeDecoder
+# from .verification import TokenVerifier
 
-__all__ = ["DraftModel", "SpeculativeDecoder", "TokenVerifier"]
+# __all__ = [
+#     "DraftModel",
+#     "SpeculativeDecoder",
+#     "TokenVerifier",
+# ]

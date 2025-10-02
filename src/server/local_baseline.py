@@ -18,11 +18,11 @@ from typing import Dict, Any
 
 class LocalBaselineRunner:
     """Minimal HF Transformers runner with CPU/MPS support."""
-    
+
     def __init__(self, model_name: str = "facebook/opt-125m"):
         """
         Initialize the baseline runner.
-        
+
         Args:
             model_name: Hugging Face model identifier
         """
@@ -31,7 +31,7 @@ class LocalBaselineRunner:
         self.tokenizer = None
         self.model = None
         self._load_model()
-    
+
     def _select_device(self) -> str:
         """Select the best available device (MPS > CPU)."""
         if torch.backends.mps.is_available():
@@ -40,46 +40,46 @@ class LocalBaselineRunner:
             return "cuda"
         else:
             return "cpu"
-    
+
     def _load_model(self):
         """Load the tokenizer and model."""
         print(f"Loading {self.model_name} on {self.device}...")
-        
+
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        
+
         # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=torch.float32,  # Use float32 for better compatibility
-            device_map="auto" if self.device == "cuda" else None
+            device_map="auto" if self.device == "cuda" else None,
         )
-        
+
         # Move to device if not using device_map
         if self.device != "cuda":
             self.model = self.model.to(self.device)
-        
+
         print(f"Model loaded successfully on {self.device}")
-    
+
     def run(self, prompt: str, max_new_tokens: int = 48) -> Dict[str, Any]:
         """
         Run inference on the given prompt.
-        
+
         Args:
             prompt: Input text prompt
             max_new_tokens: Maximum number of new tokens to generate
-            
+
         Returns:
             Dictionary containing device, latency_ms, and generated text
         """
         start_time = time.time()
-        
+
         # Tokenize input
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
+
         # Generate
         with torch.no_grad():
             outputs = self.model.generate(
@@ -87,21 +87,21 @@ class LocalBaselineRunner:
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=0.7,
-                pad_token_id=self.tokenizer.eos_token_id
+                pad_token_id=self.tokenizer.eos_token_id,
             )
-        
+
         # Decode output
         generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
+
         # Calculate latency
         latency_ms = (time.time() - start_time) * 1000
-        
+
         return {
             "device": self.device,
             "latency_ms": latency_ms,
             "text": generated_text,
             "prompt": prompt,
-            "max_new_tokens": max_new_tokens
+            "max_new_tokens": max_new_tokens,
         }
 
 
@@ -109,32 +109,29 @@ def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Local HF Baseline Runner")
     parser.add_argument(
-        "--prompt", 
-        type=str, 
-        required=True,
-        help="Input prompt for generation"
+        "--prompt", type=str, required=True, help="Input prompt for generation"
     )
     parser.add_argument(
-        "--max-tokens", 
-        type=int, 
+        "--max-tokens",
+        type=int,
         default=48,
-        help="Maximum number of new tokens to generate (default: 48)"
+        help="Maximum number of new tokens to generate (default: 48)",
     )
     parser.add_argument(
-        "--model", 
-        type=str, 
+        "--model",
+        type=str,
         default="facebook/opt-125m",
-        help="Hugging Face model name (default: facebook/opt-125m)"
+        help="Hugging Face model name (default: facebook/opt-125m)",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Initialize runner
     runner = LocalBaselineRunner(model_name=args.model)
-    
+
     # Run inference
     result = runner.run(args.prompt, args.max_tokens)
-    
+
     # Print results
     print(f"\n=== Local Baseline Results ===")
     print(f"Device: {result['device']}")

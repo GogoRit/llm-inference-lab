@@ -29,6 +29,7 @@ def test_src_modules_importable():
     """Test that src modules can be imported."""
     try:
         import src
+
         assert src.__version__ == "0.1.0"
     except ImportError as e:
         pytest.fail(f"Failed to import src module: {e}")
@@ -46,6 +47,7 @@ def test_gpu_availability():
     """Test GPU availability (marked as GPU test)."""
     try:
         import torch
+
         if torch.cuda.is_available():
             assert torch.cuda.device_count() > 0
         else:
