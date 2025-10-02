@@ -11,7 +11,7 @@ Usage:
 
 import argparse
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -29,8 +29,8 @@ class LocalBaselineRunner:
         """
         self.model_name = model_name
         self.device = self._select_device()
-        self.tokenizer = None
-        self.model = None
+        self.tokenizer: Any = None
+        self.model: Any = None
         self._load_model()
 
     def _select_device(self) -> str:
@@ -76,6 +76,10 @@ class LocalBaselineRunner:
             Dictionary containing device, latency_ms, and generated text
         """
         start_time = time.time()
+
+        # Ensure model and tokenizer are loaded
+        assert self.tokenizer is not None, "Tokenizer not loaded"
+        assert self.model is not None, "Model not loaded"
 
         # Tokenize input
         inputs = self.tokenizer(prompt, return_tensors="pt")
