@@ -1,0 +1,20 @@
+# vLLM Server Configuration for LLM Inference Lab
+# This file contains default parameters for connecting to vLLM servers
+
+# Server connection
+host: "127.0.0.1"
+port: 8000
+
+# Model configuration
+model: "llama-2-7b"
+max_tokens: 50
+temperature: 0.7
+
+# Request settings
+timeout: 30
+retry_attempts: 3
+retry_delay: 1.0
+
+# Benchmark settings
+iterations: 5
+warmup_iterations: 1

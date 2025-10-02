@@ -2,10 +2,17 @@
 Benchmark Runner for LLM Inference Lab
 
 Runs multiple inference iterations and measures performance metrics including
-latency, throughput, and statistical analysis.
+latency, throughput, and statistical analysis. Supports both local baseline
+and HTTP vLLM server endpoints.
 
 Usage:
+    # Local baseline benchmarking
     python -m src.benchmarks.run_bench --prompt "Hello, world!" --iterations 5
+    
+    # HTTP server benchmarking
+    python -m src.benchmarks.run_bench --prompt "Hello, world!" --mode http --host 127.0.0.1 --port 8000
+    
+    # Configuration-driven benchmarking
     python -m src.benchmarks.run_bench --config configs/baseline.yaml --iterations 10
 """
 
@@ -25,24 +32,42 @@ SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from server.local_baseline import LocalBaselineRunner
+from server.ping_vllm import VLLMPingClient
 
 
 class BenchmarkRunner:
-    """Runs performance benchmarks on the local baseline runner."""
+    """Runs performance benchmarks on local baseline or HTTP vLLM servers."""
 
-    def __init__(self, config_path: str = None):
+    def __init__(self, config_path: str = None, mode: str = "local", 
+                 host: str = None, port: int = None):
         """
         Initialize the benchmark runner.
 
         Args:
             config_path: Path to YAML configuration file
+            mode: Benchmark mode ("local" or "http")
+            host: Server hostname (for HTTP mode)
+            port: Server port (for HTTP mode)
         """
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config(config_path)
-        self.runner = LocalBaselineRunner(
-            model_name=self.config.get("model", "facebook/opt-125m"),
-            config_path=config_path
-        )
+        self.mode = mode
+        
+        if mode == "local":
+            self.runner = LocalBaselineRunner(
+                model_name=self.config.get("model", "facebook/opt-125m"),
+                config_path=config_path
+            )
+            self.runner_name = "LocalBaselineRunner"
+        elif mode == "http":
+            self.runner = VLLMPingClient(
+                host=host or self.config.get("host", "127.0.0.1"),
+                port=port or self.config.get("port", 8000),
+                config_path=config_path
+            )
+            self.runner_name = "VLLMPingClient"
+        else:
+            raise ValueError(f"Invalid mode: {mode}. Must be 'local' or 'http'")
 
     def _load_config(self, config_path: str = None) -> Dict[str, Any]:
         """Load benchmark configuration."""
@@ -86,15 +111,28 @@ class BenchmarkRunner:
         
         warmup_iterations = self.config.get("warmup_iterations", 1)
         
-        self.logger.info(f"Starting benchmark: {iterations} iterations, {warmup_iterations} warmup")
+        self.logger.info(f"Starting {self.mode} benchmark: {iterations} iterations, {warmup_iterations} warmup")
         self.logger.info(f"Prompt: '{prompt}'")
-        self.logger.info(f"Device: {self.runner.device}")
+        
+        if self.mode == "local":
+            self.logger.info(f"Device: {self.runner.device}")
+        else:
+            self.logger.info(f"Server: {self.runner.base_url}")
+        
+        # Test connectivity for HTTP mode
+        if self.mode == "http":
+            if not self.runner.ping():
+                self.logger.error("Server is not reachable. Cannot run benchmark.")
+                return {"error": "Server not reachable"}
         
         # Warmup runs
         if warmup_iterations > 0:
             self.logger.info(f"Running {warmup_iterations} warmup iterations...")
             for i in range(warmup_iterations):
-                self.runner.run(prompt, self.config.get("max_new_tokens", 48))
+                if self.mode == "local":
+                    self.runner.run(prompt, self.config.get("max_new_tokens", 48))
+                else:
+                    self.runner.generate(prompt, self.config.get("max_tokens", 50))
         
         # Benchmark runs
         latencies = []
@@ -103,12 +141,18 @@ class BenchmarkRunner:
         
         self.logger.info("Starting benchmark iterations...")
         for i in range(iterations):
-            start_time = time.time()
-            result = self.runner.run(prompt, self.config.get("max_new_tokens", 48))
-            end_time = time.time()
+            if self.mode == "local":
+                result = self.runner.run(prompt, self.config.get("max_new_tokens", 48))
+                latency_ms = result["latency_ms"]
+                tokens_generated = result["max_new_tokens"]
+            else:
+                result = self.runner.generate(prompt, self.config.get("max_tokens", 50))
+                if not result["success"]:
+                    self.logger.error(f"Iteration {i+1} failed: {result['error']}")
+                    continue
+                latency_ms = result["latency_ms"]
+                tokens_generated = result["tokens_generated"]
             
-            latency_ms = result["latency_ms"]
-            tokens_generated = result["max_new_tokens"]
             tokens_per_sec = tokens_generated / (latency_ms / 1000.0)
             
             latencies.append(latency_ms)
@@ -119,11 +163,11 @@ class BenchmarkRunner:
         
         # Calculate statistics
         stats = {
+            "mode": self.mode,
+            "runner_name": self.runner_name,
             "iterations": iterations,
             "warmup_iterations": warmup_iterations,
             "prompt": prompt,
-            "device": self.runner.device,
-            "model": self.runner.model_name,
             "latency_ms": {
                 "mean": statistics.mean(latencies),
                 "median": statistics.median(latencies),
@@ -143,13 +187,27 @@ class BenchmarkRunner:
             "raw_results": results
         }
         
+        # Add mode-specific information
+        if self.mode == "local":
+            stats["device"] = self.runner.device
+            stats["model"] = self.runner.model_name
+        else:
+            stats["server"] = self.runner.base_url
+            stats["model"] = self.config.get("model", "unknown")
+        
         return stats
 
     def print_summary(self, stats: Dict[str, Any]):
         """Print a formatted summary of benchmark results."""
         self.logger.info("=== Benchmark Summary ===")
+        self.logger.info(f"Mode: {stats['mode']} ({stats['runner_name']})")
         self.logger.info(f"Model: {stats['model']}")
-        self.logger.info(f"Device: {stats['device']}")
+        
+        if stats['mode'] == "local":
+            self.logger.info(f"Device: {stats['device']}")
+        else:
+            self.logger.info(f"Server: {stats['server']}")
+            
         self.logger.info(f"Iterations: {stats['iterations']} (warmup: {stats['warmup_iterations']})")
         self.logger.info(f"Prompt: '{stats['prompt']}'")
         
@@ -184,6 +242,25 @@ def main():
         help="Number of benchmark iterations (uses config default if not specified)"
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["local", "http"],
+        default="local",
+        help="Benchmark mode: local baseline or HTTP server"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Server hostname (for HTTP mode)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Server port (for HTTP mode)"
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default=None,
@@ -205,9 +282,18 @@ def main():
     )
     
     # Run benchmark
-    benchmark = BenchmarkRunner(config_path=args.config)
+    benchmark = BenchmarkRunner(
+        config_path=args.config,
+        mode=args.mode,
+        host=args.host,
+        port=args.port
+    )
     stats = benchmark.run_benchmark(args.prompt, args.iterations)
-    benchmark.print_summary(stats)
+    
+    if "error" in stats:
+        benchmark.logger.error(f"Benchmark failed: {stats['error']}")
+    else:
+        benchmark.print_summary(stats)
 
 
 if __name__ == "__main__":
