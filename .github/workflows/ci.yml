@@ -57,6 +57,10 @@ jobs:
             echo "No Python files found to lint"
           fi
         
+      - name: Install type stubs
+        run: |
+          pip install types-requests types-PyYAML
+          
       - name: Run MyPy (type checking)
         run: |
           # Only run if Python files exist
