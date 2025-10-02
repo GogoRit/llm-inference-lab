@@ -50,35 +50,53 @@ export PYTHONPATH="${PYTHONPATH}:$(pwd)/src"
 ### Quick Start
 
 ```bash
-# Start the inference server
-python -m src.server.main
+# Basic inference with default settings
+python -m src.server.local_baseline --prompt "Hello, world!"
 
-# Run benchmarks
-python -m src.benchmarks.run_benchmark
+# Inference with custom parameters
+python -m src.server.local_baseline --prompt "The future of AI is" --max-tokens 100 --verbose
 
-# Launch Streamlit interface
-streamlit run src/server/streamlit_app.py
+# Run performance benchmark
+python -m src.benchmarks.run_bench --prompt "Hello, world!" --iterations 5
+
+# Use custom configuration
+python -m src.server.local_baseline --prompt "Test" --config configs/baseline.yaml
 ```
 
-### API Usage
+### Configuration
+
+The system supports YAML configuration files for easy parameter management:
+
+```yaml
+# configs/baseline.yaml
+model: "facebook/opt-125m"
+max_new_tokens: 48
+temperature: 0.7
+do_sample: true
+device_priority: ["mps", "cuda", "cpu"]
+```
+
+### Programmatic Usage
 
 ```python
-from src.server.client import InferenceClient
+from src.server.local_baseline import LocalBaselineRunner
+from src.benchmarks.run_bench import BenchmarkRunner
 
-client = InferenceClient("http://localhost:8000")
-response = client.generate("Hello, world!", max_tokens=100)
-print(response.text)
+# Basic inference
+runner = LocalBaselineRunner(config_path="configs/baseline.yaml")
+result = runner.run("Hello, world!", max_new_tokens=50)
+print(f"Generated: {result['text']}")
+print(f"Latency: {result['latency_ms']:.2f} ms")
+
+# Performance benchmarking
+benchmark = BenchmarkRunner(config_path="configs/baseline.yaml")
+stats = benchmark.run_benchmark("Hello, world!", iterations=10)
+benchmark.print_summary(stats)
 ```
 
-### Custom Kernel Development
+### Development Notes
 
-```python
-from src.kernels import CustomKernel
-
-# Load and compile custom CUDA kernel
-kernel = CustomKernel("attention_kernel.cu")
-result = kernel.execute(input_tensor)
-```
+**Local Development**: This project is designed for local development on CPU/MPS (Apple Silicon) systems. Cloud GPUs (A100/H100) will be used later for final benchmarking and paper-quality results.
 
 ## Project Structure
 
@@ -97,31 +115,28 @@ llm-inference-lab/
 └── env/                   # Environment configuration
 ```
 
-## Roadmap
+## Development Roadmap
 
-### Phase 1: Core Infrastructure (Q1 2025)
-- [ ] Basic inference server with FastAPI
-- [ ] Request batching and scheduling
-- [ ] Basic benchmarking framework
-- [ ] Streamlit web interface
+| Phase | Feature | Status | Description |
+|-------|---------|--------|-------------|
+| 1A | Baseline runner | Complete | HuggingFace OPT-125M with CPU/MPS support |
+| 1B | Benchmark client | Next | Performance measurement and statistical analysis |
+| 1C | CI/CD sanity | Planned | Automated testing and code quality checks |
+| 2 | Speculative decoding | Future | Medusa/EAGLE implementation for faster inference |
+| 3 | Quantization | Future | BitsAndBytes 4-bit/8-bit quantization experiments |
+| 4 | Multi-GPU scaling | Future | Distributed inference and load balancing |
+| 5 | Cloud deployment | Future | A100/H100 benchmarking and results collection |
 
-### Phase 2: Advanced Optimizations (Q2 2025)
-- [ ] Speculative decoding implementation
-- [ ] Custom CUDA kernels for attention
-- [ ] Memory optimization techniques
-- [ ] Multi-GPU support
+### Current Focus
+- **Phase 1A**: Complete - Local baseline runner with logging and configuration
+- **Phase 1B**: In Progress - Benchmark harness for performance measurement
+- **Phase 1C**: Planned - CI/CD pipeline optimization
 
-### Phase 3: Production Features (Q3 2025)
-- [ ] Load balancing and scaling
-- [ ] Monitoring and observability
-- [ ] Docker containerization
-- [ ] Kubernetes deployment
-
-### Phase 4: Advanced Features (Q4 2025)
-- [ ] Dynamic batching optimization
-- [ ] Model quantization support
-- [ ] Distributed inference
-- [ ] Advanced profiling tools
+### Future Phases
+- **Phase 2**: Speculative decoding research and implementation
+- **Phase 3**: Quantization techniques and memory optimization
+- **Phase 4**: Multi-GPU scaling and distributed inference
+- **Phase 5**: Cloud deployment for final benchmarking
 
 ## Contributing
 

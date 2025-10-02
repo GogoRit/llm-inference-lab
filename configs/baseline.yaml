@@ -1,0 +1,20 @@
+# Baseline Configuration for LLM Inference Lab
+# This file contains default parameters for the local baseline runner
+
+# Model configuration
+model: "facebook/opt-125m"
+torch_dtype: "float32"
+
+# Generation parameters
+max_new_tokens: 48
+temperature: 0.7
+do_sample: true
+
+# Device priority (first available will be used)
+device_priority:
+  - "mps"    # Apple Silicon GPU (preferred for Mac)
+  - "cuda"   # NVIDIA GPU
+  - "cpu"    # CPU fallback
+
+# Logging configuration
+log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
