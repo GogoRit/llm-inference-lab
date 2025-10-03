@@ -108,7 +108,7 @@ class DraftModel:
                 )
 
                 # Extract generated token IDs (excluding input)
-                draft_token_ids = outputs.sequences[:, input_ids.shape[1]:]
+                draft_token_ids = outputs.sequences[:, input_ids.shape[1] :]
 
                 # Extract logits for the generated tokens
                 if outputs.scores:

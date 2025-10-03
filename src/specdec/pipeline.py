@@ -309,7 +309,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             step = 0
 
             self.logger.info(
-                f"Starting speculative decoding: prompt=\"{prompt[:50]}...\", "
+                f'Starting speculative decoding: prompt="{prompt[:50]}...", '
                 f"max_tokens={max_tokens}"
             )
 

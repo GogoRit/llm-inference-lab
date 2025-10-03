@@ -111,7 +111,7 @@ class Verifier:
                 )
 
                 # Extract base model's generated tokens (excluding input)
-                base_tokens = base_outputs.sequences[:, input_ids.shape[1]:]
+                base_tokens = base_outputs.sequences[:, input_ids.shape[1] :]
 
                 # Find the longest matching prefix
                 accepted_len = self._find_accepted_length(proposed_tokens, base_tokens)
@@ -200,7 +200,7 @@ class Verifier:
                 )
 
                 # Extract the generated token (excluding input)
-                fallback_token = outputs.sequences[:, input_ids.shape[1]:]
+                fallback_token = outputs.sequences[:, input_ids.shape[1] :]
                 generation_time_ms = (time.time() - start_time) * 1000
 
                 return {
