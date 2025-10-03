@@ -108,7 +108,7 @@ class DraftModel:
                 )
 
                 # Extract generated token IDs (excluding input)
-                draft_token_ids = outputs.sequences[:, input_ids.shape[1] :]
+                draft_token_ids = outputs.sequences[:, input_ids.shape[1]:]
 
                 # Extract logits for the generated tokens
                 if outputs.scores:
@@ -163,8 +163,9 @@ class DraftModel:
                 f"draft={draft_info}, base={base_tokenizer_info}"
             )
             self.logger.warning(
-                "Different tokenizer families detected. This may reduce acceptance rates. "
-                "Both tokenizers will be used explicitly for proposal and verification."
+                "Different tokenizer families detected. This may reduce "
+                "acceptance rates. Both tokenizers will be used explicitly for "
+                "proposal and verification."
             )
 
         return compatible

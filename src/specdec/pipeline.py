@@ -34,7 +34,7 @@ class SpeculativePipeline(SpeculativeDecoder):
         max_draft: int = 4,
         device: str = "auto",
         seed: Optional[int] = None,
-        implementation: str = "fake",
+        implementation: Optional[str] = None,
         force_device: Optional[str] = None,
     ):
         """
@@ -75,7 +75,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             self.config["seed"] = seed
 
         self.max_draft = self.config["max_draft"]
-        self.device = self.config["device"]
+        self.device = self._select_device(self.config["device"])
         self.implementation = self.config.get("implementation", "fake")
         self.force_device = self.config.get("force_device")
 
@@ -192,6 +192,17 @@ class SpeculativePipeline(SpeculativeDecoder):
         random.seed(seed)
         self.logger.info(f"Set random seed to {seed}")
 
+    def _select_device(self, device: str) -> str:
+        """Select the best available device."""
+        if device == "auto":
+            if torch.backends.mps.is_available():
+                return "mps"
+            elif torch.cuda.is_available():
+                return "cuda"
+            else:
+                return "cpu"
+        return device
+
     def _check_compatibility(self) -> None:
         """Check tokenizer compatibility between draft and base models."""
         base_info = self.base_lm.get_tokenizer_info()
@@ -210,7 +221,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                 f"base={base_info}, draft={draft_info}"
             )
             self.logger.warning(
-                "Different tokenizer families detected. This may reduce acceptance rates."
+                "Different tokenizer families detected. This may reduce "
+                "acceptance rates."
             )
 
     def _find_accepted_length(
@@ -297,7 +309,8 @@ class SpeculativePipeline(SpeculativeDecoder):
             step = 0
 
             self.logger.info(
-                f"Starting speculative decoding: prompt='{prompt[:50]}...', max_tokens={max_tokens}"
+                f"Starting speculative decoding: prompt=\"{prompt[:50]}...\", "
+                f"max_tokens={max_tokens}"
             )
 
             while (
@@ -340,43 +353,63 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Step 3: Handle results
                 if accepted_len > 0:
-                    # Accept the proposed tokens
+                    # Accept the proposed tokens (but respect max_tokens limit)
                     if accepted_tokens.numel() > 0:
-                        generated_tokens.extend(accepted_tokens[0].cpu().tolist())
-                        current_input = torch.cat(
-                            [current_input, accepted_tokens], dim=1
-                        )
+                        # Calculate how many tokens we can still accept
+                        remaining_tokens = max_tokens - len(generated_tokens)
+                        if remaining_tokens > 0:
+                            # Only accept up to the remaining limit
+                            tokens_to_accept = min(
+                                accepted_tokens.shape[1], remaining_tokens
+                            )
+                            accepted_tokens_limited = accepted_tokens[
+                                :, :tokens_to_accept
+                            ]
+                            generated_tokens.extend(
+                                accepted_tokens_limited[0].cpu().tolist()
+                            )
+                            current_input = torch.cat(
+                                [current_input, accepted_tokens_limited], dim=1
+                            )
 
                     self.logger.info(
-                        f"Step {step}: accepted {accepted_len}/{draft_tokens.shape[1]} tokens, "
+                        f"Step {step}: accepted {accepted_len}/"
+                        f"{draft_tokens.shape[1]} tokens, "
                         f"total: {len(generated_tokens)}/{max_tokens}"
                     )
                 else:
                     # Fallback: generate one token with base model
-                    fallback_tokens, _ = self.base_lm.generate_tokens(
-                        current_input,
-                        max_new_tokens=1,
-                        temperature=temperature,
-                        do_sample=do_sample,
-                        **kwargs,
-                    )
-
-                    if fallback_tokens.numel() > 0:
-                        generated_tokens.extend(fallback_tokens[0].cpu().tolist())
-                        current_input = torch.cat(
-                            [current_input, fallback_tokens], dim=1
+                    # (if we haven't reached max_tokens)
+                    remaining_tokens = max_tokens - len(generated_tokens)
+                    if remaining_tokens > 0:
+                        fallback_tokens, _ = self.base_lm.generate_tokens(
+                            current_input,
+                            max_new_tokens=1,
+                            temperature=temperature,
+                            do_sample=do_sample,
+                            **kwargs,
                         )
+
+                        if fallback_tokens.numel() > 0:
+                            generated_tokens.extend(fallback_tokens[0].cpu().tolist())
+                            current_input = torch.cat(
+                                [current_input, fallback_tokens], dim=1
+                            )
 
                     self.metrics["total_generation_time_ms"] += (
                         time.time() - step_start
                     ) * 1000
 
                     self.logger.info(
-                        f"Step {step}: fallback generated 1 token, total: {len(generated_tokens)}/{max_tokens}"
+                        f"Step {step}: fallback generated 1 token, "
+                        f"total: {len(generated_tokens)}/{max_tokens}"
                     )
 
                 # Check for early stopping
                 if len(generated_tokens) >= max_tokens:
+                    self.logger.debug(
+                        f"Early stopping: {len(generated_tokens)} >= {max_tokens}"
+                    )
                     break
 
                 # Check for EOS token
@@ -437,8 +470,10 @@ class SpeculativePipeline(SpeculativeDecoder):
             }
 
             self.logger.info(
-                f"Speculative decoding completed: {len(generated_tokens)} tokens in {total_time_ms:.2f}ms "
-                f"({tokens_per_sec:.2f} tokens/sec, acceptance_rate={acceptance_rate:.3f})"
+                f"Speculative decoding completed: {len(generated_tokens)} tokens "
+                f"in {total_time_ms:.2f}ms "
+                f"({tokens_per_sec:.2f} tokens/sec, "
+                f"acceptance_rate={acceptance_rate:.3f})"
             )
 
             # Cleanup MPS cache if available

@@ -5,8 +5,10 @@ Command-line interface for running speculative decoding with JSON output.
 Supports configuration files and various generation parameters.
 
 Usage:
-    python -m src.specdec.run_specdec --prompt "Explain KV cache simply." --max-tokens 64 --verbose
-    python -m src.specdec.run_specdec --config configs/specdec.yaml --prompt "Test" --seed 42
+    python -m src.specdec.run_specdec --prompt "Explain KV cache simply." \\
+        --max-tokens 64 --verbose
+    python -m src.specdec.run_specdec --config configs/specdec.yaml \\
+        --prompt "Test" --seed 42
 """
 
 import argparse
@@ -42,9 +44,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m src.specdec.run_specdec --prompt "Hello world" --max-tokens 32
-  python -m src.specdec.run_specdec --config configs/specdec.yaml --prompt "Test" --verbose
-  python -m src.specdec.run_specdec --prompt "Explain AI" --max-draft 8 --temperature 0.8
+  python -m src.specdec.run_specdec --prompt "Hello world" \\
+      --max-tokens 32
+  python -m src.specdec.run_specdec --prompt "Hello world" \\
+      --max-tokens 32
+  python -m src.specdec.run_specdec --config configs/specdec.yaml \\
+      --prompt "Test" --verbose
         """,
     )
 

@@ -230,7 +230,7 @@ class TestSpeculativePipelineHF:
         if config_path.exists():
             pipeline = SpeculativePipeline(config_path=str(config_path))
             assert pipeline.implementation == "hf"
-            assert pipeline.config["base_model"] == "gpt2"
+            assert pipeline.config["base_model"] == "sshleifer/tiny-gpt2"
 
             # Test generation works
             result = pipeline.generate("Test", max_tokens=4)

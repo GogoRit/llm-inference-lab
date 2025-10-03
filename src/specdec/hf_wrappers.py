@@ -127,7 +127,7 @@ class HFWrapper(LanguageModel):
                 )
 
                 # Extract generated token IDs (excluding input)
-                generated_ids = outputs.sequences[:, input_ids.shape[1] :]
+                generated_ids = outputs.sequences[:, input_ids.shape[1]:]
 
                 # Extract logits for the generated tokens
                 if outputs.scores:
