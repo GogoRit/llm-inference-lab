@@ -166,6 +166,7 @@ class FakeLMWithAcceptance(FakeLM):
         """
         super().__init__(model_name, vocab_size, device, seed)
         self._acceptance_rate = acceptance_rate
+        self._call_count = 0
         if seed is not None:
             random.seed(seed)
         self.logger.info(
@@ -189,7 +190,14 @@ class FakeLMWithAcceptance(FakeLM):
         # Simulate acceptance by potentially truncating the sequence
         # Use deterministic random based on input for reproducibility
         input_hash = hash(tuple(input_ids[0].tolist()))
-        random.seed(input_hash + self._seed if self._seed is not None else input_hash)
+        # Add call count to create variation between calls (for testing acceptance rate)
+        self._call_count += 1
+        random_seed = (
+            input_hash
+            + (self._seed if self._seed is not None else 0)
+            + self._call_count
+        )
+        random.seed(random_seed)
         if random.random() < self._acceptance_rate:
             # Accept some tokens (truncate randomly)
             accept_count = random.randint(1, max_new_tokens)

@@ -40,8 +40,8 @@ class TestSpeculativePipeline:
         assert pipeline.max_draft == 4
         assert pipeline.device == "cpu"
         assert pipeline.config["seed"] == 42
-        assert pipeline.draft_model is not None
-        assert pipeline.verifier is not None
+        assert pipeline.draft_lm is not None
+        assert pipeline.base_lm is not None
 
     def test_generate_basic(self, pipeline):
         """Test basic text generation."""
@@ -144,8 +144,8 @@ class TestSpeculativePipeline:
         # This test verifies that the pipeline handles tokenizer differences
         # The distilgpt2 and opt-125m tokenizers are different, so we should
         # see a warning about compatibility
-        assert pipeline.draft_model is not None
-        assert pipeline.verifier is not None
+        assert pipeline.draft_lm is not None
+        assert pipeline.base_lm is not None
 
         # The compatibility check should have been done during initialization
         # We can't easily test the warning without mocking, but we can verify

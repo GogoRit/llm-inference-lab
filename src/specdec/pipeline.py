@@ -163,7 +163,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             return create_fake_lm(
                 model_name=f"fake-draft-{self.config['draft_model']}",
                 seed=self.config.get("seed"),
-                acceptance_rate=0.7,  # Simulate realistic acceptance rate
+                # Don't use acceptance rate for deterministic behavior
             )
         elif self.implementation == "hf":
             # Use tiny models for HF implementation with shared tokenizer
