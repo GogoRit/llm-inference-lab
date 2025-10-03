@@ -1,0 +1,27 @@
+# Speculative Decoding Configuration for Hugging Face Models
+# Uses tiny models for memory safety
+
+# Model configuration
+base_model: sshleifer/tiny-gpt2  # Tiny model for memory safety
+draft_model: sshleifer/tiny-gpt2  # Same as base for compatibility
+max_draft: 2
+implementation: hf  # Use Hugging Face models
+
+# Generation parameters
+temperature: 0.3
+do_sample: false
+max_new_tokens: 24  # Smaller for testing
+top_p: 0.9
+top_k: 50
+repetition_penalty: 1.0
+
+# Device and memory configuration
+device: cpu  # Force CPU for stability
+max_memory_mb: 500  # Memory limit for HF models
+
+# Reproducibility
+seed: 1234
+
+# Logging configuration
+log_level: INFO
+verbose: false

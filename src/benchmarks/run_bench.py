@@ -33,6 +33,7 @@ sys.path.insert(0, str(SRC_DIR))
 
 from server.local_baseline import LocalBaselineRunner  # noqa: E402
 from server.ping_vllm import VLLMPingClient  # noqa: E402
+from specdec.pipeline import SpeculativePipeline  # noqa: E402
 
 
 class BenchmarkRunner:
@@ -44,19 +45,22 @@ class BenchmarkRunner:
         mode: str = "local",
         host: str = None,
         port: int = None,
+        compare_baseline: bool = False,
     ):
         """
         Initialize the benchmark runner.
 
         Args:
             config_path: Path to YAML configuration file
-            mode: Benchmark mode ("local" or "http")
+            mode: Benchmark mode ("local", "http", or "specdec")
             host: Server hostname (for HTTP mode)
             port: Server port (for HTTP mode)
+            compare_baseline: Whether to run baseline comparison (for specdec mode)
         """
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config(config_path)
         self.mode = mode
+        self.compare_baseline = compare_baseline
 
         if mode == "local":
             self.runner = LocalBaselineRunner(
@@ -71,8 +75,28 @@ class BenchmarkRunner:
                 config_path=config_path,
             )
             self.runner_name = "VLLMPingClient"
+        elif mode == "specdec":
+            self.runner = SpeculativePipeline(
+                config_path=config_path,
+                base_model=self.config.get("base_model"),
+                draft_model=self.config.get("draft_model"),
+                max_draft=self.config.get("max_draft"),
+                device=self.config.get("device"),
+                seed=self.config.get("seed"),
+            )
+            self.runner_name = "SpeculativePipeline"
+
+            # Initialize baseline runner for comparison if requested
+            if compare_baseline:
+                self.baseline_runner = LocalBaselineRunner(
+                    model_name=self.config.get("base_model", "facebook/opt-125m"),
+                    config_path=config_path,
+                )
+                self.baseline_runner_name = "LocalBaselineRunner"
         else:
-            raise ValueError(f"Invalid mode: {mode}. Must be 'local' or 'http'")
+            raise ValueError(
+                f"Invalid mode: {mode}. Must be 'local', 'http', or 'specdec'"
+            )
 
     def _load_config(self, config_path: str = None) -> Dict[str, Any]:
         """Load benchmark configuration."""
@@ -145,6 +169,7 @@ class BenchmarkRunner:
         # Benchmark runs
         latencies = []
         tokens_per_second = []
+        acceptance_rates = []
         results = []
 
         self.logger.info("Starting benchmark iterations...")
@@ -153,22 +178,41 @@ class BenchmarkRunner:
                 result = self.runner.run(prompt, self.config.get("max_new_tokens", 48))
                 latency_ms = result["latency_ms"]
                 tokens_generated = result["max_new_tokens"]
-            else:
+                acceptance_rate = None  # Not applicable for baseline
+            elif self.mode == "http":
                 result = self.runner.generate(prompt, self.config.get("max_tokens", 50))
                 if not result["success"]:
                     self.logger.error(f"Iteration {i+1} failed: {result['error']}")
                     continue
                 latency_ms = result["latency_ms"]
                 tokens_generated = result["tokens_generated"]
+                acceptance_rate = None  # Not applicable for HTTP
+            elif self.mode == "specdec":
+                result = self.runner.generate(
+                    prompt,
+                    max_tokens=self.config.get("max_new_tokens", 48),
+                    temperature=self.config.get("temperature"),
+                    do_sample=self.config.get("do_sample"),
+                )
+                latency_ms = result["latency_ms"]
+                tokens_generated = len(result["generated_tokens"])
+                acceptance_rate = result["acceptance_rate"]
 
             tokens_per_sec = tokens_generated / (latency_ms / 1000.0)
 
             latencies.append(latency_ms)
             tokens_per_second.append(tokens_per_sec)
+            if acceptance_rate is not None:
+                acceptance_rates.append(acceptance_rate)
             results.append(result)
 
             self.logger.debug(
                 f"Iteration {i+1}: {latency_ms:.2f}ms, {tokens_per_sec:.2f} tokens/sec"
+                + (
+                    f", acceptance_rate={acceptance_rate:.3f}"
+                    if acceptance_rate is not None
+                    else ""
+                )
             )
 
         # Calculate statistics
@@ -201,26 +245,99 @@ class BenchmarkRunner:
             "raw_results": results,
         }
 
+        # Add acceptance rate statistics for speculative decoding
+        if acceptance_rates:
+            stats["acceptance_rate"] = {
+                "mean": statistics.mean(acceptance_rates),
+                "median": statistics.median(acceptance_rates),
+                "std": (
+                    statistics.stdev(acceptance_rates)
+                    if len(acceptance_rates) > 1
+                    else 0.0
+                ),
+                "min": min(acceptance_rates),
+                "max": max(acceptance_rates),
+                "raw": acceptance_rates,
+            }
+
         # Add mode-specific information
         if self.mode == "local":
             stats["device"] = self.runner.device
             stats["model"] = self.runner.model_name
-        else:
+        elif self.mode == "http":
             stats["server"] = self.runner.base_url
             stats["model"] = self.config.get("model", "unknown")
+        elif self.mode == "specdec":
+            stats["device"] = self.runner.device
+            stats["base_model"] = self.runner.config["base_model"]
+            stats["draft_model"] = self.runner.config["draft_model"]
+            stats["max_draft"] = self.runner.config["max_draft"]
+
+        # Run baseline comparison if requested
+        if self.mode == "specdec" and self.compare_baseline:
+            self.logger.info("Running baseline comparison...")
+            baseline_stats = self._run_baseline_comparison(prompt, iterations)
+            stats["baseline_comparison"] = baseline_stats
 
         return stats
+
+    def _run_baseline_comparison(self, prompt: str, iterations: int) -> Dict[str, Any]:
+        """Run baseline comparison for speculative decoding."""
+        baseline_latencies = []
+        baseline_tokens_per_second = []
+
+        for i in range(iterations):
+            result = self.baseline_runner.run(
+                prompt, self.config.get("max_new_tokens", 48)
+            )
+            latency_ms = result["latency_ms"]
+            tokens_generated = result["max_new_tokens"]
+            tokens_per_sec = tokens_generated / (latency_ms / 1000.0)
+
+            baseline_latencies.append(latency_ms)
+            baseline_tokens_per_second.append(tokens_per_sec)
+
+        return {
+            "latency_ms": {
+                "mean": statistics.mean(baseline_latencies),
+                "median": statistics.median(baseline_latencies),
+                "std": (
+                    statistics.stdev(baseline_latencies)
+                    if len(baseline_latencies) > 1
+                    else 0.0
+                ),
+                "min": min(baseline_latencies),
+                "max": max(baseline_latencies),
+            },
+            "tokens_per_second": {
+                "mean": statistics.mean(baseline_tokens_per_second),
+                "median": statistics.median(baseline_tokens_per_second),
+                "std": (
+                    statistics.stdev(baseline_tokens_per_second)
+                    if len(baseline_tokens_per_second) > 1
+                    else 0.0
+                ),
+                "min": min(baseline_tokens_per_second),
+                "max": max(baseline_tokens_per_second),
+            },
+        }
 
     def print_summary(self, stats: Dict[str, Any]):
         """Print a formatted summary of benchmark results."""
         self.logger.info("=== Benchmark Summary ===")
         self.logger.info(f"Mode: {stats['mode']} ({stats['runner_name']})")
-        self.logger.info(f"Model: {stats['model']}")
 
         if stats["mode"] == "local":
+            self.logger.info(f"Model: {stats['model']}")
             self.logger.info(f"Device: {stats['device']}")
-        else:
+        elif stats["mode"] == "http":
+            self.logger.info(f"Model: {stats['model']}")
             self.logger.info(f"Server: {stats['server']}")
+        elif stats["mode"] == "specdec":
+            self.logger.info(f"Base Model: {stats['base_model']}")
+            self.logger.info(f"Draft Model: {stats['draft_model']}")
+            self.logger.info(f"Max Draft: {stats['max_draft']}")
+            self.logger.info(f"Device: {stats['device']}")
 
         self.logger.info(
             f"Iterations: {stats['iterations']} (warmup: {stats['warmup_iterations']})"
@@ -241,6 +358,45 @@ class BenchmarkRunner:
         self.logger.info(f"Min:    {stats['tokens_per_second']['min']:.2f}")
         self.logger.info(f"Max:    {stats['tokens_per_second']['max']:.2f}")
 
+        # Print acceptance rate for speculative decoding
+        if "acceptance_rate" in stats:
+            self.logger.info("\n--- Acceptance Rate ---")
+            self.logger.info(f"Mean:   {stats['acceptance_rate']['mean']:.3f}")
+            self.logger.info(f"Median: {stats['acceptance_rate']['median']:.3f}")
+            self.logger.info(f"Std:    {stats['acceptance_rate']['std']:.3f}")
+            self.logger.info(f"Min:    {stats['acceptance_rate']['min']:.3f}")
+            self.logger.info(f"Max:    {stats['acceptance_rate']['max']:.3f}")
+
+        # Print baseline comparison if available
+        if "baseline_comparison" in stats:
+            self.logger.info("\n--- Baseline Comparison ---")
+            baseline = stats["baseline_comparison"]
+
+            # Calculate speedup
+            specdec_latency = stats["latency_ms"]["mean"]
+            baseline_latency = baseline["latency_ms"]["mean"]
+            speedup = baseline_latency / specdec_latency if specdec_latency > 0 else 0.0
+
+            self.logger.info(f"Speculative Decoding Latency: {specdec_latency:.2f}ms")
+            self.logger.info(f"Baseline Latency: {baseline_latency:.2f}ms")
+            self.logger.info(f"Speedup: {speedup:.2f}x")
+
+            specdec_throughput = stats["tokens_per_second"]["mean"]
+            baseline_throughput = baseline["tokens_per_second"]["mean"]
+            throughput_improvement = (
+                (specdec_throughput / baseline_throughput - 1) * 100
+                if baseline_throughput > 0
+                else 0.0
+            )
+
+            self.logger.info(
+                f"Speculative Decoding Throughput: {specdec_throughput:.2f} tokens/sec"
+            )
+            self.logger.info(
+                f"Baseline Throughput: {baseline_throughput:.2f} tokens/sec"
+            )
+            self.logger.info(f"Throughput Improvement: {throughput_improvement:+.1f}%")
+
 
 def main():
     """CLI entry point."""
@@ -257,9 +413,9 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["local", "http"],
+        choices=["local", "http", "specdec"],
         default="local",
-        help="Benchmark mode: local baseline or HTTP server",
+        help="Benchmark mode: local baseline, HTTP server, or speculative decoding",
     )
     parser.add_argument(
         "--host", type=str, default=None, help="Server hostname (for HTTP mode)"
@@ -269,6 +425,11 @@ def main():
     )
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML configuration file"
+    )
+    parser.add_argument(
+        "--compare-baseline",
+        action="store_true",
+        help="Run baseline comparison (for specdec mode only)",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
 
@@ -282,7 +443,11 @@ def main():
 
     # Run benchmark
     benchmark = BenchmarkRunner(
-        config_path=args.config, mode=args.mode, host=args.host, port=args.port
+        config_path=args.config,
+        mode=args.mode,
+        host=args.host,
+        port=args.port,
+        compare_baseline=args.compare_baseline,
     )
     stats = benchmark.run_benchmark(args.prompt, args.iterations)
 
