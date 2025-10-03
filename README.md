@@ -4,20 +4,33 @@ A comprehensive toolkit for optimizing and benchmarking Large Language Model inf
 
 ## Overview
 
-This project provides a modular framework for:
-- High-performance LLM serving with custom CUDA kernels
+This project provides a comprehensive toolkit for LLM inference optimization research:
+
+**Current Capabilities**:
+- **Local Baseline Runner**: HuggingFace OPT-125M with CPU/MPS support
+- **HTTP Client**: OpenAI-compatible client for vLLM server integration
+- **Dual-Mode Benchmarking**: Statistical performance analysis (local vs HTTP)
+- **Professional Logging**: Structured logging and configuration management
+- **Code Quality**: Comprehensive linting and type checking
+
+**Future Research Areas**:
 - Speculative decoding for faster inference
+- Custom CUDA kernels and quantization
 - Intelligent request batching and scheduling
-- Comprehensive benchmarking and profiling tools
-- API serving with FastAPI and Streamlit interfaces
+- Multi-GPU scaling and distributed inference
 
 ## Setup
 
 ### Prerequisites
 
+**Local Development**:
 - Python 3.8+
+- Mac with Apple Silicon (for MPS acceleration) or CPU-only setup
+- 4GB+ RAM for model loading
+
+**Future Cloud Deployment**:
 - CUDA 11.8+ (for GPU acceleration)
-- NVIDIA GPU with compute capability 7.0+
+- NVIDIA GPU with compute capability 7.0+ (A100/H100 recommended)
 
 ### Installation
 
@@ -124,6 +137,21 @@ stats = benchmark.run_benchmark("Hello, world!", iterations=10)
 benchmark.print_summary(stats)
 ```
 
+### Performance Metrics
+
+**Current Baseline Performance** (Apple Silicon MPS):
+- **Model**: facebook/opt-125m (125M parameters)
+- **Latency**: ~1.15s per 48 tokens
+- **Throughput**: ~41 tokens/second
+- **Memory Usage**: ~500MB model loading
+- **Device**: MPS acceleration on Apple Silicon
+
+**Benchmarking Capabilities**:
+- Statistical analysis (mean, median, std deviation)
+- Dual-mode comparison (local vs HTTP)
+- Configurable warmup and iteration counts
+- Professional logging and error handling
+
 ### Development Notes
 
 **Local Development**: This project is designed for local development on CPU/MPS (Apple Silicon) systems. Cloud GPUs (A100/H100) will be used later for final benchmarking and paper-quality results.
@@ -151,8 +179,8 @@ llm-inference-lab/
 |-------|---------|--------|-------------|
 | 1A | Baseline runner | Complete | HuggingFace OPT-125M with CPU/MPS support |
 | 1B | Benchmark client | Complete | HTTP client + dual-mode benchmarking (local/HTTP) |
-| 1C | CI/CD sanity | Next | Automated testing and code quality checks |
-| 2 | Speculative decoding | Future | Medusa/EAGLE implementation for faster inference |
+| 1C | CI/CD sanity | Complete | Automated testing and code quality checks |
+| 2 | Speculative decoding | Next | Medusa/EAGLE implementation for faster inference |
 | 3 | Quantization | Future | BitsAndBytes 4-bit/8-bit quantization experiments |
 | 4 | Multi-GPU scaling | Future | Distributed inference and load balancing |
 | 5 | Cloud deployment | Future | A100/H100 benchmarking and results collection |
@@ -160,10 +188,10 @@ llm-inference-lab/
 ### Current Focus
 - **Phase 1A**: Complete - Local baseline runner with logging and configuration
 - **Phase 1B**: Complete - HTTP client and dual-mode benchmark harness
-- **Phase 1C**: Next - CI/CD pipeline optimization and testing
+- **Phase 1C**: Complete - CI/CD pipeline optimization and testing
+- **Phase 2**: Next - Speculative decoding research and implementation
 
 ### Future Phases
-- **Phase 2**: Speculative decoding research and implementation
 - **Phase 3**: Quantization techniques and memory optimization
 - **Phase 4**: Multi-GPU scaling and distributed inference
 - **Phase 5**: Cloud deployment for final benchmarking
