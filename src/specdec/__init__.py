@@ -1,25 +1,18 @@
 """
-Speculative Decoding Module
+Speculative Decoding Package for LLM Inference Lab
 
-This module implements speculative decoding techniques to accelerate LLM inference
-by predicting multiple tokens in parallel and verifying them efficiently.
+This package implements speculative decoding techniques for faster LLM inference
+using a draft model to propose tokens and a base model to verify them.
 
-Components:
-- Draft model implementation
-- Token prediction algorithms
-- Verification and acceptance mechanisms
-- Parallel token generation
-- Performance optimization strategies
-- Integration with main inference pipeline
+Key Components:
+- draft_model: Small draft model for token proposal
+- verifier: Base model verification with exact-match policy
+- pipeline: Orchestrates the speculative decoding loop
+- run_specdec: CLI entrypoint for speculative decoding
 """
 
-# Import modules when they exist
-# from .draft_model import DraftModel
-# from .speculative_decoder import SpeculativeDecoder
-# from .verification import TokenVerifier
+from .draft_model import DraftModel
+from .pipeline import SpeculativePipeline
+from .verifier import Verifier
 
-# __all__ = [
-#     "DraftModel",
-#     "SpeculativeDecoder",
-#     "TokenVerifier",
-# ]
+__all__ = ["DraftModel", "Verifier", "SpeculativePipeline"]

@@ -1,0 +1,27 @@
+# Speculative Decoding Configuration
+# Default parameters for CPU/MPS speculative decoding pipeline
+
+# Model configuration
+base_model: facebook/opt-125m
+draft_model: distilgpt2
+max_draft: 4
+implementation: fake  # fake for testing, hf for real models
+
+# Generation parameters
+temperature: 0.7
+do_sample: true
+max_new_tokens: 64
+top_p: 0.9
+top_k: 50
+repetition_penalty: 1.0
+
+# Device and memory configuration
+device: auto  # prioritize MPS > CPU
+max_memory_mb: 500  # Memory limit for HF models
+
+# Reproducibility
+seed: 1234
+
+# Logging configuration
+log_level: INFO
+verbose: false

@@ -13,7 +13,7 @@ import argparse
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 import yaml
@@ -23,7 +23,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 class LocalBaselineRunner:
     """Minimal HF Transformers runner with CPU/MPS support."""
 
-    def __init__(self, model_name: str = "facebook/opt-125m", config_path: str = None):
+    def __init__(
+        self, model_name: str = "facebook/opt-125m", config_path: Optional[str] = None
+    ):
         """
         Initialize the baseline runner.
 
@@ -39,7 +41,7 @@ class LocalBaselineRunner:
         self.model: Any = None
         self._load_model()
 
-    def _load_config(self, config_path: str = None) -> Dict[str, Any]:
+    def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
         """Load configuration from YAML file or use defaults."""
         default_config = {
             "model": "facebook/opt-125m",
@@ -109,7 +111,7 @@ class LocalBaselineRunner:
 
         self.logger.info(f"Model loaded successfully on {self.device}")
 
-    def run(self, prompt: str, max_new_tokens: int = None) -> Dict[str, Any]:
+    def run(self, prompt: str, max_new_tokens: Optional[int] = None) -> Dict[str, Any]:
         """
         Run inference on the given prompt.
 
