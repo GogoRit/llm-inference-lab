@@ -305,6 +305,7 @@ class BenchmarkRunner:
             stats["base_model"] = self.runner.config["base_model"]
             stats["draft_model"] = self.runner.config["draft_model"]
             stats["max_draft"] = self.runner.config["max_draft"]
+            stats["draft_mode"] = self.runner.config.get("draft_mode", "vanilla")
 
         # Run baseline comparison if requested
         if self.mode == "specdec" and self.compare_baseline:
@@ -369,6 +370,7 @@ class BenchmarkRunner:
         elif stats["mode"] == "specdec":
             self.logger.info(f"Base Model: {stats['base_model']}")
             self.logger.info(f"Draft Model: {stats['draft_model']}")
+            self.logger.info(f"Draft Mode: {stats['draft_mode']}")
             self.logger.info(f"Max Draft: {stats['max_draft']}")
             self.logger.info(f"Device: {stats['device']}")
 

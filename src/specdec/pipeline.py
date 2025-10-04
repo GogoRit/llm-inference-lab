@@ -599,6 +599,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 "device": self.force_device or self.device,
                 "base_model": self.config["base_model"],
                 "draft_model": self.config["draft_model"],
+                "draft_mode": self.config.get("draft_mode", "vanilla"),
                 "dtype": (
                     "float16"
                     if (self.force_device or self.device) == "mps"

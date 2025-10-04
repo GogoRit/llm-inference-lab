@@ -245,6 +245,7 @@ def main() -> None:
             "device": result["device"],
             "base_model": result["base_model"],
             "draft_model": result["draft_model"],
+            "draft_mode": result["draft_mode"],
             "dtype": result["dtype"],
         }
 
