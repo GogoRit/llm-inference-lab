@@ -129,7 +129,10 @@ class EagleDraftor:
 
             for step in range(num_tokens_to_generate):
                 # Extrapolate next hidden state
-                if self.last_hidden_states.shape[1] >= 2:
+                if (
+                    self.last_hidden_states is not None
+                    and self.last_hidden_states.shape[1] >= 2
+                ):
                     # We have at least 2 hidden states for extrapolation
                     h_t_minus_1 = self.last_hidden_states[
                         :, -2, :
@@ -165,18 +168,24 @@ class EagleDraftor:
                 # In a full implementation, we'd run the base model forward
                 # For now, we'll use extrapolation for the next hidden state
                 h_next_expanded = h_next.unsqueeze(1)  # [batch_size, 1, hidden_size]
-                self.last_hidden_states = torch.cat(
-                    [self.last_hidden_states, h_next_expanded], dim=1
-                )  # [batch_size, 3, hidden_size]
+                if self.last_hidden_states is not None:
+                    self.last_hidden_states = torch.cat(
+                        [self.last_hidden_states, h_next_expanded], dim=1
+                    )  # [batch_size, 3, hidden_size]
+                else:
+                    self.last_hidden_states = h_next_expanded
 
                 # Keep only last 2 states for next extrapolation
-                if self.last_hidden_states.shape[1] > 2:
+                if (
+                    self.last_hidden_states is not None
+                    and self.last_hidden_states.shape[1] > 2
+                ):
                     self.last_hidden_states = self.last_hidden_states[:, -2:, :]
 
         if end_time:
             end_time.record()
             torch.cuda.synchronize()
-            generation_time_ms = start_time.elapsed_time(end_time)
+            generation_time_ms = start_time.elapsed_time(end_time)  # type: ignore
         else:
             generation_time_ms = 0.0
 

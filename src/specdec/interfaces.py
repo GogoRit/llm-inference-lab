@@ -48,6 +48,26 @@ class LanguageModel(ABC):
         """
         pass
 
+    @property
+    def model(self) -> Any:
+        """
+        Get the underlying model for advanced operations.
+
+        Returns:
+            The underlying model object
+        """
+        return getattr(self, "_model", None)
+
+    @property
+    def tokenizer(self) -> Any:
+        """
+        Get the underlying tokenizer for advanced operations.
+
+        Returns:
+            The underlying tokenizer object
+        """
+        return getattr(self, "_tokenizer", None)
+
     @abstractmethod
     def encode(self, text: str) -> torch.Tensor:
         """

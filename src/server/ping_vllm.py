@@ -15,7 +15,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 import yaml
@@ -25,7 +25,10 @@ class VLLMPingClient:
     """OpenAI-compatible HTTP client for vLLM servers."""
 
     def __init__(
-        self, host: str = "127.0.0.1", port: int = 8000, config_path: str = None
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        config_path: Optional[str] = None,
     ):
         """
         Initialize the vLLM ping client.
@@ -54,7 +57,7 @@ class VLLMPingClient:
 
         self.logger.info(f"Initialized vLLM client for {self.base_url}")
 
-    def _load_config(self, config_path: str = None) -> Dict[str, Any]:
+    def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
         """Load configuration from YAML file or use defaults."""
         default_config = {
             "model": "llama-2-7b",
@@ -79,7 +82,7 @@ class VLLMPingClient:
 
         return default_config
 
-    def ping(self, timeout: int = None) -> bool:
+    def ping(self, timeout: Optional[int] = None) -> bool:
         """
         Test if the vLLM server is reachable.
 
@@ -107,9 +110,9 @@ class VLLMPingClient:
     def generate(
         self,
         prompt: str,
-        max_tokens: int = None,
-        temperature: float = None,
-        model: str = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate text using the vLLM server.

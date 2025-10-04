@@ -190,7 +190,7 @@ class MedusaDraftor:
         if end_time:
             end_time.record()
             torch.cuda.synchronize()
-            generation_time_ms = start_time.elapsed_time(end_time)
+            generation_time_ms = start_time.elapsed_time(end_time)  # type: ignore
         else:
             generation_time_ms = 0.0
 

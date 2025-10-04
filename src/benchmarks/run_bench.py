@@ -22,7 +22,7 @@ import logging
 import statistics
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -42,10 +42,10 @@ class BenchmarkRunner:
 
     def __init__(
         self,
-        config_path: str = None,
+        config_path: Optional[str] = None,
         mode: str = "local",
-        host: str = None,
-        port: int = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
         compare_baseline: bool = False,
         eval_perplexity: bool = False,
     ):
@@ -121,7 +121,7 @@ class BenchmarkRunner:
                 self.logger.warning(f"Failed to initialize perplexity evaluator: {e}")
                 self.evaluator = None
 
-    def _load_config(self, config_path: str = None) -> Dict[str, Any]:
+    def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
         """Load benchmark configuration."""
         default_config = {
             "model": "facebook/opt-125m",
@@ -147,7 +147,9 @@ class BenchmarkRunner:
 
         return default_config
 
-    def run_benchmark(self, prompt: str, iterations: int = None) -> Dict[str, Any]:
+    def run_benchmark(
+        self, prompt: str, iterations: Optional[int] = None
+    ) -> Dict[str, Any]:
         """
         Run benchmark with multiple iterations.
 

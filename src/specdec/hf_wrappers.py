@@ -71,8 +71,10 @@ class HFWrapper(LanguageModel):
             # Load tokenizer (shared if provided)
             if self._tokenizer is None:
                 self._tokenizer = AutoTokenizer.from_pretrained(self._model_name)
-                if self._tokenizer.pad_token is None:
-                    self._tokenizer.pad_token = self._tokenizer.eos_token
+                if self._tokenizer.pad_token is None:  # type: ignore
+                    self._tokenizer.pad_token = (  # type: ignore
+                        self._tokenizer.eos_token  # type: ignore
+                    )
 
             # Load model with memory considerations
             model_kwargs = {
@@ -85,11 +87,11 @@ class HFWrapper(LanguageModel):
             if self._max_memory_mb:
                 model_kwargs["max_memory"] = {0: f"{self._max_memory_mb}MB"}
 
-            self._model = AutoModelForCausalLM.from_pretrained(
+            self._model = AutoModelForCausalLM.from_pretrained(  # type: ignore
                 self._model_name, **model_kwargs
             )
             if self._device != "auto":
-                self._model = self._model.to(self._device)
+                self._model = self._model.to(self._device)  # type: ignore
             self._model.eval()
 
             self.logger.info(f"HF model loaded on device: {self._device}")
@@ -114,24 +116,26 @@ class HFWrapper(LanguageModel):
                     input_ids = input_ids.to(self._device)
 
                 # Generate tokens
-                outputs = self._model.generate(
+                outputs = self._model.generate(  # type: ignore
                     input_ids,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     do_sample=do_sample,
-                    pad_token_id=self._tokenizer.pad_token_id,
-                    eos_token_id=self._tokenizer.eos_token_id,
+                    pad_token_id=self._tokenizer.pad_token_id,  # type: ignore
+                    eos_token_id=self._tokenizer.eos_token_id,  # type: ignore
                     return_dict_in_generate=True,
                     output_scores=True,
                     **kwargs,
                 )
 
                 # Extract generated token IDs (excluding input)
-                generated_ids = outputs.sequences[:, input_ids.shape[1] :]
+                generated_ids = outputs.sequences[  # type: ignore[union-attr]
+                    :, input_ids.shape[1] :
+                ]
 
                 # Extract logits for the generated tokens
-                if outputs.scores:
-                    logits = torch.stack(outputs.scores, dim=1)
+                if outputs.scores:  # type: ignore
+                    logits = torch.stack(outputs.scores, dim=1)  # type: ignore
                 else:
                     # Fallback: get logits from the last layer
                     with torch.no_grad():
@@ -148,16 +152,16 @@ class HFWrapper(LanguageModel):
         """Get tokenizer information for compatibility checking."""
         return {
             "model_name": self._model_name,
-            "vocab_size": self._tokenizer.vocab_size,
-            "pad_token_id": self._tokenizer.pad_token_id,
-            "eos_token_id": self._tokenizer.eos_token_id,
-            "bos_token_id": self._tokenizer.bos_token_id,
-            "unk_token_id": self._tokenizer.unk_token_id,
+            "vocab_size": self._tokenizer.vocab_size,  # type: ignore
+            "pad_token_id": self._tokenizer.pad_token_id,  # type: ignore
+            "eos_token_id": self._tokenizer.eos_token_id,  # type: ignore
+            "bos_token_id": self._tokenizer.bos_token_id,  # type: ignore
+            "unk_token_id": self._tokenizer.unk_token_id,  # type: ignore
         }
 
     def encode(self, text: str) -> torch.Tensor:
         """Encode text to token IDs."""
-        return self._tokenizer.encode(text, return_tensors="pt")
+        return self._tokenizer.encode(text, return_tensors="pt")  # type: ignore
 
     def decode(self, token_ids) -> str:
         """Decode token IDs to text."""
@@ -171,7 +175,9 @@ class HFWrapper(LanguageModel):
         if token_ids.dim() > 1:
             token_ids = token_ids.flatten()
 
-        return self._tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)
+        return self._tokenizer.decode(  # type: ignore[union-attr]
+            token_ids.tolist(), skip_special_tokens=True
+        )
 
     @property
     def device(self) -> str:

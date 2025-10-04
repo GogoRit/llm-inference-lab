@@ -345,8 +345,8 @@ class SpeculativePipeline(SpeculativeDecoder):
         start_time = time.time()
 
         # Get base model and tokenizer
-        base_model = self.base_lm._model
-        tokenizer = self.base_lm._tokenizer
+        base_model = self.base_lm.model  # type: ignore
+        tokenizer = self.base_lm.tokenizer  # type: ignore
 
         # Get hidden states from base model
         with torch.no_grad():
@@ -455,8 +455,8 @@ class SpeculativePipeline(SpeculativeDecoder):
         start_time = time.time()
 
         # Get base model and tokenizer
-        base_model = self.base_lm._model
-        tokenizer = self.base_lm._tokenizer
+        base_model = self.base_lm.model  # type: ignore
+        tokenizer = self.base_lm.tokenizer  # type: ignore
 
         # Get EAGLE parameters
         alpha = self.config.get("eagle", {}).get("alpha", 0.7)
