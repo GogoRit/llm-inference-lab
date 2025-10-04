@@ -6,7 +6,7 @@ small linear heads to predict multiple future tokens in parallel.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class MedusaDraftor:
-    """Medusa-lite draft model that uses multiple heads for parallel token prediction."""
+    """Medusa-lite draft model using multiple heads for parallel token prediction."""
 
     def __init__(
         self,

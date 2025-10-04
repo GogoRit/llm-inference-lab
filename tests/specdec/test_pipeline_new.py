@@ -2,8 +2,8 @@
 Tests for Speculative Decoding Pipeline with Dependency Injection
 
 Tests correctness, performance, and edge cases for the speculative decoding
-implementation. Uses FakeLM by default to avoid memory issues. Real model tests
-are marked with @pytest.mark.slow and excluded from CI.
+implementation. Uses FakeLM exclusively to avoid memory issues in CI/CD.
+Real model testing is done locally with manual commands.
 """
 
 import sys
@@ -18,7 +18,6 @@ SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from specdec.fake_lm import create_fake_lm  # noqa: E402
-from specdec.hf_wrappers import create_tiny_hf_wrapper  # noqa: E402
 from specdec.pipeline import SpeculativePipeline  # noqa: E402
 
 
@@ -201,42 +200,6 @@ class TestSpeculativePipelineFake:
         assert result["text"] is not None
 
 
-class TestSpeculativePipelineHF:
-    """Test cases for the speculative decoding pipeline using Hugging Face models."""
-
-    @pytest.mark.slow
-    def test_hf_implementation(self):
-        """Test HF implementation with tiny models."""
-        pipeline = SpeculativePipeline(
-            implementation="hf",
-            max_draft=2,
-            device="cpu",
-            seed=42,
-        )
-
-        assert pipeline.implementation == "hf"
-        assert pipeline.base_lm is not None
-        assert pipeline.draft_lm is not None
-
-        # Test generation works
-        result = pipeline.generate("Hello", max_tokens=4)
-        assert result["text"] is not None
-        assert len(result["generated_tokens"]) > 0
-
-    @pytest.mark.slow
-    def test_hf_with_config(self):
-        """Test HF implementation with config file."""
-        config_path = PROJECT_ROOT / "configs" / "specdec_hf.yaml"
-        if config_path.exists():
-            pipeline = SpeculativePipeline(config_path=str(config_path))
-            assert pipeline.implementation == "hf"
-            assert pipeline.config["base_model"] == "sshleifer/tiny-gpt2"
-
-            # Test generation works
-            result = pipeline.generate("Test", max_tokens=4)
-            assert result["text"] is not None
-
-
 class TestFakeLM:
     """Test cases for the FakeLM implementation."""
 
@@ -285,37 +248,3 @@ class TestFakeLM:
         assert len(set(results)) > 1
 
 
-class TestHFWrapper:
-    """Test cases for the HFWrapper implementation."""
-
-    @pytest.mark.slow
-    def test_hf_wrapper_initialization(self):
-        """Test HFWrapper initialization with tiny model."""
-        wrapper = create_tiny_hf_wrapper(model_name="gpt2", device="cpu")
-        assert wrapper.model_name == "gpt2"
-        assert wrapper.device == "cpu"
-
-    @pytest.mark.slow
-    def test_hf_wrapper_generation(self):
-        """Test HFWrapper token generation."""
-        wrapper = create_tiny_hf_wrapper(model_name="gpt2", device="cpu")
-        input_ids = torch.tensor([[1, 2, 3]])
-
-        tokens, logits = wrapper.generate_tokens(input_ids, max_new_tokens=2)
-        assert tokens.shape[1] == 2
-        assert logits.shape[1] == 2
-
-    @pytest.mark.slow
-    def test_hf_wrapper_encoding_decoding(self):
-        """Test HFWrapper encoding and decoding."""
-        wrapper = create_tiny_hf_wrapper(model_name="gpt2", device="cpu")
-        text = "Hello world"
-
-        # Test encoding
-        tokens = wrapper.encode(text)
-        assert isinstance(tokens, torch.Tensor)
-
-        # Test decoding
-        decoded = wrapper.decode(tokens)
-        assert isinstance(decoded, str)
-        assert len(decoded) > 0

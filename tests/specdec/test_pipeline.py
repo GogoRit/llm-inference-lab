@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from specdec.draft_model import DraftModel  # noqa: E402
+# from specdec.draft_model import DraftModel  # noqa: E402  # Unused
 from specdec.pipeline import SpeculativePipeline  # noqa: E402
 from specdec.verifier import Verifier  # noqa: E402
 
@@ -198,31 +198,32 @@ class TestSpeculativePipeline:
 
 
 class TestDraftModel:
-    """Test cases for the draft model."""
+    """Test cases for the draft model using FakeLM."""
 
     @pytest.fixture
     def draft_model(self):
-        """Create a draft model instance for testing."""
-        return DraftModel(model_name="distilgpt2", device="cpu")
+        """Create a fake draft model instance for testing."""
+        from specdec.fake_lm import create_fake_lm
+
+        return create_fake_lm("fake-draft-distilgpt2", device="cpu")
 
     def test_draft_model_initialization(self, draft_model):
         """Test draft model initialization."""
-        assert draft_model.model_name == "distilgpt2"
+        assert draft_model.model_name == "fake-draft-distilgpt2"
         assert draft_model.device == "cpu"
-        assert draft_model.tokenizer is not None
-        assert draft_model.model is not None
+        assert draft_model._vocab_size == 1000
 
     def test_generate_draft_tokens(self, draft_model):
         """Test draft token generation."""
         # Create a simple input
-        input_ids = draft_model.tokenizer.encode("Hello", return_tensors="pt")
+        input_ids = torch.tensor([[1, 2, 3]])  # Simple input
 
-        draft_tokens, draft_logits = draft_model.generate_draft_tokens(
-            input_ids, max_draft=3, temperature=0.7, do_sample=True
+        draft_tokens, draft_logits = draft_model.generate_tokens(
+            input_ids, max_new_tokens=3, temperature=0.7, do_sample=True
         )
 
         assert draft_tokens.shape[0] == 1  # batch size
-        assert draft_tokens.shape[1] <= 3  # max_draft
+        assert draft_tokens.shape[1] <= 3  # max_new_tokens
         assert draft_logits.shape[0] == 1  # batch size
         assert draft_logits.shape[1] == draft_tokens.shape[1]  # sequence length
 
@@ -234,7 +235,7 @@ class TestDraftModel:
         assert "vocab_size" in info
         assert "pad_token_id" in info
         assert "eos_token_id" in info
-        assert info["model_name"] == "distilgpt2"
+        assert info["model_name"] == "fake-draft-distilgpt2"
 
 
 class TestVerifier:

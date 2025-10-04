@@ -6,7 +6,7 @@ extrapolation to predict future tokens without additional model forward passes.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 

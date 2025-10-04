@@ -9,16 +9,19 @@ This project provides a comprehensive toolkit for LLM inference optimization res
 **Current Capabilities**:
 - **Local Baseline Runner**: HuggingFace OPT-125M with CPU/MPS support
 - **HTTP Client**: OpenAI-compatible client for vLLM server integration
-- **Speculative Decoding**: Draft-and-verify pipeline for faster inference
+- **Speculative Decoding**: Draft-and-verify pipeline with advanced strategies
+- **Advanced Draft Modes**: Medusa-lite and EAGLE-lite implementations
+- **Acceptance Policies**: Longest prefix, confidence threshold, top-k agreement, typical acceptance
+- **Adaptive Controllers**: Fixed and adaptive K controllers for draft token management
 - **Dual-Mode Benchmarking**: Statistical performance analysis (local vs HTTP vs specdec)
 - **Professional Logging**: Structured logging and configuration management
 - **Code Quality**: Comprehensive linting and type checking
 
 **Future Research Areas**:
-- Advanced speculative decoding techniques (Medusa, EAGLE)
 - Custom CUDA kernels and quantization
 - Intelligent request batching and scheduling
 - Multi-GPU scaling and distributed inference
+- Advanced model optimization techniques
 
 ## Setup
 
@@ -250,13 +253,19 @@ specdec_benchmark.print_summary(stats)
 | **FakeLM Mode** | 0.42ms (4 tokens) | 9,430 tokens/sec | Minimal | Testing, CI/CD |
 | **HF Mode** | 44.62ms (4 tokens) | 89.65 tokens/sec | ~500MB | Real inference |
 
-**Advanced Draft Modes** (Tiny CPU Models):
+**Advanced Draft Modes** (Real Performance):
 
-| Draft Mode | Latency (ms) | Tokens/sec | Acceptance Rate | Memory (MB) | Description |
-|------------|-------------|------------|-----------------|-------------|-------------|
-| **Vanilla** | 125.3 | 80.9 | 1.000 | 45.2 | Traditional draft model approach |
-| **Medusa-lite** | 118.7 | 85.4 | 1.000 | 47.8 | Multiple prediction heads |
-| **EAGLE-lite** | 112.1 | 89.2 | 1.000 | 44.1 | Hidden state extrapolation |
+**MPS Performance** (facebook/opt-125m + distilgpt2, 10 tokens):
+| Draft Mode | Latency (ms) | Tokens/sec | Acceptance Rate | Speedup | Description |
+|------------|-------------|------------|-----------------|---------|-------------|
+| **Vanilla** | 7,315 | 1.37 | 0.00 | 1.0x | Traditional draft model approach |
+| **Medusa-lite** | 14,088 | 0.71 | 0.00 | 0.52x | Multiple prediction heads |
+| **EAGLE-lite** | 2,837 | 3.53 | 0.05 | 2.58x | Hidden state extrapolation |
+
+**Tiny CPU Performance** (sshleifer/tiny-gpt2, 24 tokens):
+| Draft Mode | Latency (ms) | Tokens/sec | Acceptance Rate | Speedup | Description |
+|------------|-------------|------------|-----------------|---------|-------------|
+| **Vanilla** | 101.7 | 236.0 | 1.00 | 1.0x | Traditional draft model approach |
 
 **Implementation Details**:
 - **FakeLM Mode**: Deterministic testing without memory issues, 100% acceptance rate
