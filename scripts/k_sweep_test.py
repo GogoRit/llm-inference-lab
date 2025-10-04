@@ -67,7 +67,9 @@ def run_k_sweep(
 
                 # Extract metrics
                 latency_ms = result.get("latency_ms", (end_time - start_time) * 1000)
-                tokens_per_sec = result.get("tokens_per_sec", max_tokens / (latency_ms / 1000))
+                tokens_per_sec = result.get(
+                    "tokens_per_sec", max_tokens / (latency_ms / 1000)
+                )
                 acceptance_rate = result.get("acceptance_rate", 0.0)
                 proposed = result.get("proposed", 0)
                 accepted = result.get("accepted", 0)
@@ -100,15 +102,21 @@ def run_k_sweep(
         # Calculate averages for this K
         valid_results = [r for r in k_results if "error" not in r]
         if valid_results:
-            avg_latency = sum(r["latency_ms"] for r in valid_results) / len(valid_results)
+            avg_latency = sum(r["latency_ms"] for r in valid_results) / len(
+                valid_results
+            )
             avg_tokens_per_sec = sum(r["tokens_per_sec"] for r in valid_results) / len(
                 valid_results
             )
-            avg_acceptance_rate = sum(r["acceptance_rate"] for r in valid_results) / len(
+            avg_acceptance_rate = sum(
+                r["acceptance_rate"] for r in valid_results
+            ) / len(valid_results)
+            avg_proposed = sum(r["proposed"] for r in valid_results) / len(
                 valid_results
             )
-            avg_proposed = sum(r["proposed"] for r in valid_results) / len(valid_results)
-            avg_accepted = sum(r["accepted"] for r in valid_results) / len(valid_results)
+            avg_accepted = sum(r["accepted"] for r in valid_results) / len(
+                valid_results
+            )
 
             results.append(
                 {
@@ -134,13 +142,23 @@ def run_k_sweep(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="K-Sweep Testing for Speculative Decoding")
+    parser = argparse.ArgumentParser(
+        description="K-Sweep Testing for Speculative Decoding"
+    )
     parser.add_argument("--base-model", default="gpt2", help="Base model name")
     parser.add_argument("--draft-model", default="distilgpt2", help="Draft model name")
-    parser.add_argument("--prompt", default="Explain KV cache simply.", help="Test prompt")
-    parser.add_argument("--max-tokens", type=int, default=32, help="Maximum tokens to generate")
-    parser.add_argument("--iterations", type=int, default=3, help="Number of iterations per K")
-    parser.add_argument("--output", default="k_sweep_results.json", help="Output file for results")
+    parser.add_argument(
+        "--prompt", default="Explain KV cache simply.", help="Test prompt"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=32, help="Maximum tokens to generate"
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=3, help="Number of iterations per K"
+    )
+    parser.add_argument(
+        "--output", default="k_sweep_results.json", help="Output file for results"
+    )
 
     args = parser.parse_args()
 

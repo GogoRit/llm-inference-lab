@@ -103,8 +103,12 @@ def run_comprehensive_k_sweep(
                     end_time = time.time()
 
                     # Extract metrics
-                    latency_ms = result.get("latency_ms", (end_time - start_time) * 1000)
-                    tokens_per_sec = result.get("tokens_per_sec", max_tokens / (latency_ms / 1000))
+                    latency_ms = result.get(
+                        "latency_ms", (end_time - start_time) * 1000
+                    )
+                    tokens_per_sec = result.get(
+                        "tokens_per_sec", max_tokens / (latency_ms / 1000)
+                    )
                     acceptance_rate = result.get("acceptance_rate", 0.0)
                     proposed = result.get("proposed", 0)
                     accepted = result.get("accepted", 0)
@@ -266,7 +270,9 @@ def create_plots(results, output_dir):
         plt.xticks(k_values)
 
         # Add value labels
-        for i, (k, mean, std) in enumerate(zip(k_values, throughput_means, throughput_stds)):
+        for i, (k, mean, std) in enumerate(
+            zip(k_values, throughput_means, throughput_stds)
+        ):
             plt.annotate(
                 f"{mean:.2f}±{std:.2f}",
                 (k, mean),
@@ -300,7 +306,9 @@ def create_plots(results, output_dir):
         plt.xticks(k_values)
 
         # Add value labels
-        for i, (k, mean, std) in enumerate(zip(k_values, acceptance_means, acceptance_stds)):
+        for i, (k, mean, std) in enumerate(
+            zip(k_values, acceptance_means, acceptance_stds)
+        ):
             plt.annotate(
                 f"{mean:.3f}±{std:.3f}",
                 (k, mean),
@@ -328,13 +336,21 @@ def main():
     )
     parser.add_argument("--base-model", default="gpt2", help="Base model name")
     parser.add_argument("--draft-model", default="distilgpt2", help="Draft model name")
-    parser.add_argument("--max-tokens", type=int, default=32, help="Maximum tokens to generate")
-    parser.add_argument("--iterations", type=int, default=10, help="Number of iterations per K")
-    parser.add_argument("--output-dir", default="results", help="Output directory for results")
+    parser.add_argument(
+        "--max-tokens", type=int, default=32, help="Maximum tokens to generate"
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=10, help="Number of iterations per K"
+    )
+    parser.add_argument(
+        "--output-dir", default="results", help="Output directory for results"
+    )
 
     args = parser.parse_args()
 
-    logger.info(f"Starting comprehensive K-sweep test: {args.base_model} + {args.draft_model}")
+    logger.info(
+        f"Starting comprehensive K-sweep test: {args.base_model} + {args.draft_model}"
+    )
     logger.info(f"Max tokens: {args.max_tokens}, Iterations: {args.iterations}")
     logger.info(f"Prompt suite: {len(PROMPT_SUITE)} prompts")
 
@@ -350,7 +366,9 @@ def main():
     )
 
     # Save results
-    csv_file, json_file = save_results(results, detailed_results, system_info, args.output_dir)
+    csv_file, json_file = save_results(
+        results, detailed_results, system_info, args.output_dir
+    )
 
     # Create plots
     create_plots(results, args.output_dir)
@@ -376,7 +394,9 @@ def main():
         )
 
     print("=" * 100)
-    logger.info(f"Comprehensive K-sweep completed. Results saved to {csv_file} and {json_file}")
+    logger.info(
+        f"Comprehensive K-sweep completed. Results saved to {csv_file} and {json_file}"
+    )
 
 
 if __name__ == "__main__":
