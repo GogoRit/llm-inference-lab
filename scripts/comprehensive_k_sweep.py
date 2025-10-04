@@ -14,14 +14,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-import torch
-
-# Add src to path
+# Add src to path before importing project modules
 SRC_DIR = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from specdec.pipeline import SpeculativePipeline
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+from specdec.pipeline import SpeculativePipeline  # noqa: E402
 
 # Set up logging
 logging.basicConfig(
@@ -148,7 +148,8 @@ def run_comprehensive_k_sweep(
 
                 except Exception as e:
                     logger.error(
-                        f"      K={k}, Iter={iteration+1}, Prompt={prompt_idx+1} failed: {e}"
+                        f"      K={k}, Iter={iteration+1}, Prompt={prompt_idx+1} "
+                        f"failed: {e}"
                     )
                     detailed_result = {
                         "k": k,
@@ -187,9 +188,10 @@ def run_comprehensive_k_sweep(
             )
 
             logger.info(
-                f"  K={k} AVERAGE: {np.mean(throughputs):.2f}±{np.std(throughputs):.2f} "
-                f"tok/s, {np.mean(acceptance_rates):.3f}±{np.std(acceptance_rates):.3f} "
-                f"accept rate"
+                f"  K={k} AVERAGE: "
+                f"{np.mean(throughputs):.2f}±{np.std(throughputs):.2f} "
+                f"tok/s, {np.mean(acceptance_rates):.3f}±"
+                f"{np.std(acceptance_rates):.3f} accept rate"
             )
         else:
             logger.error(f"  K={k}: All iterations failed")
@@ -387,8 +389,10 @@ def main():
         print(
             f"{result['k']:<3} {result['n_samples']:<8} "
             f"{result['latency_ms_mean']:.1f}±{result['latency_ms_std']:.1f}    "
-            f"{result['tokens_per_sec_mean']:.2f}±{result['tokens_per_sec_std']:.2f}        "
-            f"{result['acceptance_rate_mean']:.3f}±{result['acceptance_rate_std']:.3f}    "
+            f"{result['tokens_per_sec_mean']:.2f}±"
+            f"{result['tokens_per_sec_std']:.2f}        "
+            f"{result['acceptance_rate_mean']:.3f}±"
+            f"{result['acceptance_rate_std']:.3f}    "
             f"{result['proposed_mean']:.1f}±{result['proposed_std']:.1f}    "
             f"{result['accepted_mean']:.1f}±{result['accepted_std']:.1f}"
         )

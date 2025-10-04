@@ -11,11 +11,12 @@ import sys
 import time
 from pathlib import Path
 
-# Add src to path
+# Add src to path before importing project modules
 SRC_DIR = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from specdec.pipeline import SpeculativePipeline
+
+from specdec.pipeline import SpeculativePipeline  # noqa: E402
 
 # Set up logging
 logging.basicConfig(
@@ -191,7 +192,8 @@ def main():
     for result in results:
         print(
             f"{result['k']:<3} {result['avg_latency_ms']:<12.1f} "
-            f"{result['avg_tokens_per_sec']:<12.2f} {result['avg_acceptance_rate']:<12.3f} "
+            f"{result['avg_tokens_per_sec']:<12.2f} "
+            f"{result['avg_acceptance_rate']:<12.3f} "
             f"{result['avg_proposed']:<10.1f} {result['avg_accepted']:<10.1f}"
         )
 

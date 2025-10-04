@@ -17,13 +17,13 @@ import psutil
 import torch
 import yaml
 
-logger = logging.getLogger(__name__)
-
 from .controllers import KController, create_controller
 from .fake_lm import create_fake_lm
 from .hf_wrappers import create_tiny_hf_wrapper
 from .interfaces import LanguageModel, SpeculativeDecoder
 from .policies import AcceptancePolicy, create_policy
+
+logger = logging.getLogger(__name__)
 
 # Import optimization modules (conditional to avoid import errors during development)
 try:
@@ -140,7 +140,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             self.optimization_manager = create_optimization_manager(
                 device=self.force_device or self.device,
                 mixed_precision=True,
-                gradient_checkpointing=False,  # Disabled for inference - only useful for training
+                gradient_checkpointing=False,  # Disabled for inference
                 memory_efficient=True,
             )
         else:
@@ -153,25 +153,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                     logger.info("Optimizing base model...")
                     self.base_lm.optimize(self.optimization_manager)
                     logger.info("Base model optimization completed")
-                elif hasattr(self.base_lm, "model") and self.base_lm.model is not None:
-                    logger.info("Optimizing base model...")
-                    self.base_lm.model = self.optimization_manager.optimize_model(
-                        self.base_lm.model
-                    )
-                    logger.info("Base model optimization completed")
+                # Note: Base model optimization handled via optimize() method above
 
                 if hasattr(self.draft_lm, "optimize"):
                     logger.info("Optimizing draft model...")
                     self.draft_lm.optimize(self.optimization_manager)
                     logger.info("Draft model optimization completed")
-                elif (
-                    hasattr(self.draft_lm, "model") and self.draft_lm.model is not None
-                ):
-                    logger.info("Optimizing draft model...")
-                    self.draft_lm.model = self.optimization_manager.optimize_model(
-                        self.draft_lm.model
-                    )
-                    logger.info("Draft model optimization completed")
+                # Note: Draft model optimization handled via optimize() method above
             except Exception as e:
                 logger.error(f"Model optimization failed: {e}")
                 import traceback

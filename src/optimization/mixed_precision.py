@@ -341,7 +341,8 @@ class LocalOptimizationManager:
 
         logger.info(
             f"LocalOptimizationManager initialized: device={device}, "
-            f"mixed_precision={mixed_precision}, gradient_checkpointing={gradient_checkpointing}"
+            f"mixed_precision={mixed_precision}, "
+            f"gradient_checkpointing={gradient_checkpointing}"
         )
 
     def optimize_model(self, model: nn.Module) -> nn.Module:
@@ -372,8 +373,10 @@ class LocalOptimizationManager:
         return {
             "device": self.device,
             "mixed_precision": self.mixed_precision.get_optimization_info(),
-            "gradient_checkpointing": self.gradient_checkpointing.get_memory_savings_estimate(
-                torch.nn.Linear(10, 10)  # Dummy model for estimation
+            "gradient_checkpointing": (
+                self.gradient_checkpointing.get_memory_savings_estimate(
+                    torch.nn.Linear(10, 10)  # Dummy model for estimation
+                )
             ),
         }
 

@@ -210,7 +210,7 @@ class OptimizedTokenizer:
                     )
 
             # Combine results
-            all_results = [None] * len(texts)
+            all_results: list = [None] * len(texts)
 
             # Add cached results
             for i, result in cached_results:
@@ -263,7 +263,7 @@ class OptimizedTokenizer:
             Decoded text
         """
         # Handle single sequence
-        if isinstance(token_ids, (list, torch.Tensor)) and len(token_ids.shape) == 1:
+        if isinstance(token_ids, torch.Tensor) and len(token_ids.shape) == 1:
             return self.tokenizer.decode(
                 token_ids, skip_special_tokens=skip_special_tokens, **kwargs
             )

@@ -257,7 +257,7 @@ class PerformanceProfiler:
         Returns:
             Dictionary containing profiling results
         """
-        results = {}
+        results: Dict[str, Any] = {}
 
         # Memory tracking
         if self.memory_tracking:
@@ -282,11 +282,13 @@ class PerformanceProfiler:
         results.update(
             {
                 "forward_time_ms": forward_time_ms,
-                "input_tokens": input_ids.shape[1],
-                "device": str(input_ids.device),
-                "dtype": str(input_ids.dtype),
+                "input_tokens": float(input_ids.shape[1]),
             }
         )
+
+        # Metadata (separate from numeric results)
+        results["device"] = str(input_ids.device)
+        results["dtype"] = str(input_ids.dtype)
 
         # Add model-specific metrics
         if hasattr(outputs, "logits"):
