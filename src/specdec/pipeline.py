@@ -11,7 +11,7 @@ Orchestrates the speculative decoding loop:
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import psutil
 import torch
@@ -275,6 +275,50 @@ class SpeculativePipeline(SpeculativeDecoder):
                 "acceptance rates."
             )
 
+    def _generate_medusa_tokens(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        do_sample: bool,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """Generate tokens using Medusa draftor."""
+        # For now, fall back to vanilla generation
+        # In a full implementation, we'd create and use MedusaDraftor
+        self.logger.debug("Medusa mode: falling back to vanilla generation")
+        draft_tokens, draft_logits = self.draft_lm.generate_tokens(
+            input_ids,
+            max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+            **kwargs,
+        )
+        draft_info = {"mode": "medusa_fallback"}
+        return draft_tokens, draft_logits, draft_info
+
+    def _generate_eagle_tokens(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        do_sample: bool,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """Generate tokens using EAGLE draftor."""
+        # For now, fall back to vanilla generation
+        # In a full implementation, we'd create and use EagleDraftor
+        self.logger.debug("EAGLE mode: falling back to vanilla generation")
+        draft_tokens, draft_logits = self.draft_lm.generate_tokens(
+            input_ids,
+            max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+            **kwargs,
+        )
+        draft_info = {"mode": "eagle_fallback"}
+        return draft_tokens, draft_logits, draft_info
+
     def generate(
         self,
         prompt: str,
@@ -361,19 +405,41 @@ class SpeculativePipeline(SpeculativeDecoder):
                 k = self.controller.get_k(step, context)
                 self.logger.debug(f"K from controller: {k}, type: {type(k)}")
 
-                # Step 1: Generate draft tokens
+                # Step 1: Generate draft tokens based on draft mode
                 draft_start = time.time()
                 self.logger.debug(
                     f"Generating draft tokens with k={k}, "
-                    f"temperature={temperature}, do_sample={do_sample}"
+                    f"temperature={temperature}, do_sample={do_sample}, "
+                    f"draft_mode={self.config.get('draft_mode', 'vanilla')}"
                 )
-                draft_tokens, draft_logits = self.draft_lm.generate_tokens(
-                    current_input,
-                    max_new_tokens=k,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    **kwargs,
-                )
+
+                draft_mode = self.config.get("draft_mode", "vanilla")
+                if draft_mode == "vanilla":
+                    # Use existing draft model
+                    draft_tokens, draft_logits = self.draft_lm.generate_tokens(
+                        current_input,
+                        max_new_tokens=k,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        **kwargs,
+                    )
+                elif draft_mode == "medusa":
+                    # Use Medusa draftor
+                    draft_tokens, draft_logits, draft_info = (
+                        self._generate_medusa_tokens(
+                            current_input, k, temperature, do_sample, **kwargs
+                        )
+                    )
+                elif draft_mode == "eagle":
+                    # Use EAGLE draftor
+                    draft_tokens, draft_logits, draft_info = (
+                        self._generate_eagle_tokens(
+                            current_input, k, temperature, do_sample, **kwargs
+                        )
+                    )
+                else:
+                    raise ValueError(f"Unknown draft mode: {draft_mode}")
+
                 draft_time_ms = (time.time() - draft_start) * 1000
                 self.logger.debug(
                     f"Draft tokens shape: {draft_tokens.shape}, "
