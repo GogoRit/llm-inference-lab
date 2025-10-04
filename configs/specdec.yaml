@@ -2,7 +2,7 @@
 # Default parameters for CPU/MPS speculative decoding pipeline
 
 # Model configuration
-base_model: facebook/opt-125m
+base_model: gpt2
 draft_model: distilgpt2
 max_draft: 4
 implementation: fake  # fake for testing, hf for real models

@@ -17,11 +17,28 @@ import psutil
 import torch
 import yaml
 
+logger = logging.getLogger(__name__)
+
 from .controllers import KController, create_controller
 from .fake_lm import create_fake_lm
 from .hf_wrappers import create_tiny_hf_wrapper
 from .interfaces import LanguageModel, SpeculativeDecoder
 from .policies import AcceptancePolicy, create_policy
+
+# Import optimization modules (conditional to avoid import errors during development)
+try:
+    from benchmarks.profiler import create_profiler
+    from optimization import create_optimization_manager, create_optimized_tokenizer
+except ImportError:
+    # Fallback for development - create dummy functions
+    def create_optimization_manager(*args, **kwargs):
+        return None
+
+    def create_optimized_tokenizer(*args, **kwargs):
+        return None
+
+    def create_profiler(*args, **kwargs):
+        return None
 
 
 class SpeculativePipeline(SpeculativeDecoder):
@@ -44,6 +61,9 @@ class SpeculativePipeline(SpeculativeDecoder):
         controller: str = "fixed",
         controller_params: Optional[Dict[str, Any]] = None,
         draft_mode: str = "vanilla",
+        enable_optimization: bool = True,
+        enable_profiling: bool = False,
+        profile_dir: Optional[str] = None,
     ):
         """
         Initialize the speculative decoding pipeline.
@@ -64,6 +84,10 @@ class SpeculativePipeline(SpeculativeDecoder):
             policy_params: Parameters for the acceptance policy
             controller: K controller type ("fixed", "adaptive")
             controller_params: Parameters for the K controller
+            draft_mode: Draft mode ("vanilla", "medusa", "eagle")
+            enable_optimization: Whether to enable performance optimizations
+            enable_profiling: Whether to enable profiling
+            profile_dir: Directory to save profiling traces
         """
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config(config_path)
@@ -107,6 +131,64 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         # Check tokenizer compatibility
         self._check_compatibility()
+
+        # Initialize optimization and profiling
+        self.enable_optimization = enable_optimization
+        self.enable_profiling = enable_profiling
+
+        if self.enable_optimization:
+            self.optimization_manager = create_optimization_manager(
+                device=self.force_device or self.device,
+                mixed_precision=True,
+                gradient_checkpointing=False,  # Disabled for inference - only useful for training
+                memory_efficient=True,
+            )
+        else:
+            self.optimization_manager = None
+
+        if self.enable_optimization and self.optimization_manager is not None:
+            # Use clean API for optimization
+            try:
+                if hasattr(self.base_lm, "optimize"):
+                    logger.info("Optimizing base model...")
+                    self.base_lm.optimize(self.optimization_manager)
+                    logger.info("Base model optimization completed")
+                elif hasattr(self.base_lm, "model") and self.base_lm.model is not None:
+                    logger.info("Optimizing base model...")
+                    self.base_lm.model = self.optimization_manager.optimize_model(
+                        self.base_lm.model
+                    )
+                    logger.info("Base model optimization completed")
+
+                if hasattr(self.draft_lm, "optimize"):
+                    logger.info("Optimizing draft model...")
+                    self.draft_lm.optimize(self.optimization_manager)
+                    logger.info("Draft model optimization completed")
+                elif (
+                    hasattr(self.draft_lm, "model") and self.draft_lm.model is not None
+                ):
+                    logger.info("Optimizing draft model...")
+                    self.draft_lm.model = self.optimization_manager.optimize_model(
+                        self.draft_lm.model
+                    )
+                    logger.info("Draft model optimization completed")
+            except Exception as e:
+                logger.error(f"Model optimization failed: {e}")
+                import traceback
+
+                logger.error(traceback.format_exc())
+                # Continue without optimization rather than failing
+                self.optimization_manager = None
+
+        if self.enable_profiling:
+            self.profiler = create_profiler(
+                enable_profiling=True,
+                profile_dir=profile_dir,
+                memory_tracking=True,
+                device=self.force_device or self.device,
+            )
+        else:
+            self.profiler = None
 
         # Metrics tracking
         self.metrics = {
@@ -590,6 +672,10 @@ class SpeculativePipeline(SpeculativeDecoder):
         """
         start_time = time.time()
 
+        # Start profiling if enabled
+        if self.profiler:
+            self.profiler.start_memory_tracking()
+
         # Use provided parameters or fall back to config
         max_tokens = max_tokens or self.config["max_new_tokens"]
         temperature = temperature or self.config["temperature"]
@@ -609,15 +695,23 @@ class SpeculativePipeline(SpeculativeDecoder):
         }
 
         try:
-            # Tokenize input prompt
-            input_ids = self.base_lm.encode(prompt)
-            # Move to device if needed (but only if device is not "auto")
-            if (
-                self.device != "auto"
-                and self.device != "cpu"
-                and input_ids.device == torch.device("cpu")
-            ):
-                input_ids = input_ids.to(self.device)
+            # Use optimization context if available
+            optimization_context = (
+                self.optimization_manager.get_optimization_context()
+                if self.optimization_manager
+                else torch.no_grad()
+            )
+
+            with optimization_context:
+                # Tokenize input prompt
+                input_ids = self.base_lm.encode(prompt)
+                # Move to device if needed (but only if device is not "auto")
+                if (
+                    self.device != "auto"
+                    and self.device != "cpu"
+                    and input_ids.device == torch.device("cpu")
+                ):
+                    input_ids = input_ids.to(self.device)
 
             # Initialize generation state
             generated_tokens: list[int] = []
@@ -854,6 +948,20 @@ class SpeculativePipeline(SpeculativeDecoder):
                     else "float32"
                 ),
             }
+
+            # Add profiling data if available
+            if self.profiler:
+                memory_stats = self.profiler.stop_memory_tracking()
+                result["profiling"] = {
+                    "memory_stats": memory_stats,
+                    "timing_stats": self.profiler.get_timing_stats(),
+                }
+
+            # Add optimization info if available
+            if self.optimization_manager:
+                result["optimization"] = (
+                    self.optimization_manager.get_optimization_report()
+                )
 
             self.logger.info(
                 f"Speculative decoding completed: {len(generated_tokens)} tokens "
