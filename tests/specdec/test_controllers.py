@@ -17,7 +17,7 @@ class TestFixedKController:
     def test_fixed_k(self):
         """Test that controller always returns fixed K."""
         controller = FixedKController(k=5)
-        
+
         # Test multiple calls
         for step in range(10):
             context = {"step": step, "acceptance_rate": 0.5}
@@ -28,7 +28,7 @@ class TestFixedKController:
         """Test controller info."""
         controller = FixedKController(k=3)
         info = controller.get_info()
-        
+
         assert info["controller"] == "fixed_k"
         assert info["k"] == 3
 
@@ -39,7 +39,7 @@ class TestAdaptiveKController:
     def test_initial_k(self):
         """Test that controller starts with initial K."""
         controller = AdaptiveKController(initial_k=4, min_k=1, max_k=8)
-        
+
         context = {"step": 0, "acceptance_rate": 0.5}
         k = controller.get_k(0, context)
         assert k == 4
@@ -49,12 +49,12 @@ class TestAdaptiveKController:
         controller = AdaptiveKController(
             initial_k=4, min_k=1, max_k=8, target_acceptance_rate=0.7
         )
-        
+
         # Simulate high acceptance rates
         for step in range(5):
             context = {"step": step, "acceptance_rate": 0.9}
             k = controller.get_k(step, context)
-        
+
         # K should have increased
         assert k > 4
 
@@ -63,12 +63,12 @@ class TestAdaptiveKController:
         controller = AdaptiveKController(
             initial_k=4, min_k=1, max_k=8, target_acceptance_rate=0.7
         )
-        
+
         # Simulate low acceptance rates
         for step in range(5):
             context = {"step": step, "acceptance_rate": 0.3}
             k = controller.get_k(step, context)
-        
+
         # K should have decreased
         assert k < 4
 
@@ -77,7 +77,7 @@ class TestAdaptiveKController:
         controller = AdaptiveKController(
             initial_k=4, min_k=2, max_k=6, target_acceptance_rate=0.7
         )
-        
+
         # Simulate very high acceptance rates
         for step in range(10):
             context = {"step": step, "acceptance_rate": 0.95}
@@ -89,12 +89,12 @@ class TestAdaptiveKController:
         controller = AdaptiveKController(
             initial_k=4, min_k=1, max_k=8, step_size=2, target_acceptance_rate=0.7
         )
-        
+
         # Simulate high acceptance rates (need at least 4 iterations)
         for step in range(5):
             context = {"step": step, "acceptance_rate": 0.9}
             k = controller.get_k(step, context)
-        
+
         # K should have increased by step_size (but may have hit max)
         assert k >= 6  # 4 + 2, but may have increased further
 
@@ -103,17 +103,17 @@ class TestAdaptiveKController:
         controller = AdaptiveKController(
             initial_k=4, min_k=1, max_k=8, window_size=3, target_acceptance_rate=0.7
         )
-        
+
         # Fill up history with low acceptance
         for step in range(4):
             context = {"step": step, "acceptance_rate": 0.3}
             k = controller.get_k(step, context)
-        
+
         # Add high acceptance to recent history
         for step in range(4, 8):
             context = {"step": step, "acceptance_rate": 0.9}
             k = controller.get_k(step, context)
-        
+
         # K should have increased due to recent high acceptance (but may have hit max)
         assert k >= 4  # May have increased or stayed the same
 
@@ -122,14 +122,14 @@ class TestAdaptiveKController:
         controller = AdaptiveKController(
             initial_k=4, min_k=1, max_k=8, target_acceptance_rate=0.7
         )
-        
+
         # Add some history
         for step in range(5):
             context = {"step": step, "acceptance_rate": 0.5}
             controller.get_k(step, context)
-        
+
         info = controller.get_info()
-        
+
         assert info["controller"] == "adaptive_k"
         assert info["current_k"] >= 1  # K may have changed due to adaptation
         assert info["min_k"] == 1
@@ -143,12 +143,12 @@ class TestAdaptiveKController:
         controller = AdaptiveKController(
             initial_k=4, min_k=1, max_k=8, target_acceptance_rate=0.7
         )
-        
+
         # Only 2 iterations of history (less than 4 required)
         for step in range(2):
             context = {"step": step, "acceptance_rate": 0.9}
             k = controller.get_k(step, context)
-        
+
         # K should still be initial value
         assert k == 4
 
@@ -165,11 +165,7 @@ class TestCreateController:
     def test_create_adaptive(self):
         """Test creating adaptive controller."""
         controller = create_controller(
-            "adaptive", 
-            initial_k=3, 
-            min_k=1, 
-            max_k=10,
-            target_acceptance_rate=0.8
+            "adaptive", initial_k=3, min_k=1, max_k=10, target_acceptance_rate=0.8
         )
         assert isinstance(controller, AdaptiveKController)
         assert controller.initial_k == 3

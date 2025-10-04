@@ -58,7 +58,8 @@ class BenchmarkRunner:
             host: Server hostname (for HTTP mode)
             port: Server port (for HTTP mode)
             compare_baseline: Whether to run baseline comparison (for specdec mode)
-            eval_perplexity: Whether to evaluate text quality using perplexity (HF mode only)
+            eval_perplexity: Whether to evaluate text quality using perplexity
+                (HF mode only)
         """
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config(config_path)
@@ -103,12 +104,19 @@ class BenchmarkRunner:
 
         # Initialize perplexity evaluator if requested and in HF mode
         self.evaluator = None
-        if eval_perplexity and mode == "specdec" and self.config.get("implementation") == "hf":
+        if (
+            eval_perplexity
+            and mode == "specdec"
+            and self.config.get("implementation") == "hf"
+        ):
             try:
                 eval_model = self.config.get("eval_model", "sshleifer/tiny-gpt2")
                 eval_device = self.config.get("eval_device", "cpu")
                 self.evaluator = create_evaluator(eval_model, eval_device)
-                self.logger.info(f"Initialized perplexity evaluator with {eval_model} on {eval_device}")
+                self.logger.info(
+                    f"Initialized perplexity evaluator with {eval_model} "
+                    f"on {eval_device}"
+                )
             except Exception as e:
                 self.logger.warning(f"Failed to initialize perplexity evaluator: {e}")
                 self.evaluator = None
@@ -214,10 +222,12 @@ class BenchmarkRunner:
                 latency_ms = result["latency_ms"]
                 tokens_generated = len(result["generated_tokens"])
                 acceptance_rate = result["acceptance_rate"]
-                
+
                 # Add perplexity evaluation if requested and in HF mode
-                if hasattr(self, 'evaluator') and self.evaluator is not None:
-                    perplexity_result = self.evaluator.calculate_perplexity(result["text"])
+                if hasattr(self, "evaluator") and self.evaluator is not None:
+                    perplexity_result = self.evaluator.calculate_perplexity(
+                        result["text"]
+                    )
                     result["perplexity"] = perplexity_result["perplexity"]
                     result["perplexity_loss"] = perplexity_result["loss"]
 

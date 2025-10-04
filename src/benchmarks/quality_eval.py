@@ -29,7 +29,7 @@ class PerplexityEvaluator:
         self.model_name = model_name
         self.device = device
         self.logger = logging.getLogger(__name__)
-        
+
         # Load model and tokenizer
         self._load_model()
 
@@ -44,11 +44,11 @@ class PerplexityEvaluator:
                 device_map={"": self.device},
                 low_cpu_mem_usage=True,
             )
-            
+
             # Set pad token if not present
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
-                
+
             self.logger.info(f"Evaluation model loaded successfully on {self.device}")
         except Exception as e:
             self.logger.error(f"Failed to load evaluation model: {e}")
@@ -101,7 +101,9 @@ class PerplexityEvaluator:
                 "error": str(e),
             }
 
-    def compare_texts(self, texts: List[str], labels: Optional[List[str]] = None) -> Dict[str, Any]:
+    def compare_texts(
+        self, texts: List[str], labels: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
         """
         Compare perplexity of multiple texts.
 
@@ -122,8 +124,10 @@ class PerplexityEvaluator:
             results.append(result)
 
         # Calculate statistics
-        perplexities = [r["perplexity"] for r in results if r["perplexity"] != float("inf")]
-        
+        perplexities = [
+            r["perplexity"] for r in results if r["perplexity"] != float("inf")
+        ]
+
         if perplexities:
             avg_perplexity = sum(perplexities) / len(perplexities)
             min_perplexity = min(perplexities)
@@ -157,7 +161,9 @@ class PerplexityEvaluator:
             torch.mps.empty_cache()
 
 
-def create_evaluator(model_name: str = "sshleifer/tiny-gpt2", device: str = "cpu") -> PerplexityEvaluator:
+def create_evaluator(
+    model_name: str = "sshleifer/tiny-gpt2", device: str = "cpu"
+) -> PerplexityEvaluator:
     """
     Create a perplexity evaluator with the specified model.
 

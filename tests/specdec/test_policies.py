@@ -22,9 +22,9 @@ class TestLongestPrefixPolicy:
         policy = LongestPrefixPolicy()
         proposed = torch.tensor([[1, 2, 3, 4]])
         base = torch.tensor([[1, 2, 3, 4]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base)
-        
+
         assert accepted_len == 4
         assert info["policy"] == "longest_prefix"
         assert info["accepted_len"] == 4
@@ -36,9 +36,9 @@ class TestLongestPrefixPolicy:
         policy = LongestPrefixPolicy()
         proposed = torch.tensor([[1, 2, 3, 4]])
         base = torch.tensor([[1, 2, 5, 6]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base)
-        
+
         assert accepted_len == 2
         assert info["accepted_len"] == 2
 
@@ -47,9 +47,9 @@ class TestLongestPrefixPolicy:
         policy = LongestPrefixPolicy()
         proposed = torch.tensor([[1, 2, 3, 4]])
         base = torch.tensor([[5, 6, 7, 8]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base)
-        
+
         assert accepted_len == 0
         assert info["accepted_len"] == 0
 
@@ -58,9 +58,9 @@ class TestLongestPrefixPolicy:
         policy = LongestPrefixPolicy()
         proposed = torch.tensor([[1, 2, 3]])
         base = torch.tensor([[1, 2, 3, 4, 5]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base)
-        
+
         assert accepted_len == 3
         assert info["accepted_len"] == 3
 
@@ -73,12 +73,12 @@ class TestConfidenceThresholdPolicy:
         policy = ConfidenceThresholdPolicy(tau=0.5)
         proposed = torch.tensor([[1, 2, 3]])
         base = torch.tensor([[1, 2, 3]])
-        
+
         # Create high confidence logits
         logits = torch.tensor([[[0.1, 0.1, 0.8], [0.1, 0.1, 0.8], [0.1, 0.1, 0.8]]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base, logits)
-        
+
         assert accepted_len == 3
         assert info["policy"] == "conf_threshold"
         assert info["tau"] == 0.5
@@ -88,12 +88,12 @@ class TestConfidenceThresholdPolicy:
         policy = ConfidenceThresholdPolicy(tau=0.8)
         proposed = torch.tensor([[1, 2, 3]])
         base = torch.tensor([[1, 2, 3]])
-        
+
         # Create low confidence logits
         logits = torch.tensor([[[0.3, 0.3, 0.4], [0.3, 0.3, 0.4], [0.3, 0.3, 0.4]]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base, logits)
-        
+
         assert accepted_len == 0
         assert info["accepted_len"] == 0
 
@@ -102,9 +102,9 @@ class TestConfidenceThresholdPolicy:
         policy = ConfidenceThresholdPolicy(tau=0.5)
         proposed = torch.tensor([[1, 2, 3]])
         base = torch.tensor([[1, 2, 3]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base)
-        
+
         assert accepted_len == 3
         assert info["policy"] == "longest_prefix"  # Fallback policy
 
@@ -117,13 +117,19 @@ class TestTopKAgreementPolicy:
         policy = TopKAgreementPolicy(k=3)
         proposed = torch.tensor([[0, 1, 2]])  # Tokens 0, 1, 2
         base = torch.tensor([[0, 1, 2]])
-        
+
         # Create logits where proposed tokens (0, 1, 2) are in top-k
-        proposed_logits = torch.tensor([[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]])
-        base_logits = torch.tensor([[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]])
-        
-        accepted_len, info = policy.accept_tokens(proposed, base, proposed_logits, base_logits)
-        
+        proposed_logits = torch.tensor(
+            [[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]]
+        )
+        base_logits = torch.tensor(
+            [[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]]
+        )
+
+        accepted_len, info = policy.accept_tokens(
+            proposed, base, proposed_logits, base_logits
+        )
+
         assert accepted_len == 3
         assert info["policy"] == "topk_agree"
         assert info["k"] == 3
@@ -133,14 +139,21 @@ class TestTopKAgreementPolicy:
         policy = TopKAgreementPolicy(k=2)
         proposed = torch.tensor([[0, 1, 2]])  # Tokens 0, 1, 2
         base = torch.tensor([[0, 1, 2]])
-        
+
         # Create logits where proposed tokens (0, 1, 2) are not in base model's top-2
-        # Base model top-2 should be [2, 1] for all positions, but proposed tokens are [0, 1, 2]
-        proposed_logits = torch.tensor([[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]])
-        base_logits = torch.tensor([[[0.1, 0.1, 0.8], [0.1, 0.1, 0.8], [0.1, 0.1, 0.8]]])
-        
-        accepted_len, info = policy.accept_tokens(proposed, base, proposed_logits, base_logits)
-        
+        # Base model top-2 should be [2, 1] for all positions,
+        # but proposed tokens are [0, 1, 2]
+        proposed_logits = torch.tensor(
+            [[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]]
+        )
+        base_logits = torch.tensor(
+            [[[0.1, 0.1, 0.8], [0.1, 0.1, 0.8], [0.1, 0.1, 0.8]]]
+        )
+
+        accepted_len, info = policy.accept_tokens(
+            proposed, base, proposed_logits, base_logits
+        )
+
         # Token 0 is in base model's top-2 [2, 0], so it accepts 1 token
         assert accepted_len == 1
         assert info["accepted_len"] == 1
@@ -150,9 +163,9 @@ class TestTopKAgreementPolicy:
         policy = TopKAgreementPolicy(k=3)
         proposed = torch.tensor([[1, 2, 3]])
         base = torch.tensor([[1, 2, 3]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base)
-        
+
         assert accepted_len == 3
         assert info["policy"] == "longest_prefix"  # Fallback policy
 
@@ -165,13 +178,19 @@ class TestTypicalAcceptancePolicy:
         policy = TypicalAcceptancePolicy(p=0.5)
         proposed = torch.tensor([[0, 1, 2]])  # Tokens 0, 1, 2
         base = torch.tensor([[0, 1, 2]])
-        
+
         # Create logits with high probability for proposed tokens (0, 1, 2)
-        proposed_logits = torch.tensor([[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]])
-        base_logits = torch.tensor([[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]])
-        
-        accepted_len, info = policy.accept_tokens(proposed, base, proposed_logits, base_logits)
-        
+        proposed_logits = torch.tensor(
+            [[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]]
+        )
+        base_logits = torch.tensor(
+            [[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]]
+        )
+
+        accepted_len, info = policy.accept_tokens(
+            proposed, base, proposed_logits, base_logits
+        )
+
         assert accepted_len == 3
         assert info["policy"] == "typical"
         assert info["p"] == 0.5
@@ -181,13 +200,19 @@ class TestTypicalAcceptancePolicy:
         policy = TypicalAcceptancePolicy(p=0.9)
         proposed = torch.tensor([[1, 2, 3]])
         base = torch.tensor([[1, 2, 3]])
-        
+
         # Create logits with low probability for proposed tokens
-        proposed_logits = torch.tensor([[[0.1, 0.1, 0.8], [0.1, 0.1, 0.8], [0.1, 0.1, 0.8]]])
-        base_logits = torch.tensor([[[0.1, 0.1, 0.8], [0.1, 0.1, 0.8], [0.1, 0.1, 0.8]]])
-        
-        accepted_len, info = policy.accept_tokens(proposed, base, proposed_logits, base_logits)
-        
+        proposed_logits = torch.tensor(
+            [[[0.1, 0.1, 0.8], [0.1, 0.1, 0.8], [0.1, 0.1, 0.8]]]
+        )
+        base_logits = torch.tensor(
+            [[[0.1, 0.1, 0.8], [0.1, 0.1, 0.8], [0.1, 0.1, 0.8]]]
+        )
+
+        accepted_len, info = policy.accept_tokens(
+            proposed, base, proposed_logits, base_logits
+        )
+
         assert accepted_len == 0
         assert info["accepted_len"] == 0
 
@@ -196,9 +221,9 @@ class TestTypicalAcceptancePolicy:
         policy = TypicalAcceptancePolicy(p=0.5)
         proposed = torch.tensor([[1, 2, 3]])
         base = torch.tensor([[1, 2, 3]])
-        
+
         accepted_len, info = policy.accept_tokens(proposed, base)
-        
+
         assert accepted_len == 3
         assert info["policy"] == "longest_prefix"  # Fallback policy
 
