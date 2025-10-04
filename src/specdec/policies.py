@@ -44,6 +44,16 @@ class AcceptancePolicy(ABC):
         """
         pass
 
+    @abstractmethod
+    def get_info(self) -> Dict[str, Any]:
+        """
+        Get policy-specific information for logging and results.
+
+        Returns:
+            Dictionary with policy-specific information
+        """
+        pass
+
 
 class LongestPrefixPolicy(AcceptancePolicy):
     """Default policy: accept the longest matching prefix."""
