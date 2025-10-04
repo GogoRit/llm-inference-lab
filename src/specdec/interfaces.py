@@ -21,7 +21,7 @@ class LanguageModel(ABC):
         max_new_tokens: int,
         temperature: float = 0.7,
         do_sample: bool = True,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate tokens from the model.
@@ -97,7 +97,7 @@ class SpeculativeDecoder(ABC):
         max_tokens: int,
         temperature: float = 0.7,
         do_sample: bool = True,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Generate text using speculative decoding.
