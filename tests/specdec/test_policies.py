@@ -5,9 +5,13 @@ Unit tests for acceptance policies.
 import pytest
 import torch
 
-from src.specdec.policies import (ConfidenceThresholdPolicy,
-                                  LongestPrefixPolicy, TopKAgreementPolicy,
-                                  TypicalAcceptancePolicy, create_policy)
+from src.specdec.policies import (
+    ConfidenceThresholdPolicy,
+    LongestPrefixPolicy,
+    TopKAgreementPolicy,
+    TypicalAcceptancePolicy,
+    create_policy,
+)
 
 
 class TestLongestPrefixPolicy:
