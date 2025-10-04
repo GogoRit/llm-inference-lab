@@ -93,11 +93,15 @@ class FakeLM(LanguageModel):
                 token_id = (token_id + 1) % self._vocab_size
             generated_tokens.append(token_id)
 
-        # Convert to tensor
-        generated_ids = torch.tensor([generated_tokens], dtype=torch.long)
+        # Convert to tensor on the same device as input
+        generated_ids = torch.tensor(
+            [generated_tokens], dtype=torch.long, device=input_ids.device
+        )
 
-        # Generate fake logits (uniform distribution)
-        logits = torch.randn(1, max_new_tokens, self._vocab_size)
+        # Generate fake logits (uniform distribution) on the same device
+        logits = torch.randn(
+            1, max_new_tokens, self._vocab_size, device=input_ids.device
+        )
 
         return generated_ids, logits
 

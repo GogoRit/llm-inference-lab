@@ -99,6 +99,65 @@ Examples:
         help="Force both models to same device (cpu or mps)",
     )
 
+    # Policy arguments
+    parser.add_argument(
+        "--policy",
+        type=str,
+        choices=["longest_prefix", "conf_threshold", "topk_agree", "typical"],
+        default="longest_prefix",
+        help="Acceptance policy (default: longest_prefix)",
+    )
+    parser.add_argument(
+        "--tau",
+        type=float,
+        help="Confidence threshold for conf_threshold policy (default: 0.5)",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        help="Top-k value for topk_agree policy (default: 5)",
+    )
+    parser.add_argument(
+        "--p",
+        type=float,
+        help="Typical acceptance probability for typical policy (default: 0.9)",
+    )
+
+    # Controller arguments
+    parser.add_argument(
+        "--controller",
+        type=str,
+        choices=["fixed", "adaptive"],
+        default="fixed",
+        help="K controller type (default: fixed)",
+    )
+    parser.add_argument(
+        "--K",
+        type=int,
+        default=4,
+        help="Fixed K value for fixed controller (default: 4)",
+    )
+    parser.add_argument(
+        "--adaptive-K",
+        action="store_true",
+        help="Use adaptive K controller (mutually exclusive with --K)",
+    )
+    parser.add_argument(
+        "--min-k",
+        type=int,
+        help="Minimum K for adaptive controller (default: 1)",
+    )
+    parser.add_argument(
+        "--max-k",
+        type=int,
+        help="Maximum K for adaptive controller (default: 8)",
+    )
+    parser.add_argument(
+        "--target-acceptance",
+        type=float,
+        help="Target acceptance rate for adaptive controller (default: 0.7)",
+    )
+
     return parser.parse_args()
 
 
@@ -111,6 +170,35 @@ def main() -> None:
     logger = logging.getLogger(__name__)
 
     try:
+        # Handle mutual exclusivity between --K and --adaptive-K
+        # Check if both were explicitly provided by looking at sys.argv
+        has_K = any(arg.startswith("--K") for arg in sys.argv)
+        has_adaptive_K = "--adaptive-K" in sys.argv
+        if has_K and has_adaptive_K:
+            logger.error("Cannot specify both --K and --adaptive-K")
+            sys.exit(1)
+
+        # Determine controller type and parameters
+        if args.adaptive_K:
+            controller = "adaptive"
+            controller_params = {
+                "min_k": args.min_k,
+                "max_k": args.max_k,
+                "target_acceptance_rate": args.target_acceptance,
+            }
+        else:
+            controller = "fixed"
+            controller_params = {"k": args.K}
+
+        # Determine policy parameters
+        policy_params = {}
+        if args.tau is not None:
+            policy_params["tau"] = args.tau
+        if args.k is not None:
+            policy_params["k"] = args.k
+        if args.p is not None:
+            policy_params["p"] = args.p
+
         # Initialize pipeline
         logger.info(f"Initializing speculative decoding pipeline (impl={args.impl})...")
         pipeline = SpeculativePipeline(
@@ -122,10 +210,15 @@ def main() -> None:
             seed=args.seed,
             implementation=args.impl,
             force_device=args.force_device,
+            policy=args.policy,
+            policy_params=policy_params,
+            controller=controller,
+            controller_params=controller_params,
         )
 
         # Generate text
         logger.info(f"Generating text for prompt: '{args.prompt[:50]}...'")
+        logger.info(f"max_tokens: {args.max_tokens}, type: {type(args.max_tokens)}")
         result = pipeline.generate(
             prompt=args.prompt,
             max_tokens=args.max_tokens,

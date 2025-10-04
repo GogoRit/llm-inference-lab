@@ -2,8 +2,8 @@
 # Uses tiny models for memory safety
 
 # Model configuration
-base_model: sshleifer/tiny-gpt2  # Tiny model for memory safety
-draft_model: sshleifer/tiny-gpt2  # Same as base for compatibility
+base_model: sshleifer/tiny-gpt2  # Base model for verification
+draft_model: sshleifer/tiny-gpt2  # Draft model for proposal generation
 max_draft: 2
 implementation: hf  # Use Hugging Face models
 

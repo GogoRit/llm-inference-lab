@@ -34,6 +34,7 @@ sys.path.insert(0, str(SRC_DIR))
 from server.local_baseline import LocalBaselineRunner  # noqa: E402
 from server.ping_vllm import VLLMPingClient  # noqa: E402
 from specdec.pipeline import SpeculativePipeline  # noqa: E402
+from benchmarks.quality_eval import create_evaluator  # noqa: E402
 
 
 class BenchmarkRunner:
@@ -46,6 +47,7 @@ class BenchmarkRunner:
         host: str = None,
         port: int = None,
         compare_baseline: bool = False,
+        eval_perplexity: bool = False,
     ):
         """
         Initialize the benchmark runner.
@@ -56,6 +58,7 @@ class BenchmarkRunner:
             host: Server hostname (for HTTP mode)
             port: Server port (for HTTP mode)
             compare_baseline: Whether to run baseline comparison (for specdec mode)
+            eval_perplexity: Whether to evaluate text quality using perplexity (HF mode only)
         """
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config(config_path)
@@ -97,6 +100,18 @@ class BenchmarkRunner:
             raise ValueError(
                 f"Invalid mode: {mode}. Must be 'local', 'http', or 'specdec'"
             )
+
+        # Initialize perplexity evaluator if requested and in HF mode
+        self.evaluator = None
+        if eval_perplexity and mode == "specdec" and self.config.get("implementation") == "hf":
+            try:
+                eval_model = self.config.get("eval_model", "sshleifer/tiny-gpt2")
+                eval_device = self.config.get("eval_device", "cpu")
+                self.evaluator = create_evaluator(eval_model, eval_device)
+                self.logger.info(f"Initialized perplexity evaluator with {eval_model} on {eval_device}")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize perplexity evaluator: {e}")
+                self.evaluator = None
 
     def _load_config(self, config_path: str = None) -> Dict[str, Any]:
         """Load benchmark configuration."""
@@ -148,8 +163,10 @@ class BenchmarkRunner:
 
         if self.mode == "local":
             self.logger.info(f"Device: {self.runner.device}")
-        else:
+        elif self.mode == "http":
             self.logger.info(f"Server: {self.runner.base_url}")
+        elif self.mode == "specdec":
+            self.logger.info(f"Implementation: {self.runner.implementation}")
 
         # Test connectivity for HTTP mode
         if self.mode == "http":
@@ -197,6 +214,12 @@ class BenchmarkRunner:
                 latency_ms = result["latency_ms"]
                 tokens_generated = len(result["generated_tokens"])
                 acceptance_rate = result["acceptance_rate"]
+                
+                # Add perplexity evaluation if requested and in HF mode
+                if hasattr(self, 'evaluator') and self.evaluator is not None:
+                    perplexity_result = self.evaluator.calculate_perplexity(result["text"])
+                    result["perplexity"] = perplexity_result["perplexity"]
+                    result["perplexity_loss"] = perplexity_result["loss"]
 
             tokens_per_sec = tokens_generated / (latency_ms / 1000.0)
 
@@ -431,6 +454,11 @@ def main():
         action="store_true",
         help="Run baseline comparison (for specdec mode only)",
     )
+    parser.add_argument(
+        "--eval-perplexity",
+        action="store_true",
+        help="Evaluate text quality using perplexity (HF mode only)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
 
     args = parser.parse_args()
@@ -448,6 +476,7 @@ def main():
         host=args.host,
         port=args.port,
         compare_baseline=args.compare_baseline,
+        eval_perplexity=args.eval_perplexity,
     )
     stats = benchmark.run_benchmark(args.prompt, args.iterations)
 

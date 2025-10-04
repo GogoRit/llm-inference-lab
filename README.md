@@ -109,15 +109,18 @@ device_priority: ["mps", "cuda", "cpu"]
 
 ### Speculative Decoding
 
-Speculative decoding uses a small draft model to propose multiple tokens, then verifies them with the base model for faster inference. The implementation features a dual-mode architecture optimized for both testing and production use cases.
+Speculative decoding uses a small draft model to propose multiple tokens, then verifies them with the base model for faster inference. The implementation features advanced acceptance policies, adaptive K controllers, and comprehensive instrumentation for research and production use cases.
 
 **FakeLM Mode (Testing & Development)**:
 ```bash
 # Default mode - memory safe, deterministic testing
 python -m src.specdec.run_specdec --prompt "Explain KV cache simply." --max-tokens 64 --impl fake
 
-# With custom parameters
-python -m src.specdec.run_specdec --prompt "Test" --max-draft 8 --temperature 0.8 --seed 42 --impl fake
+# With custom parameters and policies
+python -m src.specdec.run_specdec --prompt "Test" --K 8 --policy conf_threshold --tau 0.7 --impl fake
+
+# Using adaptive K controller
+python -m src.specdec.run_specdec --prompt "Test" --adaptive-K --min-k 1 --max-k 8 --impl fake
 
 # Using configuration file
 python -m src.specdec.run_specdec --config configs/specdec.yaml --prompt "Test" --impl fake
@@ -128,14 +131,29 @@ python -m src.specdec.run_specdec --config configs/specdec.yaml --prompt "Test" 
 # Real models with tiny configurations for memory safety
 python -m src.specdec.run_specdec --prompt "Test real inference" --max-tokens 20 --impl hf --force-device cpu
 
+# With different base and draft models
+python -m src.specdec.run_specdec --prompt "Test" --base-model sshleifer/tiny-gpt2 --draft-model sshleifer/tiny-gpt2 --impl hf
+
 # Using HF-specific configuration
 python -m src.specdec.run_specdec --config configs/specdec_hf.yaml --prompt "Test" --impl hf
 ```
 
+**Advanced Features**:
+
+**Acceptance Policies**:
+- `longest_prefix` (default): Accept longest matching prefix
+- `conf_threshold`: Accept tokens above confidence threshold (--tau)
+- `topk_agree`: Accept tokens in base model's top-k predictions (--k)
+- `typical`: Accept tokens above typical probability (--p)
+
+**K Controllers**:
+- `fixed`: Fixed K value (--K)
+- `adaptive`: Adaptive K based on acceptance rates (--adaptive-K, --min-k, --max-k, --target-acceptance)
+
 **Architecture**:
-1. **Draft Model**: Small model proposes up to K tokens
-2. **Verification**: Base model verifies proposals with exact-match policy
-3. **Acceptance**: Accept consecutive tokens that match base model's greedy continuation
+1. **Draft Model**: Small model proposes up to K tokens (controlled by K controller)
+2. **Verification**: Base model verifies proposals with selected acceptance policy
+3. **Acceptance**: Policy determines how many proposed tokens to accept
 4. **Fallback**: If no tokens accepted, generate one token with base model
 5. **Repeat**: Continue until max_tokens or stop condition
 
@@ -157,6 +175,9 @@ python -m src.benchmarks.run_bench --mode specdec --prompt "Why speculative deco
 
 # Compare speculative decoding vs baseline
 python -m src.benchmarks.run_bench --mode specdec --compare-baseline --prompt "Test comparison" --iterations 3
+
+# Benchmark with perplexity evaluation (HF mode only)
+python -m src.benchmarks.run_bench --mode specdec --eval-perplexity --prompt "Quality test" --iterations 3
 
 # Use different configuration files
 python -m src.benchmarks.run_bench --config configs/baseline.yaml --prompt "Test" --mode local
@@ -262,7 +283,8 @@ llm-inference-lab/
 | 1B | Benchmark client | Complete | HTTP client + dual-mode benchmarking (local/HTTP) |
 | 1C | CI/CD sanity | Complete | Automated testing and code quality checks |
 | 2A | Speculative decoding | Complete | CPU/MPS draft-and-verify pipeline with benchmarking |
-| 2B | Advanced specdec | Next | Medusa/EAGLE techniques and optimizations |
+| 2B | Advanced specdec | Complete | Acceptance policies, adaptive K controllers, instrumentation |
+| 2C | Advanced specdec | Next | Medusa/EAGLE techniques and optimizations |
 | 3 | Quantization | Future | BitsAndBytes 4-bit/8-bit quantization experiments |
 | 4 | Multi-GPU scaling | Future | Distributed inference and load balancing |
 | 5 | Cloud deployment | Future | A100/H100 benchmarking and results collection |
@@ -272,7 +294,8 @@ llm-inference-lab/
 - **Phase 1B**: Complete - HTTP client and dual-mode benchmark harness
 - **Phase 1C**: Complete - CI/CD pipeline optimization and testing
 - **Phase 2A**: Complete - Speculative decoding CPU/MPS baseline with dual-mode architecture
-- **Phase 2B**: Next - Advanced speculative decoding techniques (Medusa, EAGLE)
+- **Phase 2B**: Complete - Advanced speculative decoding with policies, controllers, and instrumentation
+- **Phase 2C**: Next - Advanced speculative decoding techniques (Medusa, EAGLE)
 
 ### Future Phases
 - **Phase 3**: Quantization techniques and memory optimization

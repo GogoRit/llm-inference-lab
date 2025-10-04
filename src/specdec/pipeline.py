@@ -10,6 +10,7 @@ Orchestrates the speculative decoding loop:
 
 import logging
 import time
+import psutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -19,6 +20,8 @@ import yaml
 from .fake_lm import create_fake_lm
 from .hf_wrappers import create_tiny_hf_wrapper
 from .interfaces import LanguageModel, SpeculativeDecoder
+from .policies import create_policy, AcceptancePolicy
+from .controllers import create_controller, KController
 
 
 class SpeculativePipeline(SpeculativeDecoder):
@@ -36,6 +39,10 @@ class SpeculativePipeline(SpeculativeDecoder):
         seed: Optional[int] = None,
         implementation: Optional[str] = None,
         force_device: Optional[str] = None,
+        policy: str = "longest_prefix",
+        policy_params: Optional[Dict[str, Any]] = None,
+        controller: str = "fixed",
+        controller_params: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the speculative decoding pipeline.
@@ -51,6 +58,11 @@ class SpeculativePipeline(SpeculativeDecoder):
             seed: Random seed for reproducibility
             implementation: Implementation type ("fake" or "hf")
             force_device: Force both models to same device ("cpu", "mps")
+            policy: Acceptance policy name ("longest_prefix",
+                   "conf_threshold", "topk_agree", "typical")
+            policy_params: Parameters for the acceptance policy
+            controller: K controller type ("fixed", "adaptive")
+            controller_params: Parameters for the K controller
         """
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config(config_path)
@@ -62,7 +74,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             self.config["draft_model"] = draft_model
         if max_draft:
             self.config["max_draft"] = max_draft
-        if device != "auto":
+        if device is not None and device != "auto":
             self.config["device"] = device
         if implementation:
             self.config["implementation"] = implementation
@@ -85,6 +97,10 @@ class SpeculativePipeline(SpeculativeDecoder):
         # Initialize models with dependency injection
         self.base_lm = base_lm or self._create_base_model()
         self.draft_lm = draft_lm or self._create_draft_model()
+
+        # Initialize policy and controller
+        self.policy = self._create_policy(policy, policy_params)
+        self.controller = self._create_controller(controller, controller_params)
 
         # Check tokenizer compatibility
         self._check_compatibility()
@@ -144,6 +160,8 @@ class SpeculativePipeline(SpeculativeDecoder):
         if self.implementation == "fake":
             return create_fake_lm(
                 model_name=f"fake-base-{self.config['base_model']}",
+                vocab_size=1000,
+                device="cpu",
                 seed=self.config.get("seed"),
             )
         elif self.implementation == "hf":
@@ -162,6 +180,8 @@ class SpeculativePipeline(SpeculativeDecoder):
         if self.implementation == "fake":
             return create_fake_lm(
                 model_name=f"fake-draft-{self.config['draft_model']}",
+                vocab_size=1000,
+                device="cpu",
                 seed=self.config.get("seed"),
                 # Don't use acceptance rate for deterministic behavior
             )
@@ -203,6 +223,20 @@ class SpeculativePipeline(SpeculativeDecoder):
                 return "cpu"
         return device
 
+    def _create_policy(
+        self, policy_name: str, policy_params: Optional[Dict[str, Any]]
+    ) -> AcceptancePolicy:
+        """Create acceptance policy."""
+        params = policy_params or {}
+        return create_policy(policy_name, **params)
+
+    def _create_controller(
+        self, controller_type: str, controller_params: Optional[Dict[str, Any]]
+    ) -> KController:
+        """Create K controller."""
+        params = controller_params or {}
+        return create_controller(controller_type, **params)
+
     def _check_compatibility(self) -> None:
         """Check tokenizer compatibility between draft and base models."""
         base_info = self.base_lm.get_tokenizer_info()
@@ -224,36 +258,6 @@ class SpeculativePipeline(SpeculativeDecoder):
                 "Different tokenizer families detected. This may reduce "
                 "acceptance rates."
             )
-
-    def _find_accepted_length(
-        self, proposed_tokens: torch.Tensor, base_tokens: torch.Tensor
-    ) -> int:
-        """
-        Find the length of the longest matching prefix between proposed and base tokens.
-
-        Args:
-            proposed_tokens: Proposed token IDs [batch_size, num_proposed]
-            base_tokens: Base model token IDs [batch_size, num_base]
-
-        Returns:
-            Length of accepted prefix
-        """
-        # For simplicity, we'll work with the first batch item
-        proposed = proposed_tokens[0].cpu().numpy()
-        base = base_tokens[0].cpu().numpy()
-
-        # Find the minimum length to compare
-        min_len = min(len(proposed), len(base))
-
-        # Count consecutive matching tokens
-        accepted_len = 0
-        for i in range(min_len):
-            if proposed[i] == base[i]:
-                accepted_len += 1
-            else:
-                break
-
-        return accepted_len
 
     def generate(
         self,
@@ -282,6 +286,10 @@ class SpeculativePipeline(SpeculativeDecoder):
         max_tokens = max_tokens or self.config["max_new_tokens"]
         temperature = temperature or self.config["temperature"]
         do_sample = do_sample if do_sample is not None else self.config["do_sample"]
+
+        self.logger.debug(f"max_tokens: {max_tokens}, type: {type(max_tokens)}")
+        self.logger.debug(f"temperature: {temperature}, type: {type(temperature)}")
+        self.logger.debug(f"do_sample: {do_sample}, type: {type(do_sample)}")
 
         # Reset metrics
         self.metrics = {
@@ -316,29 +324,61 @@ class SpeculativePipeline(SpeculativeDecoder):
             while (
                 len(generated_tokens) < max_tokens and step < max_tokens * 2
             ):  # Safety limit
+                self.logger.debug(
+                    f"Loop condition: len(generated_tokens)={len(generated_tokens)} "
+                    f"< max_tokens={max_tokens} and step={step} "
+                    f"< max_tokens*2={max_tokens * 2}"
+                )
                 step += 1
                 step_start = time.time()
 
+                # Get K from controller
+                context = {
+                    "step": step,
+                    "generated_tokens": len(generated_tokens),
+                    "acceptance_rate": (
+                        self.metrics["total_accepted"]
+                        / max(self.metrics["total_proposed"], 1)
+                    ),
+                }
+                self.logger.debug(f"Context: {context}")
+                k = self.controller.get_k(step, context)
+                self.logger.debug(f"K from controller: {k}, type: {type(k)}")
+
                 # Step 1: Generate draft tokens
-                draft_tokens, _ = self.draft_lm.generate_tokens(
+                draft_start = time.time()
+                self.logger.debug(
+                    f"Generating draft tokens with k={k}, "
+                    f"temperature={temperature}, do_sample={do_sample}"
+                )
+                draft_tokens, draft_logits = self.draft_lm.generate_tokens(
                     current_input,
-                    max_new_tokens=self.max_draft,
+                    max_new_tokens=k,
                     temperature=temperature,
                     do_sample=do_sample,
                     **kwargs,
+                )
+                draft_time_ms = (time.time() - draft_start) * 1000
+                self.logger.debug(
+                    f"Draft tokens shape: {draft_tokens.shape}, "
+                    f"logits shape: {draft_logits.shape}"
                 )
 
                 # Step 2: Verify with base model
-                base_tokens, _ = self.base_lm.generate_tokens(
+                verify_start = time.time()
+                base_tokens, base_logits = self.base_lm.generate_tokens(
                     current_input,
-                    max_new_tokens=self.max_draft,
+                    max_new_tokens=k,
                     temperature=temperature,
                     do_sample=do_sample,
                     **kwargs,
                 )
+                verify_time_ms = (time.time() - verify_start) * 1000
 
-                # Find accepted length
-                accepted_len = self._find_accepted_length(draft_tokens, base_tokens)
+                # Step 3: Apply acceptance policy
+                accepted_len, policy_info = self.policy.accept_tokens(
+                    draft_tokens, base_tokens, draft_logits, base_logits
+                )
                 accepted_tokens = (
                     draft_tokens[:, :accepted_len]
                     if accepted_len > 0
@@ -348,8 +388,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Update metrics
                 self.metrics["total_proposed"] += draft_tokens.shape[1]
                 self.metrics["total_accepted"] += accepted_len
-                verification_time_ms = (time.time() - step_start) * 1000
-                self.metrics["total_verification_time_ms"] += verification_time_ms
+                self.metrics["total_verification_time_ms"] += verify_time_ms
+                self.metrics["total_generation_time_ms"] += draft_time_ms
+
+                # Log step details
+                self.logger.info(
+                    f"Step {step}: K={k}, proposed={draft_tokens.shape[1]}, "
+                    f"accepted={accepted_len}, t_draft={draft_time_ms:.1f}ms, "
+                    f"t_verify={verify_time_ms:.1f}ms, "
+                    f"total={len(generated_tokens)}/{max_tokens}"
+                )
 
                 # Step 3: Handle results
                 if accepted_len > 0:
@@ -447,6 +495,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                 else 0.0
             )
 
+            # Get memory usage
+            process = psutil.Process()
+            mem_rss_mb = process.memory_info().rss / 1024 / 1024
+
             result = {
                 "text": generated_text,
                 "generated_tokens": generated_tokens,
@@ -458,6 +510,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                 "steps": step,
                 "verification_time_ms": self.metrics["total_verification_time_ms"],
                 "generation_time_ms": self.metrics["total_generation_time_ms"],
+                "mem_rss_mb": mem_rss_mb,
+                "policy": self.policy.get_info(),
+                "controller": self.controller.get_info(),
                 "impl": self.implementation,
                 "device": self.force_device or self.device,
                 "base_model": self.config["base_model"],
