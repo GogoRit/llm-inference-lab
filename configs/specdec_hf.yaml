@@ -7,6 +7,19 @@ draft_model: sshleifer/tiny-gpt2  # Draft model for proposal generation
 max_draft: 2
 implementation: hf  # Use Hugging Face models
 
+# Draft mode configuration
+draft_mode: vanilla  # vanilla, medusa, eagle
+medusa:
+  enabled: false
+  num_heads: 2
+  head_init: "tie"  # tie/copy/random
+  temperature: 0.7
+  top_p: 1.0
+eagle:
+  enabled: false
+  alpha: 0.7
+  max_draft: 2
+
 # Generation parameters
 temperature: 0.3
 do_sample: false

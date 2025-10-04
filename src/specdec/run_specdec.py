@@ -93,6 +93,13 @@ Examples:
         help="Implementation type: fake (default) for testing, hf for real models",
     )
     parser.add_argument(
+        "--draft-mode",
+        type=str,
+        choices=["vanilla", "medusa", "eagle"],
+        default="vanilla",
+        help="Draft generation strategy (default: vanilla)",
+    )
+    parser.add_argument(
         "--force-device",
         type=str,
         choices=["cpu", "mps"],
@@ -214,6 +221,7 @@ def main() -> None:
             policy_params=policy_params,
             controller=controller,
             controller_params=controller_params,
+            draft_mode=args.draft_mode,
         )
 
         # Generate text

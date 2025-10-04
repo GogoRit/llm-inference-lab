@@ -43,6 +43,7 @@ class SpeculativePipeline(SpeculativeDecoder):
         policy_params: Optional[Dict[str, Any]] = None,
         controller: str = "fixed",
         controller_params: Optional[Dict[str, Any]] = None,
+        draft_mode: str = "vanilla",
     ):
         """
         Initialize the speculative decoding pipeline.
@@ -80,6 +81,8 @@ class SpeculativePipeline(SpeculativeDecoder):
             self.config["implementation"] = implementation
         if force_device:
             self.config["force_device"] = force_device
+        if draft_mode:
+            self.config["draft_mode"] = draft_mode
 
         # Set random seed if provided
         if seed is not None:
@@ -129,6 +132,19 @@ class SpeculativePipeline(SpeculativeDecoder):
             "top_k": 50,
             "repetition_penalty": 1.0,
             "implementation": "fake",
+            "draft_mode": "vanilla",
+            "medusa": {
+                "enabled": False,
+                "num_heads": 2,
+                "head_init": "tie",
+                "temperature": 0.7,
+                "top_p": 1.0,
+            },
+            "eagle": {
+                "enabled": False,
+                "alpha": 0.7,
+                "max_draft": 2,
+            },
         }
 
         if config_path and Path(config_path).exists():
