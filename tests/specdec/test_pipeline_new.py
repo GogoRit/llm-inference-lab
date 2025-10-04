@@ -246,5 +246,3 @@ class TestFakeLM:
 
         # Should have some variation due to acceptance rate
         assert len(set(results)) > 1
-
-
