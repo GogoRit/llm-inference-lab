@@ -23,9 +23,9 @@ DOCS_DIR = Path(__file__).parent
 # Available documentation sections
 SECTIONS = [
     "api",
-    "examples", 
+    "examples",
     "tutorials",
     "architecture",
     "performance",
-    "troubleshooting"
+    "troubleshooting",
 ]

@@ -168,7 +168,7 @@ class TestSpeculativePipeline:
         config_path = PROJECT_ROOT / "configs" / "specdec.yaml"
         if config_path.exists():
             pipeline = SpeculativePipeline(config_path=str(config_path))
-            assert pipeline.config["base_model"] == "facebook/opt-125m"
+            assert pipeline.config["base_model"] == "gpt2"
             assert pipeline.config["draft_model"] == "distilgpt2"
             assert pipeline.config["max_draft"] == 4
 

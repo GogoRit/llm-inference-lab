@@ -48,6 +48,8 @@ class BenchmarkRunner:
         port: Optional[int] = None,
         compare_baseline: bool = False,
         eval_perplexity: bool = False,
+        enable_profiling: bool = False,
+        profile_dir: Optional[str] = None,
     ):
         """
         Initialize the benchmark runner.
@@ -60,6 +62,8 @@ class BenchmarkRunner:
             compare_baseline: Whether to run baseline comparison (for specdec mode)
             eval_perplexity: Whether to evaluate text quality using perplexity
                 (HF mode only)
+            enable_profiling: Whether to enable comprehensive profiling
+            profile_dir: Directory to save profiling traces
         """
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config(config_path)
@@ -87,6 +91,9 @@ class BenchmarkRunner:
                 max_draft=self.config.get("max_draft"),
                 device=self.config.get("device"),
                 seed=self.config.get("seed"),
+                enable_optimization=True,
+                enable_profiling=enable_profiling,
+                profile_dir=profile_dir,
             )
             self.runner_name = "SpeculativePipeline"
 
@@ -473,6 +480,16 @@ def main():
         action="store_true",
         help="Evaluate text quality using perplexity (HF mode only)",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable comprehensive profiling and performance analysis",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        help="Directory to save profiling traces (default: profiles/)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
 
     args = parser.parse_args()
@@ -491,6 +508,8 @@ def main():
         port=args.port,
         compare_baseline=args.compare_baseline,
         eval_perplexity=args.eval_perplexity,
+        enable_profiling=args.profile,
+        profile_dir=args.profile_dir,
     )
     stats = benchmark.run_benchmark(args.prompt, args.iterations)
 

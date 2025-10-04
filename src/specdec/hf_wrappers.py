@@ -189,6 +189,16 @@ class HFWrapper(LanguageModel):
         """Get the model name/identifier."""
         return self._model_name
 
+    @property
+    def model(self):
+        """Get the underlying model (read-only)."""
+        return self._model
+
+    def optimize(self, optimization_manager) -> None:
+        """Optimize the model using the provided optimization manager."""
+        if optimization_manager and hasattr(self, "_model") and self._model is not None:
+            self._model = optimization_manager.optimize_model(self._model)
+
     def cleanup(self) -> None:
         """Clean up model memory (useful for MPS)."""
         if hasattr(self, "_model"):

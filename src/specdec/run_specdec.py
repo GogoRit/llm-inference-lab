@@ -165,6 +165,23 @@ Examples:
         help="Target acceptance rate for adaptive controller (default: 0.7)",
     )
 
+    # Optimization and profiling arguments
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable comprehensive profiling and performance analysis",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        help="Directory to save profiling traces (default: profiles/)",
+    )
+    parser.add_argument(
+        "--disable-optimization",
+        action="store_true",
+        help="Disable performance optimizations (mixed precision, etc.)",
+    )
+
     return parser.parse_args()
 
 
@@ -222,6 +239,9 @@ def main() -> None:
             controller=controller,
             controller_params=controller_params,
             draft_mode=args.draft_mode,
+            enable_optimization=not args.disable_optimization,
+            enable_profiling=args.profile,
+            profile_dir=args.profile_dir,
         )
 
         # Generate text
