@@ -7,7 +7,7 @@ This module implements various strategies for controlling the number of draft to
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 

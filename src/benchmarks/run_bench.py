@@ -31,10 +31,10 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
+from benchmarks.quality_eval import create_evaluator  # noqa: E402
 from server.local_baseline import LocalBaselineRunner  # noqa: E402
 from server.ping_vllm import VLLMPingClient  # noqa: E402
 from specdec.pipeline import SpeculativePipeline  # noqa: E402
-from benchmarks.quality_eval import create_evaluator  # noqa: E402
 
 
 class BenchmarkRunner:

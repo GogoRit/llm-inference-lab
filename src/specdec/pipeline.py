@@ -10,18 +10,18 @@ Orchestrates the speculative decoding loop:
 
 import logging
 import time
-import psutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import psutil
 import torch
 import yaml
 
+from .controllers import KController, create_controller
 from .fake_lm import create_fake_lm
 from .hf_wrappers import create_tiny_hf_wrapper
 from .interfaces import LanguageModel, SpeculativeDecoder
-from .policies import create_policy, AcceptancePolicy
-from .controllers import create_controller, KController
+from .policies import AcceptancePolicy, create_policy
 
 
 class SpeculativePipeline(SpeculativeDecoder):

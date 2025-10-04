@@ -4,11 +4,8 @@ Unit tests for K controllers.
 
 import pytest
 
-from src.specdec.controllers import (
-    FixedKController,
-    AdaptiveKController,
-    create_controller,
-)
+from src.specdec.controllers import (AdaptiveKController, FixedKController,
+                                     create_controller)
 
 
 class TestFixedKController:

@@ -6,9 +6,8 @@ proposed tokens from the draft model should be accepted by the base model.
 """
 
 import logging
-
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 

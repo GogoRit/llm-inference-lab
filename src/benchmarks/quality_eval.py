@@ -7,7 +7,7 @@ for comparing speculative decoding outputs with baseline models.
 
 import logging
 import math
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
