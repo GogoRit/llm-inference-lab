@@ -5,8 +5,9 @@ Quick test to verify CUDA functionality and fp16 dtype selection.
 """
 
 import os
-import sys
 import pathlib
+import sys
+
 import torch
 
 # Silence tokenizer parallelism warning
@@ -15,7 +16,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # Add src to path
 sys.path.insert(0, str(pathlib.Path("src").resolve()))
 
-from specdec.pipeline import SpeculativePipeline
+from specdec.pipeline import SpeculativePipeline  # noqa: E402
 
 
 def main():

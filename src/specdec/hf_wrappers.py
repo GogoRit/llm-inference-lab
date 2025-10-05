@@ -103,7 +103,7 @@ class HFWrapper(LanguageModel):
                         self._model = self._model.half()
                 else:
                     # Use to() for other dtype conversions
-                    self._model = self._model.to(self._torch_dtype)
+                    self._model = self._model.to(self._torch_dtype)  # type: ignore
 
             self._model.eval()
 
@@ -182,7 +182,7 @@ class HFWrapper(LanguageModel):
 
     def encode_with_attention_mask(self, text: str) -> Dict[str, torch.Tensor]:
         """Encode text to token IDs with attention mask."""
-        inputs = self._tokenizer(
+        inputs = self._tokenizer(  # type: ignore
             text, return_tensors="pt", padding=True, truncation=True
         )
         return {k: v.to(self._device) for k, v in inputs.items()}

@@ -102,7 +102,8 @@ class MixedPrecisionManager:
             return _NoopContext()
 
         if self.device == "cuda":
-            # Use torch.cuda.amp.autocast with dtype only (no device_type for Torch 2.3+)
+            # Use torch.cuda.amp.autocast with dtype only
+            # (no device_type for Torch 2.3+)
             try:
                 return autocast(dtype=self.dtype)
             except Exception as e:

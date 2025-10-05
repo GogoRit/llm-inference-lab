@@ -265,7 +265,8 @@ def run_comprehensive_k_sweep(
                 f"{np.mean(throughputs):.2f}±{np.std(throughputs):.2f} "
                 f"tok/s, {np.mean(acceptance_rates):.3f}±"
                 f"{np.std(acceptance_rates):.3f} accept rate, "
-                f"success rate: {len(valid_results)}/{total_attempts} ({len(valid_results)/total_attempts:.1%})"
+                f"success rate: {len(valid_results)}/{total_attempts} "
+                f"({len(valid_results)/total_attempts:.1%})"
             )
         else:
             # Still write a row even if all failed
@@ -490,11 +491,13 @@ def main():
     print("COMPREHENSIVE K-SWEEP RESULTS SUMMARY")
     print("=" * 120)
     print(
-        f"Device: {resolved_device} | Dtype: {system_info['dtype']} | Models: {args.base_model} + {args.draft_model}"
+        f"Device: {resolved_device} | Dtype: {system_info['dtype']} | "
+        f"Models: {args.base_model} + {args.draft_model}"
     )
     print("=" * 120)
     print(
-        f"{'K':<3} {'Samples':<8} {'Failures':<9} {'Success%':<9} {'Latency (ms)':<20} {'Throughput (tok/s)':<20} "
+        f"{'K':<3} {'Samples':<8} {'Failures':<9} {'Success%':<9} "
+        f"{'Latency (ms)':<20} {'Throughput (tok/s)':<20} "
         f"{'Accept Rate':<15} {'Proposed':<12} {'Accepted':<12}"
     )
     print("-" * 120)
