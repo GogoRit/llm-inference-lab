@@ -8,12 +8,16 @@ import argparse
 import csv
 import json
 import logging
+import os
 import platform
 import sys
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+
+# Silence tokenizer parallelism warning
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Add src to path before importing project modules
 SRC_DIR = Path(__file__).parent.parent / "src"
@@ -56,7 +60,11 @@ def get_system_info(device):
         "device_name": (
             torch.cuda.get_device_name(0)
             if device == "cuda" and torch.cuda.is_available()
-            else "MPS" if device == "mps" and torch.backends.mps.is_available() else "CPU"
+            else (
+                "MPS"
+                if device == "mps" and torch.backends.mps.is_available()
+                else "CPU"
+            )
         ),
         "cuda_available": torch.cuda.is_available(),
         "mps_available": torch.backends.mps.is_available(),
@@ -77,23 +85,27 @@ def resolve_device(device_arg):
 
 
 def run_comprehensive_k_sweep(
-    base_model="gpt2", draft_model="distilgpt2", max_tokens=32, iterations=10, device="auto"
+    base_model="gpt2",
+    draft_model="distilgpt2",
+    max_tokens=32,
+    iterations=10,
+    device="auto",
 ):
     """Run comprehensive K-sweep test with 10-prompt suite."""
-    
+
     # Resolve device
     resolved_device = resolve_device(device)
     logger.info(f"Using device: {resolved_device}")
 
     results = []
     detailed_results = []
-    
+
     # Cache pipelines per K to avoid reloading models
     pipeline_cache = {}
 
     for k in range(1, 5):  # K = 1, 2, 3, 4
         logger.info(f"Testing K={k}...")
-        
+
         # Create pipeline once per K (cached)
         if k not in pipeline_cache:
             logger.info(f"  Creating pipeline for K={k}...")
@@ -164,7 +176,11 @@ def run_comprehensive_k_sweep(
                         "text": text[:100] + "..." if len(text) > 100 else text,
                         "success": True,
                         "device": resolved_device,
-                        "dtype": "float16" if resolved_device in ["cuda", "mps"] else "float32",
+                        "dtype": (
+                            "float16"
+                            if resolved_device in ["cuda", "mps"]
+                            else "float32"
+                        ),
                     }
                     detailed_results.append(detailed_result)
 
@@ -192,7 +208,7 @@ def run_comprehensive_k_sweep(
                         f"failed: {e}"
                     )
                     logger.error(f"      Traceback: {error_traceback}")
-                    
+
                     detailed_result = {
                         "k": k,
                         "iteration": iteration + 1,
@@ -202,14 +218,18 @@ def run_comprehensive_k_sweep(
                         "traceback": error_traceback,
                         "success": False,
                         "device": resolved_device,
-                        "dtype": "float16" if resolved_device in ["cuda", "mps"] else "float32",
+                        "dtype": (
+                            "float16"
+                            if resolved_device in ["cuda", "mps"]
+                            else "float32"
+                        ),
                     }
                     detailed_results.append(detailed_result)
 
         # Calculate statistics for this K
         valid_results = [r for r in k_results if "error" not in r]
         total_attempts = iterations * len(PROMPT_SUITE)
-        
+
         if valid_results:
             latencies = [r["latency_ms"] for r in valid_results]
             throughputs = [r["tokens_per_sec"] for r in valid_results]
@@ -234,7 +254,9 @@ def run_comprehensive_k_sweep(
                     "accepted_mean": np.mean(accepted_counts),
                     "accepted_std": np.std(accepted_counts),
                     "device": resolved_device,
-                    "dtype": "float16" if resolved_device in ["cuda", "mps"] else "float32",
+                    "dtype": (
+                        "float16" if resolved_device in ["cuda", "mps"] else "float32"
+                    ),
                 }
             )
 
@@ -253,21 +275,25 @@ def run_comprehensive_k_sweep(
                     "n_samples": 0,
                     "n_failures": k_failures,
                     "success_rate": 0.0,
-                    "latency_ms_mean": float('nan'),
-                    "latency_ms_std": float('nan'),
-                    "tokens_per_sec_mean": float('nan'),
-                    "tokens_per_sec_std": float('nan'),
-                    "acceptance_rate_mean": float('nan'),
-                    "acceptance_rate_std": float('nan'),
-                    "proposed_mean": float('nan'),
-                    "proposed_std": float('nan'),
-                    "accepted_mean": float('nan'),
-                    "accepted_std": float('nan'),
+                    "latency_ms_mean": float("nan"),
+                    "latency_ms_std": float("nan"),
+                    "tokens_per_sec_mean": float("nan"),
+                    "tokens_per_sec_std": float("nan"),
+                    "acceptance_rate_mean": float("nan"),
+                    "acceptance_rate_std": float("nan"),
+                    "proposed_mean": float("nan"),
+                    "proposed_std": float("nan"),
+                    "accepted_mean": float("nan"),
+                    "accepted_std": float("nan"),
                     "device": resolved_device,
-                    "dtype": "float16" if resolved_device in ["cuda", "mps"] else "float32",
+                    "dtype": (
+                        "float16" if resolved_device in ["cuda", "mps"] else "float32"
+                    ),
                 }
             )
-            logger.error(f"  K={k}: All {total_attempts} attempts failed ({k_failures} failures)")
+            logger.error(
+                f"  K={k}: All {total_attempts} attempts failed ({k_failures} failures)"
+            )
 
     return results, detailed_results
 
@@ -421,17 +447,17 @@ def main():
         "--output-dir", default="results", help="Output directory for results"
     )
     parser.add_argument(
-        "--device", 
-        choices=["auto", "cuda", "mps", "cpu"], 
-        default="auto", 
-        help="Device to run on (auto selects best available)"
+        "--device",
+        choices=["auto", "cuda", "mps", "cpu"],
+        default="auto",
+        help="Device to run on (auto selects best available)",
     )
 
     args = parser.parse_args()
 
     # Resolve device
     resolved_device = resolve_device(args.device)
-    
+
     logger.info(
         f"Starting comprehensive K-sweep test: {args.base_model} + {args.draft_model}"
     )
@@ -463,7 +489,9 @@ def main():
     print("\n" + "=" * 120)
     print("COMPREHENSIVE K-SWEEP RESULTS SUMMARY")
     print("=" * 120)
-    print(f"Device: {resolved_device} | Dtype: {system_info['dtype']} | Models: {args.base_model} + {args.draft_model}")
+    print(
+        f"Device: {resolved_device} | Dtype: {system_info['dtype']} | Models: {args.base_model} + {args.draft_model}"
+    )
     print("=" * 120)
     print(
         f"{'K':<3} {'Samples':<8} {'Failures':<9} {'Success%':<9} {'Latency (ms)':<20} {'Throughput (tok/s)':<20} "
@@ -472,7 +500,7 @@ def main():
     print("-" * 120)
 
     for result in results:
-        if result['n_samples'] > 0:
+        if result["n_samples"] > 0:
             print(
                 f"{result['k']:<3} {result['n_samples']:<8} {result['n_failures']:<9} "
                 f"{result['success_rate']*100:.1f}%{'':<4} "

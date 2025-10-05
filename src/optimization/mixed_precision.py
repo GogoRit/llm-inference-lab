@@ -15,6 +15,16 @@ from torch.cuda.amp import GradScaler, autocast
 logger = logging.getLogger(__name__)
 
 
+class _NoopContext:
+    """No-op context manager for when mixed precision is disabled."""
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 class MixedPrecisionManager:
     """Manages mixed precision operations for CPU/MPS optimization."""
 
@@ -89,15 +99,24 @@ class MixedPrecisionManager:
     def get_autocast_context(self):
         """Get autocast context for mixed precision operations."""
         if not self.enabled:
-            return torch.no_grad()  # No-op context
+            return _NoopContext()
 
         if self.device == "cuda":
-            return autocast(device_type="cuda", dtype=self.dtype)
+            # Use torch.cuda.amp.autocast with dtype only (no device_type for Torch 2.3+)
+            try:
+                return autocast(dtype=self.dtype)
+            except Exception as e:
+                logger.warning(f"CUDA autocast failed, using no-op: {e}")
+                return _NoopContext()
         elif self.device == "mps":
-            # MPS doesn't have native autocast, use manual casting
-            return self._mps_autocast_context()
+            # Try MPS autocast, fallback to no-op if unavailable
+            try:
+                return torch.autocast("mps", dtype=self.dtype)
+            except Exception as e:
+                logger.warning(f"MPS autocast not available, using no-op: {e}")
+                return _NoopContext()
         else:
-            return torch.no_grad()
+            return _NoopContext()
 
     def _mps_autocast_context(self):
         """Custom autocast context for MPS (manual dtype conversion)."""
