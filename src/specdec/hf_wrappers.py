@@ -58,7 +58,7 @@ class HFWrapper(LanguageModel):
 
     def _select_dtype(self) -> torch.dtype:
         """Select appropriate dtype based on device."""
-        if self._device == "mps":
+        if self._device in ["cuda", "mps"]:
             return torch.float16
         else:
             return torch.float32
@@ -75,10 +75,11 @@ class HFWrapper(LanguageModel):
                     self._tokenizer.pad_token = (  # type: ignore
                         self._tokenizer.eos_token  # type: ignore
                     )
+                self._tokenizer.padding_side = "left"  # type: ignore
 
             # Load model with memory considerations
             model_kwargs = {
-                "dtype": self._torch_dtype,
+                "torch_dtype": self._torch_dtype,
                 "attn_implementation": "eager",
                 "low_cpu_mem_usage": True,
             }
@@ -115,13 +116,17 @@ class HFWrapper(LanguageModel):
                 if input_ids.device != torch.device(self._device):
                     input_ids = input_ids.to(self._device)
 
+                # Create attention mask for proper padding handling
+                attention_mask = torch.ones_like(input_ids)
+
                 # Generate tokens
                 outputs = self._model.generate(  # type: ignore
                     input_ids,
+                    attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     do_sample=do_sample,
-                    pad_token_id=self._tokenizer.pad_token_id,  # type: ignore
+                    pad_token_id=self._tokenizer.eos_token_id,  # type: ignore
                     eos_token_id=self._tokenizer.eos_token_id,  # type: ignore
                     return_dict_in_generate=True,
                     output_scores=True,
@@ -162,6 +167,13 @@ class HFWrapper(LanguageModel):
     def encode(self, text: str) -> torch.Tensor:
         """Encode text to token IDs."""
         return self._tokenizer.encode(text, return_tensors="pt")  # type: ignore
+
+    def encode_with_attention_mask(self, text: str) -> Dict[str, torch.Tensor]:
+        """Encode text to token IDs with attention mask."""
+        inputs = self._tokenizer(
+            text, return_tensors="pt", padding=True, truncation=True
+        )
+        return {k: v.to(self._device) for k, v in inputs.items()}
 
     def decode(self, token_ids) -> str:
         """Decode token IDs to text."""
