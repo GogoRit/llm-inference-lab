@@ -79,9 +79,20 @@ class HFWrapper(LanguageModel):
 
             # Load model with memory considerations
             model_kwargs = {
-                "attn_implementation": "eager",
+                "torch_dtype": self._torch_dtype,
                 "low_cpu_mem_usage": True,
+                "attn_implementation": "sdpa",
             }
+
+            # Only use device_map if accelerate is available
+            try:
+                # import accelerate  # Unused import
+
+                if self._device != "cpu":
+                    model_kwargs["device_map"] = {"": 0}
+            except ImportError:
+                # Fallback: load to CPU first, then move to device
+                pass
 
             # Add memory constraints if specified
             if self._max_memory_mb:
@@ -91,19 +102,19 @@ class HFWrapper(LanguageModel):
                 self._model_name, **model_kwargs
             )
 
-            # Move to device and cast to appropriate dtype
-            if self._device != "auto":
-                self._model = self._model.to(self._device)  # type: ignore
+            # Move to device if needed (device_map handles this for GPU if accelerate is available)
+            if self._device != "auto" and self._device != "cpu":
+                try:
+                    # # import accelerate  # Unused import  # Unused import
 
-            # Cast to target dtype if needed
-            if self._torch_dtype != torch.float32:
-                if self._device == "cuda" and self._torch_dtype == torch.float16:
-                    # Use half() for CUDA fp16 conversion
-                    if next(self._model.parameters()).dtype == torch.float32:
-                        self._model = self._model.half()
-                else:
-                    # Use to() for other dtype conversions
-                    self._model = self._model.to(self._torch_dtype)  # type: ignore
+                    # If accelerate is available and device_map was used, model is already on device
+                    if "device_map" not in model_kwargs or not hasattr(
+                        self._model, "hf_device_map"
+                    ):
+                        self._model = self._model.to(self._device)  # type: ignore
+                except ImportError:
+                    # No accelerate, manually move to device
+                    self._model = self._model.to(self._device)  # type: ignore
 
             self._model.eval()
 

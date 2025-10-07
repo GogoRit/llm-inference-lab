@@ -8,7 +8,9 @@ from .mixed_precision import (
     GradientCheckpointingManager,
     LocalOptimizationManager,
     MixedPrecisionManager,
+    amp_context,
     create_optimization_manager,
+    select_device_dtype,
 )
 from .tokenizer_optimization import (
     OptimizedTokenizer,
@@ -20,6 +22,8 @@ __all__ = [
     "MixedPrecisionManager",
     "GradientCheckpointingManager",
     "create_optimization_manager",
+    "select_device_dtype",
+    "amp_context",
     "OptimizedTokenizer",
     "create_optimized_tokenizer",
 ]

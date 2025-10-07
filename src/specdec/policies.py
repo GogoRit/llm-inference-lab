@@ -11,6 +11,23 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+# Import kernels with fallback
+try:
+    from kernels import get_kernel_info, get_verify_prefix
+
+    KERNELS_AVAILABLE = True
+except ImportError:
+    logger = logging.getLogger(__name__)
+    logger.warning("Kernels not available, using fallback implementation")
+    KERNELS_AVAILABLE = False
+
+    def get_verify_prefix(device):
+        return None
+
+    def get_kernel_info():
+        return {"verify_backend": "fallback"}
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +77,10 @@ class LongestPrefixPolicy(AcceptancePolicy):
 
     def __init__(self):
         self.name = "longest_prefix"
+        self.kernels_available = KERNELS_AVAILABLE
+        self.kernel_info = (
+            get_kernel_info() if KERNELS_AVAILABLE else {"verify_backend": "fallback"}
+        )
 
     def accept_tokens(
         self,
@@ -70,7 +91,36 @@ class LongestPrefixPolicy(AcceptancePolicy):
         **kwargs: Any,
     ) -> Tuple[int, Dict[str, Any]]:
         """Accept the longest matching prefix of tokens."""
-        # Find the longest matching prefix
+        # Try to use kernel if available and on CUDA
+        if (
+            self.kernels_available
+            and base_logits is not None
+            and base_logits.device.type == "cuda"
+        ):
+
+            try:
+                # Get kernel for current device
+                verify_kernel = get_verify_prefix(base_logits.device.type)
+                if verify_kernel is not None:
+                    # Use kernel for verification
+                    accept_len, accepted_mask = verify_kernel(
+                        base_logits, proposed_tokens
+                    )
+                    accepted_len = accept_len[0].item()  # Assuming batch size 1
+
+                    return accepted_len, {
+                        "policy": self.name,
+                        "accepted_len": accepted_len,
+                        "proposed_len": proposed_tokens.shape[1],
+                        "base_len": base_tokens.shape[1],
+                        "verify_backend": self.kernel_info["verify_backend"],
+                    }
+            except Exception as e:
+                logger.warning(
+                    f"Kernel verification failed, falling back to PyTorch: {e}"
+                )
+
+        # Fallback to PyTorch implementation
         max_len = min(proposed_tokens.shape[1], base_tokens.shape[1])
         accepted_len = 0
 
@@ -85,6 +135,7 @@ class LongestPrefixPolicy(AcceptancePolicy):
             "accepted_len": accepted_len,
             "proposed_len": proposed_tokens.shape[1],
             "base_len": base_tokens.shape[1],
+            "verify_backend": "torch",
         }
 
     def get_info(self) -> Dict[str, Any]:

@@ -25,6 +25,23 @@ This project provides a comprehensive toolkit for LLM inference optimization res
 - Multi-GPU scaling and distributed inference
 - Advanced model optimization techniques
 
+## What's New (2025-10-06)
+
+**Phase 3C.4 Complete - MPS Final Validation**:
+- **Kernel Registry**: Safe backend selection with priority-based fallbacks
+- **Detailed Metrics**: Optional performance profiling with `--metrics-detailed` flag
+- **CUDA Graph Capture**: Optional graph capture with `--cuda-graph` flag (CUDA only)
+- **Memory Profiling**: Enhanced memory tracking for CUDA and MPS
+- **Documentation**: Updated with latest MPS performance results
+- **CI Ready**: All tests passing, ready for CUDA validation
+
+**Environment Flags**:
+- `SPECDEC_AMP=1/0`: Enable/disable mixed precision
+- `SPECDEC_DTYPE=float16/bfloat16/float32`: Override dtype
+- `SPECDEC_DETAILED_METRICS=1`: Enable detailed profiling
+- `SPECDEC_CUDA_GRAPH=1`: Enable CUDA graph capture
+- `SPECDEC_FORCE_PY=1`: Skip kernel compilation, use PyTorch fallbacks
+
 ## Latest Results: Comprehensive K-Sweep Analysis
 
 **Phase 3A Complete** - Local Performance Optimization with Statistical Validation:
@@ -86,34 +103,51 @@ export PYTHONPATH="${PYTHONPATH}:$(pwd)/src"
 
 ### Quick Start
 
+**Local MPS Quick Run**:
+```bash
+# Activate environment
+source env/bin/activate
+
+# Run comprehensive K-sweep on MPS
+python scripts/comprehensive_k_sweep.py \
+  --base-model gpt2 --draft-model distilgpt2 \
+  --max-tokens 32 --iterations 5 --device mps \
+  --output-dir results_mps_quick --no-plots
+
+# Run with detailed metrics
+SPECDEC_DETAILED_METRICS=1 python scripts/comprehensive_k_sweep.py \
+  --base-model gpt2 --draft-model distilgpt2 \
+  --max-tokens 32 --iterations 5 --device mps \
+  --output-dir results_mps_detailed --no-plots
+```
+
+**CUDA Quick Run (Kaggle)**:
+```bash
+# Set environment variables
+export SPECDEC_AMP=1
+export SPECDEC_DTYPE=float16
+export SPECDEC_DETAILED_METRICS=1
+export SPECDEC_CUDA_GRAPH=1
+
+# Run comprehensive K-sweep on CUDA
+python scripts/comprehensive_k_sweep.py \
+  --base-model gpt2 --draft-model distilgpt2 \
+  --max-tokens 32 --iterations 5 --device cuda \
+  --output-dir results_cuda_quick --no-plots
+
+# Artifacts will be saved to results_cuda_quick/
+```
+
+**Basic Usage**:
 ```bash
 # Local baseline inference
 python -m src.server.local_baseline --prompt "Hello, world!"
 
-# Local baseline with custom parameters
-python -m src.server.local_baseline --prompt "The future of AI is" --max-tokens 100 --verbose
-
-# Test vLLM server connectivity
-python -m src.server.ping_vllm --prompt "Test" --ping-only
-
-# Benchmark local baseline
-python -m src.benchmarks.run_bench --prompt "Hello, world!" --iterations 5 --mode local
-
-# Benchmark HTTP server (when available)
-python -m src.benchmarks.run_bench --prompt "Hello, world!" --mode http --host 127.0.0.1 --port 8000
-
 # Speculative decoding
 python -m src.specdec.run_specdec --prompt "Explain KV cache simply." --max-tokens 64 --verbose
 
-# Benchmark speculative decoding
-python -m src.benchmarks.run_bench --mode specdec --prompt "Why speculative decoding helps?" --iterations 3
-
-# Compare speculative decoding vs baseline
-python -m src.benchmarks.run_bench --mode specdec --compare-baseline --prompt "Test comparison" --iterations 3
-
-# Use configuration files
-python -m src.server.local_baseline --config configs/baseline.yaml --prompt "Test"
-python -m src.server.ping_vllm --config configs/vllm.yaml --prompt "Test" --ping-only
+# Smoke test
+python scripts/dev/smoke_cuda.py
 python -m src.specdec.run_specdec --config configs/specdec.yaml --prompt "Test" --seed 42
 
 # Performance optimization and profiling

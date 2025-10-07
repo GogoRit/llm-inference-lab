@@ -307,6 +307,19 @@ def save_results(results, detailed_results, system_info, output_dir, device):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Get detailed metrics if available
+    detailed_metrics = {}
+    try:
+        from src.metrics.detailed_profiler import get_summary
+
+        detailed_metrics = get_summary()
+    except ImportError:
+        pass
+
+    # Add detailed metrics to system info
+    if detailed_metrics and detailed_metrics.get("enabled", False):
+        system_info["detailed_metrics"] = detailed_metrics
+
     # Save summary results to CSV
     csv_file = output_dir / f"specdec_{device}_{timestamp}.csv"
     with open(csv_file, "w", newline="") as f:
@@ -323,6 +336,7 @@ def save_results(results, detailed_results, system_info, output_dir, device):
                 "system_info": system_info,
                 "summary_results": results,
                 "detailed_results": detailed_results,
+                "detailed_metrics": detailed_metrics,
             },
             f,
             indent=2,
@@ -453,8 +467,30 @@ def main():
         default="auto",
         help="Device to run on (auto selects best available)",
     )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip plot generation",
+    )
+    parser.add_argument(
+        "--metrics-detailed",
+        action="store_true",
+        help="Enable detailed metrics collection",
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Enable CUDA graph capture (CUDA only)",
+    )
 
     args = parser.parse_args()
+
+    # Set environment variables for detailed metrics
+    if args.metrics_detailed:
+        os.environ["SPECDEC_DETAILED_METRICS"] = "1"
+
+    if args.cuda_graph:
+        os.environ["SPECDEC_CUDA_GRAPH"] = "1"
 
     # Resolve device
     resolved_device = resolve_device(args.device)
@@ -483,8 +519,11 @@ def main():
         results, detailed_results, system_info, args.output_dir, resolved_device
     )
 
-    # Create plots
-    create_plots(results, args.output_dir)
+    # Create plots (unless disabled)
+    if not args.no_plots:
+        create_plots(results, args.output_dir)
+    else:
+        logger.info("Skipping plot generation (--no-plots specified)")
 
     # Print summary table
     print("\n" + "=" * 120)

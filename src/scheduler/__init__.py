@@ -12,15 +12,12 @@ Components:
 - Batch size optimization
 - Request timeout handling
 - Resource allocation and monitoring
+- Speculative decoding scheduling
 """
 
-# Import modules when they exist
-# from .batch_scheduler import BatchScheduler
-# from .request_queue import RequestQueue
-# from .load_balancer import LoadBalancer
+from .speculative_scheduler import SpeculativeScheduler, create_speculative_scheduler
 
-# __all__ = [
-#     "BatchScheduler",
-#     "RequestQueue",
-#     "LoadBalancer",
-# ]
+__all__ = [
+    "SpeculativeScheduler",
+    "create_speculative_scheduler",
+]

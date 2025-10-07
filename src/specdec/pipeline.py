@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 # Import optimization modules (conditional to avoid import errors during development)
 try:
     from benchmarks.profiler import create_profiler
-    from optimization import create_optimization_manager, create_optimized_tokenizer
+    from optimization import (
+        amp_context,
+        create_optimization_manager,
+        create_optimized_tokenizer,
+        select_device_dtype,
+    )
+    from scheduler import create_speculative_scheduler
 except ImportError:
     # Fallback for development - create dummy functions
     def create_optimization_manager(*args, **kwargs):
@@ -39,6 +45,15 @@ except ImportError:
 
     def create_profiler(*args, **kwargs):
         return None
+
+    def create_speculative_scheduler(*args, **kwargs):
+        return None
+
+    def select_device_dtype(device="auto"):
+        return device, torch.float32, False
+
+    def amp_context(device, dtype):
+        return torch.no_grad()
 
 
 class SpeculativePipeline(SpeculativeDecoder):
@@ -114,9 +129,21 @@ class SpeculativePipeline(SpeculativeDecoder):
             self.config["seed"] = seed
 
         self.max_draft = self.config["max_draft"]
-        self.device = self._select_device(self.config["device"])
+
+        # Use centralized device/dtype selection
+        device_pref = self.config["device"]
+        if force_device:
+            device_pref = force_device
+        self.device, self.dtype, self.amp_enabled = select_device_dtype(device_pref)
+
         self.implementation = self.config.get("implementation", "fake")
         self.force_device = self.config.get("force_device")
+
+        # Set deterministic flags
+        self.deterministic = self.config.get("deterministic", False)
+        if self.deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
         # Log startup configuration
         self._log_startup_config()
@@ -129,6 +156,9 @@ class SpeculativePipeline(SpeculativeDecoder):
         self.policy = self._create_policy(policy, policy_params)
         self.controller = self._create_controller(controller, controller_params)
 
+        # Initialize speculative scheduler
+        self.scheduler = self._create_scheduler()
+
         # Check tokenizer compatibility
         self._check_compatibility()
 
@@ -138,10 +168,11 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         if self.enable_optimization:
             self.optimization_manager = create_optimization_manager(
-                device=self.force_device or self.device,
+                device=self.device,
                 mixed_precision=True,
                 gradient_checkpointing=False,  # Disabled for inference
                 memory_efficient=True,
+                dtype=self.dtype,
             )
         else:
             self.optimization_manager = None
@@ -241,6 +272,17 @@ class SpeculativePipeline(SpeculativeDecoder):
             f"max_tokens={self.config.get('max_new_tokens', 64)}"
         )
 
+        # Log kernel information
+        try:
+            from kernels import get_kernel_info
+
+            kernel_info = get_kernel_info()
+            self.logger.info(
+                f"Kernel backends: verify={kernel_info['verify_backend']}, kv_append={kernel_info['kv_append_backend']}"
+            )
+        except ImportError:
+            self.logger.info("Kernels not available, using fallback implementation")
+
     def _create_base_model(self) -> LanguageModel:
         """Create the base language model based on implementation."""
         if self.implementation == "fake":
@@ -322,6 +364,17 @@ class SpeculativePipeline(SpeculativeDecoder):
         """Create K controller."""
         params = controller_params or {}
         return create_controller(controller_type, **params)
+
+    def _create_scheduler(self):
+        """Create speculative scheduler."""
+        device = self.force_device or self.device
+        if create_speculative_scheduler:
+            return create_speculative_scheduler(
+                device=device,
+                enable_multi_stream=device == "cuda",
+                enable_batched_verification=True,
+            )
+        return None
 
     def _check_compatibility(self) -> None:
         """Check tokenizer compatibility between draft and base models."""
@@ -683,12 +736,17 @@ class SpeculativePipeline(SpeculativeDecoder):
         }
 
         try:
-            # Use optimization context if available
-            optimization_context = (
-                self.optimization_manager.get_optimization_context()
-                if self.optimization_manager
-                else torch.no_grad()
-            )
+            # Use optimization context if available, otherwise use AMP context
+            if self.optimization_manager:
+                optimization_context = (
+                    self.optimization_manager.get_optimization_context()
+                )
+            else:
+                optimization_context = (
+                    amp_context(self.device, self.dtype)
+                    if self.amp_enabled
+                    else torch.no_grad()
+                )
 
             with optimization_context:
                 # Tokenize input prompt
@@ -776,21 +834,43 @@ class SpeculativePipeline(SpeculativeDecoder):
                     f"logits shape: {draft_logits.shape}"
                 )
 
-                # Step 2: Verify with base model
-                verify_start = time.time()
-                base_tokens, base_logits = self.base_lm.generate_tokens(
-                    current_input,
-                    max_new_tokens=k,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    **kwargs,
-                )
-                verify_time_ms = (time.time() - verify_start) * 1000
+                # Step 2: Verify with base model using scheduler
+                if self.scheduler:
+                    base_tokens, base_logits, verify_info = (
+                        self.scheduler.schedule_verification(
+                            self.base_lm,
+                            draft_tokens,
+                            current_input,
+                            temperature=temperature,
+                            do_sample=do_sample,
+                            **kwargs,
+                        )
+                    )
+                    verify_time_ms = verify_info.get("verification_time_ms", 0.0)
+                else:
+                    verify_start = time.time()
+                    base_tokens, base_logits = self.base_lm.generate_tokens(
+                        current_input,
+                        max_new_tokens=k,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        **kwargs,
+                    )
+                    verify_time_ms = (time.time() - verify_start) * 1000
 
                 # Step 3: Apply acceptance policy
-                accepted_len, policy_info = self.policy.accept_tokens(
-                    draft_tokens, base_tokens, draft_logits, base_logits
-                )
+                if self.scheduler:
+                    accepted_len, policy_info = self.scheduler.apply_acceptance_policy(
+                        self.policy,
+                        draft_tokens,
+                        base_tokens,
+                        draft_logits,
+                        base_logits,
+                    )
+                else:
+                    accepted_len, policy_info = self.policy.accept_tokens(
+                        draft_tokens, base_tokens, draft_logits, base_logits
+                    )
                 accepted_tokens = (
                     draft_tokens[:, :accepted_len]
                     if accepted_len > 0
@@ -911,6 +991,21 @@ class SpeculativePipeline(SpeculativeDecoder):
             process = psutil.Process()
             mem_rss_mb = process.memory_info().rss / 1024 / 1024
 
+            # Get CUDA memory if available
+            cuda_mem_allocated = 0
+            cuda_mem_peak = 0
+            if self.device == "cuda" and torch.cuda.is_available():
+                cuda_mem_allocated = torch.cuda.memory_allocated() / 1024 / 1024  # MB
+                cuda_mem_peak = torch.cuda.max_memory_allocated() / 1024 / 1024  # MB
+
+            # Get actual dtype from optimization manager if available
+            actual_dtype = str(self.dtype).replace("torch.", "")
+            actual_amp_enabled = self.amp_enabled
+            if self.optimization_manager:
+                opt_info = self.optimization_manager.get_optimization_info()
+                actual_dtype = opt_info.get("dtype", actual_dtype)
+                actual_amp_enabled = opt_info.get("enabled", actual_amp_enabled)
+
             result = {
                 "text": generated_text,
                 "generated_tokens": generated_tokens,
@@ -923,18 +1018,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                 "verification_time_ms": self.metrics["total_verification_time_ms"],
                 "generation_time_ms": self.metrics["total_generation_time_ms"],
                 "mem_rss_mb": mem_rss_mb,
+                "cuda_mem_allocated_mb": cuda_mem_allocated,
+                "cuda_mem_peak_mb": cuda_mem_peak,
                 "policy": self.policy.get_info(),
                 "controller": self.controller.get_info(),
                 "impl": self.implementation,
-                "device": self.force_device or self.device,
+                "device": self.device,
+                "dtype": actual_dtype,
+                "amp_enabled": actual_amp_enabled,
                 "base_model": self.config["base_model"],
                 "draft_model": self.config["draft_model"],
                 "draft_mode": self.config.get("draft_mode", "vanilla"),
-                "dtype": (
-                    "float16"
-                    if (self.force_device or self.device) == "mps"
-                    else "float32"
-                ),
             }
 
             # Add profiling data if available
@@ -958,9 +1052,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                 f"acceptance_rate={acceptance_rate:.3f})"
             )
 
-            # Cleanup MPS cache if available
+            # Cleanup device cache if available
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
+            elif self.device == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             return result
 

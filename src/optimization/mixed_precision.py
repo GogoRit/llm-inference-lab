@@ -6,11 +6,12 @@ for improved memory efficiency and performance in local development.
 """
 
 import logging
+import os
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,21 @@ class MixedPrecisionManager:
             memory_efficient: Whether to use memory-efficient attention
         """
         self.device = self._select_device(device)
+
+        # Check environment overrides
+        env_amp = os.getenv("SPECDEC_AMP")
+        if env_amp is not None:
+            enabled = env_amp.lower() in ("1", "true", "yes")
+
+        env_dtype = os.getenv("SPECDEC_DTYPE")
+        if env_dtype is not None:
+            if env_dtype.lower() == "float16":
+                dtype = torch.float16
+            elif env_dtype.lower() == "bfloat16":
+                dtype = torch.bfloat16
+            elif env_dtype.lower() == "float32":
+                dtype = torch.float32
+
         self.enabled = enabled and self._is_mixed_precision_supported()
         self.memory_efficient = memory_efficient
 
@@ -102,21 +118,21 @@ class MixedPrecisionManager:
             return _NoopContext()
 
         if self.device == "cuda":
-            # Use torch.cuda.amp.autocast with dtype only
-            # (no device_type for Torch 2.3+)
+            # Use torch.amp.autocast for CUDA
             try:
-                return autocast(dtype=self.dtype)
+                return torch.amp.autocast("cuda", dtype=self.dtype)
             except Exception as e:
                 logger.warning(f"CUDA autocast failed, using no-op: {e}")
                 return _NoopContext()
         elif self.device == "mps":
-            # Try MPS autocast, fallback to no-op if unavailable
+            # Use torch.amp.autocast for MPS
             try:
-                return torch.autocast("mps", dtype=self.dtype)
+                return torch.amp.autocast("mps", dtype=self.dtype)
             except Exception as e:
                 logger.warning(f"MPS autocast not available, using no-op: {e}")
                 return _NoopContext()
         else:
+            # Keep fp32 on CPU
             return _NoopContext()
 
     def _mps_autocast_context(self):
@@ -388,6 +404,10 @@ class LocalOptimizationManager:
         """Get optimization context for inference."""
         return self.mixed_precision.get_autocast_context()
 
+    def get_optimization_info(self) -> Dict[str, Any]:
+        """Get optimization information."""
+        return self.mixed_precision.get_optimization_info()
+
     def get_optimization_report(self) -> Dict[str, Any]:
         """Get comprehensive optimization report."""
         return {
@@ -399,6 +419,94 @@ class LocalOptimizationManager:
                 )
             ),
         }
+
+
+def select_device_dtype(device: str = "auto") -> tuple[str, torch.dtype, bool]:
+    """
+    Select optimal device and dtype for the given device preference.
+
+    Args:
+        device: Device preference ("auto", "cpu", "mps", "cuda")
+
+    Returns:
+        Tuple of (selected_device, optimal_dtype, amp_enabled)
+    """
+    # Select device
+    if device == "auto":
+        if torch.backends.mps.is_available():
+            selected_device = "mps"
+        elif torch.cuda.is_available():
+            selected_device = "cuda"
+        else:
+            selected_device = "cpu"
+    else:
+        selected_device = device
+
+    # Check environment overrides
+    env_amp = os.getenv("SPECDEC_AMP")
+    amp_enabled = True
+    if env_amp is not None:
+        amp_enabled = env_amp.lower() in ("1", "true", "yes")
+
+    env_dtype = os.getenv("SPECDEC_DTYPE")
+    if env_dtype is not None:
+        if env_dtype.lower() == "float16":
+            optimal_dtype = torch.float16
+        elif env_dtype.lower() == "bfloat16":
+            optimal_dtype = torch.bfloat16
+        elif env_dtype.lower() == "float32":
+            optimal_dtype = torch.float32
+        else:
+            optimal_dtype = _get_default_dtype(selected_device)
+    else:
+        optimal_dtype = _get_default_dtype(selected_device)
+
+    # Disable AMP for CPU
+    if selected_device == "cpu":
+        amp_enabled = False
+        optimal_dtype = torch.float32
+
+    return selected_device, optimal_dtype, amp_enabled
+
+
+def _get_default_dtype(device: str) -> torch.dtype:
+    """Get default dtype for device."""
+    if device == "cuda":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        else:
+            return torch.float16
+    elif device == "mps":
+        return torch.float16
+    else:
+        return torch.float32
+
+
+def amp_context(device: str, dtype: torch.dtype) -> Any:
+    """
+    Get appropriate autocast context for device and dtype.
+
+    Args:
+        device: Target device ("cuda", "mps", "cpu")
+        dtype: Target dtype
+
+    Returns:
+        Autocast context manager
+    """
+    if device == "cuda":
+        try:
+            return torch.amp.autocast("cuda", dtype=dtype)
+        except Exception as e:
+            logger.warning(f"CUDA autocast failed, using no-op: {e}")
+            return _NoopContext()
+    elif device == "mps":
+        try:
+            return torch.amp.autocast("mps", dtype=dtype)
+        except Exception as e:
+            logger.warning(f"MPS autocast failed, using no-op: {e}")
+            return _NoopContext()
+    else:
+        return _NoopContext()
 
 
 def create_optimization_manager(
