@@ -3,7 +3,7 @@ Kernel registry for safe backend selection with priority and device filtering.
 """
 
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class KernelRegistry:
     """Registry for kernel implementations with priority-based selection."""
 
-    _kernels: Dict[str, Dict[str, Any]] = {}
+    _kernels: Dict[str, List[Dict[str, Any]]] = {}
 
     @classmethod
     def register(
@@ -29,12 +29,14 @@ class KernelRegistry:
         if op_name not in cls._kernels:
             cls._kernels[op_name] = []
 
-        cls._kernels[op_name].append(
-            {"function": impl, "priority": priority, "device": device}
-        )
+        kernel_list = cls._kernels[op_name]
+        if isinstance(kernel_list, list):
+            kernel_list.append(
+                {"function": impl, "priority": priority, "device": device}
+            )
 
-        # Sort by priority (highest first)
-        cls._kernels[op_name].sort(key=lambda x: x["priority"], reverse=True)
+            # Sort by priority (highest first)
+            kernel_list.sort(key=lambda x: x["priority"], reverse=True)
 
         logger.debug(
             f"Registered {op_name} kernel: {impl.__name__} (priority={priority}, device={device})"
@@ -57,9 +59,14 @@ class KernelRegistry:
 
         # Filter by device compatibility
         candidates = []
-        for kernel in cls._kernels[op_name]:
-            if kernel["device"] in [device, "auto"]:
-                candidates.append(kernel)
+        kernel_list = cls._kernels[op_name]
+        if isinstance(kernel_list, list):
+            for kernel in kernel_list:
+                if isinstance(kernel, dict) and kernel.get("device") in [
+                    device,
+                    "auto",
+                ]:
+                    candidates.append(kernel)
 
         if not candidates:
             logger.warning(f"No kernels available for {op_name} on device {device}")
@@ -67,15 +74,23 @@ class KernelRegistry:
 
         # Return highest priority candidate
         best = candidates[0]
-        logger.debug(
-            f"Selected {op_name} kernel: {best['function'].__name__} (priority={best['priority']}, device={best['device']})"
-        )
-        return best["function"]
+        if isinstance(best, dict) and "function" in best:
+            function = best["function"]
+            if callable(function):
+                logger.debug(
+                    f"Selected {op_name} kernel: {function.__name__} (priority={best.get('priority', 0)}, device={best.get('device', 'unknown')})"
+                )
+                return function
+        return None
 
     @classmethod
     def list_available(cls, op_name: str, device: str) -> list:
         """List all available kernels for operation and device."""
         if op_name not in cls._kernels:
+            return []
+
+        kernel_list = cls._kernels[op_name]
+        if not isinstance(kernel_list, list):
             return []
 
         return [
@@ -84,8 +99,8 @@ class KernelRegistry:
                 "priority": kernel["priority"],
                 "device": kernel["device"],
             }
-            for kernel in cls._kernels[op_name]
-            if kernel["device"] in [device, "auto"]
+            for kernel in kernel_list
+            if isinstance(kernel, dict) and kernel.get("device") in [device, "auto"]
         ]
 
     @classmethod
@@ -94,7 +109,7 @@ class KernelRegistry:
         status = {}
         for op_name in cls._kernels:
             best = cls.get_best(op_name, device)
-            if best:
+            if best and callable(best):
                 status[op_name] = f"{best.__name__}"
             else:
                 status[op_name] = "none"

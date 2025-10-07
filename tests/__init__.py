@@ -20,4 +20,4 @@ Test Categories:
 try:
     import torch
 except ImportError:
-    torch = None
+    torch = None  # type: ignore

@@ -73,7 +73,7 @@ def benchmark_verify_prefix():
             if kernel_info["verify_backend"] != "fallback":
                 try:
                     verify_prefix(logits, draft_ids)
-                except:
+                except Exception:
                     pass
             verify_prefix_ref(logits, draft_ids)
 

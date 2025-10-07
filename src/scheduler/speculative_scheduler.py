@@ -150,7 +150,8 @@ class SpeculativeScheduler:
             )
 
         # Synchronize verification stream
-        self.verification_stream.synchronize()
+        if self.verification_stream is not None:
+            self.verification_stream.synchronize()
 
         verification_time_ms = (time.time() - start_time) * 1000
 

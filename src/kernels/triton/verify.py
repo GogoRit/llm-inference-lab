@@ -101,8 +101,8 @@ def verify_prefix_triton(
     assert draft_ids.dim() == 2, "draft_ids must be 2D tensor [B][K]"
     assert logits.size(0) == draft_ids.size(0), "Batch size mismatch"
     assert logits.size(1) == draft_ids.size(1), "K dimension mismatch"
-    assert logits.device().type == "cuda", "logits must be on CUDA"
-    assert draft_ids.device().type == "cuda", "draft_ids must be on CUDA"
+    assert logits.device.type == "cuda", "logits must be on CUDA"
+    assert draft_ids.device.type == "cuda", "draft_ids must be on CUDA"
 
     B, K, V = logits.shape
 

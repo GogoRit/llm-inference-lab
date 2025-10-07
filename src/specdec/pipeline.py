@@ -992,11 +992,15 @@ class SpeculativePipeline(SpeculativeDecoder):
             mem_rss_mb = process.memory_info().rss / 1024 / 1024
 
             # Get CUDA memory if available
-            cuda_mem_allocated = 0
-            cuda_mem_peak = 0
+            cuda_mem_allocated = 0.0
+            cuda_mem_peak = 0.0
             if self.device == "cuda" and torch.cuda.is_available():
-                cuda_mem_allocated = torch.cuda.memory_allocated() / 1024 / 1024  # MB
-                cuda_mem_peak = torch.cuda.max_memory_allocated() / 1024 / 1024  # MB
+                cuda_mem_allocated = float(
+                    torch.cuda.memory_allocated() / 1024 / 1024
+                )  # MB
+                cuda_mem_peak = float(
+                    torch.cuda.max_memory_allocated() / 1024 / 1024
+                )  # MB
 
             # Get actual dtype from optimization manager if available
             actual_dtype = str(self.dtype).replace("torch.", "")

@@ -3,6 +3,7 @@ CUDA/Triton kernels for speculative decoding with safe fallbacks.
 """
 
 import logging
+from typing import Any, Callable, Dict, Optional
 
 import torch
 
@@ -56,7 +57,7 @@ _register_kernels()
 
 
 # Export kernel functions using registry
-def get_verify_prefix(device: str = None):
+def get_verify_prefix(device: Optional[str] = None):
     """Get verify_prefix kernel for device."""
     if device is None:
         if torch.cuda.is_available():
@@ -69,7 +70,7 @@ def get_verify_prefix(device: str = None):
     return registry.get_best("verify_prefix", device)
 
 
-def get_kv_append(device: str = None):
+def get_kv_append(device: Optional[str] = None):
     """Get kv_append kernel for device."""
     if device is None:
         if torch.cuda.is_available():

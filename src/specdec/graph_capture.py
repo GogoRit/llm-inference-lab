@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class GraphCapture:
     """CUDA Graph capture for speculative decoding."""
 
-    def __init__(self, enabled: bool = None):
+    def __init__(self, enabled: Optional[bool] = None):
         """
         Initialize graph capture.
 
@@ -25,7 +25,7 @@ class GraphCapture:
             enabled = os.getenv("SPECDEC_CUDA_GRAPH", "0") == "1"
 
         self.enabled = enabled and self.can_capture()
-        self.graph = None
+        self.graph: Optional[Any] = None
         self.captured = False
         self.sample_inputs = None
 

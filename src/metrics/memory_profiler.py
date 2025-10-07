@@ -62,9 +62,13 @@ class MemoryProfiler:
         # This is a rough estimate - MPS doesn't provide detailed memory stats
         # We'll use a simple heuristic based on tensor sizes
         total_elements = 0
-        for obj in torch.mps._get_all_tensors():
-            if hasattr(obj, "numel"):
-                total_elements += obj.numel()
+        # MPS doesn't have _get_all_tensors, use gc as fallback
+        import gc
+
+        for obj in gc.get_objects():
+            if torch.is_tensor(obj) and obj.is_mps:
+                if hasattr(obj, "numel"):
+                    total_elements += obj.numel()
 
         # Assume float16 (2 bytes per element)
         return total_elements * 2 / 1024 / 1024
