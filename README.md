@@ -2,15 +2,15 @@
 
 A comprehensive toolkit for optimizing Large Language Model inference with speculative decoding, custom CUDA kernels, and advanced performance techniques.
 
-## 🚀 What's New (Phase 3C Complete)
+## What's New (Phase 3C Complete)
 
 **Latest Achievements**:
-- ✅ **Custom CUDA Kernels**: `verify_prefix` and `kv_append` with Triton fallbacks
-- ✅ **Kernel Registry**: Priority-based backend selection with safe fallbacks
-- ✅ **Detailed Metrics**: Optional profiling with `--metrics-detailed` flag
-- ✅ **CUDA Graph Capture**: Optional graph capture with `--cuda-graph` flag
-- ✅ **Memory Profiling**: Enhanced tracking for CUDA and MPS
-- ✅ **CI/CD Ready**: All tests passing, production-ready code
+- **Custom CUDA Kernels**: `verify_prefix` and `kv_append` with Triton fallbacks
+- **Kernel Registry**: Priority-based backend selection with safe fallbacks
+- **Detailed Metrics**: Optional profiling with `--metrics-detailed` flag
+- **CUDA Graph Capture**: Optional graph capture with `--cuda-graph` flag
+- **Memory Profiling**: Enhanced tracking for CUDA and MPS
+- **CI/CD Ready**: All tests passing, production-ready code
 
 **Performance Results** (MPS, gpt2 + distilgpt2):
 - **K=4 Peak**: 9.55 tok/s throughput
@@ -18,7 +18,7 @@ A comprehensive toolkit for optimizing Large Language Model inference with specu
 - **100% Success Rate**: 200 test runs completed
 - **Memory Efficient**: ~275MB peak usage
 
-## 📋 Quick Start
+## Quick Start
 
 ### Local MPS Run
 ```bash
@@ -65,22 +65,22 @@ python -m src.specdec.run_specdec --prompt "Hello world!" --max-tokens 32
 python -m src.server.local_baseline --prompt "Hello world!"
 ```
 
-## 🏗️ Project Phases
+## Project Phases
 
 | Phase | Status | Description | Key Features |
 |-------|--------|-------------|--------------|
-| **1A** | ✅ Complete | Baseline runner | HuggingFace OPT-125M, CPU/MPS support |
-| **1B** | ✅ Complete | Benchmark client | HTTP client, dual-mode benchmarking |
-| **1C** | ✅ Complete | CI/CD pipeline | Automated testing, code quality |
-| **2A** | ✅ Complete | Speculative decoding | Draft-and-verify pipeline |
-| **2B** | ✅ Complete | Advanced policies | Acceptance policies, adaptive K controllers |
-| **2C** | ✅ Complete | Advanced modes | Medusa-lite, EAGLE-lite implementations |
-| **3A** | ✅ Complete | Local optimization | Mixed precision, profiling, K-sweep analysis |
-| **3B** | ✅ Complete | GPU pre-check | CUDA readiness, memory-safe loading |
-| **3C** | ✅ Complete | CUDA kernels | Custom kernels, registry, detailed metrics |
-| **3D** | 🔄 Next | CUDA validation | GPU performance validation |
+| **1A** | Complete | Baseline runner | HuggingFace OPT-125M, CPU/MPS support |
+| **1B** | Complete | Benchmark client | HTTP client, dual-mode benchmarking |
+| **1C** | Complete | CI/CD pipeline | Automated testing, code quality |
+| **2A** | Complete | Speculative decoding | Draft-and-verify pipeline |
+| **2B** | Complete | Advanced policies | Acceptance policies, adaptive K controllers |
+| **2C** | Complete | Advanced modes | Medusa-lite, EAGLE-lite implementations |
+| **3A** | Complete | Local optimization | Mixed precision, profiling, K-sweep analysis |
+| **3B** | Complete | GPU pre-check | CUDA readiness, memory-safe loading |
+| **3C** | Complete | CUDA kernels | Custom kernels, registry, detailed metrics |
+| **3D** | Next | CUDA validation | GPU performance validation |
 
-## 🛠️ Environment Flags
+## Environment Flags
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -90,7 +90,7 @@ python -m src.server.local_baseline --prompt "Hello world!"
 | `SPECDEC_CUDA_GRAPH=1` | Enable CUDA graph capture | Off |
 | `SPECDEC_FORCE_PY=1` | Skip kernel compilation | Off |
 
-## 📊 Performance Results
+## Performance Results
 
 ### Latest K-Sweep Results (Phase 3C.4)
 **MPS Performance** (gpt2 + distilgpt2, 32 tokens, 5 iterations):
@@ -109,14 +109,14 @@ python -m src.server.local_baseline --prompt "Hello world!"
 - **Memory Efficient**: ~275MB peak usage maintained
 
 ### Technical Improvements Validated
-- ✅ **Mixed Precision**: AMP enabled on MPS with float16
-- ✅ **Memory-Safe Loading**: Device-aware model loading
-- ✅ **Kernel Registry**: Priority-based backend selection
-- ✅ **Detailed Metrics**: Optional profiling system
-- ✅ **CUDA Graph Capture**: Performance optimization ready
-- ✅ **CI/CD Pipeline**: All checks passing (Black, isort, flake8, mypy, pytest)
+- **Mixed Precision**: AMP enabled on MPS with float16
+- **Memory-Safe Loading**: Device-aware model loading
+- **Kernel Registry**: Priority-based backend selection
+- **Detailed Metrics**: Optional profiling system
+- **CUDA Graph Capture**: Performance optimization ready
+- **CI/CD Pipeline**: All checks passing (Black, isort, flake8, mypy, pytest)
 
-## 🏛️ Architecture
+## Architecture
 
 ### Core Components
 - **Speculative Pipeline**: Draft-and-verify with advanced policies
@@ -130,7 +130,7 @@ python -m src.server.local_baseline --prompt "Hello world!"
 - **Triton**: Python-based GPU kernels with fallbacks
 - **PyTorch**: Reference implementations for all devices
 
-## 🧪 Testing
+## Testing
 
 ```bash
 # Run all tests
@@ -147,7 +147,7 @@ flake8 src/ tests/ scripts/
 mypy src/ tests/ scripts/
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 llm-inference-lab/
@@ -163,7 +163,7 @@ llm-inference-lab/
 └── docs/                 # Documentation and progress
 ```
 
-## 🚀 Next Steps
+## Next Steps
 
 **Phase 3D - CUDA Validation**:
 - GPU performance validation on CUDA hardware
@@ -175,11 +175,11 @@ llm-inference-lab/
 - Advanced quantization techniques
 - Cloud deployment and monitoring
 
-## 📄 License
+## License
 
 MIT License - see [LICENSE](LICENSE) for details.
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch
