@@ -27,6 +27,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from specdec.pipeline import SpeculativePipeline  # noqa: E402
+from kernels import get_kernel_info  # noqa: E402
 
 # Set up logging
 logging.basicConfig(
@@ -84,18 +85,62 @@ def resolve_device(device_arg):
     return device_arg
 
 
+def set_deterministic_mode(enable: bool):
+    """Enable reproducible behavior across libraries."""
+    if not enable:
+        return
+    try:
+        import random
+        import numpy as np
+        import torch
+
+        seed = 1234
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+    except Exception as e:
+        logger.warning(f"Failed to set deterministic mode: {e}")
+
+
 def run_comprehensive_k_sweep(
     base_model="gpt2",
     draft_model="distilgpt2",
     max_tokens=32,
     iterations=10,
     device="auto",
+    deterministic: bool = False,
 ):
     """Run comprehensive K-sweep test with 10-prompt suite."""
 
     # Resolve device
     resolved_device = resolve_device(device)
     logger.info(f"Using device: {resolved_device}")
+
+    # Deterministic mode (optional via flag/env)
+    env_det = os.getenv("SPECDEC_DETERMINISTIC", "0").lower() in ("1", "true", "yes")
+    deterministic = deterministic or env_det
+    set_deterministic_mode(deterministic)
+    if deterministic:
+        logger.info("Deterministic mode: ON (fixed seeds; cudnn.deterministic; no benchmark)")
+    else:
+        logger.info("Deterministic mode: OFF")
+
+    # Kernel backend audit (single line)
+    kinfo = get_kernel_info()
+    dtype_str = "float16" if resolved_device in ["cuda", "mps"] else "float32"
+    logger.info(
+        f"Kernel backends: verify={kinfo.get('verify_backend')}, "
+        f"kv_append={kinfo.get('kv_append_backend')}, device={resolved_device}, dtype={dtype_str}"
+    )
+    if resolved_device == "cuda" and kinfo.get("verify_backend") != "cuda":
+        logger.warning(
+            "CUDA requested but verify kernel backend is not CUDA; falling back to "
+            f"{kinfo.get('verify_backend')}"
+        )
 
     results = []
     detailed_results = []
@@ -118,6 +163,7 @@ def run_comprehensive_k_sweep(
                     enable_optimization=True,
                     enable_profiling=True,
                     device=resolved_device,
+                    draft_mode="vanilla",  # disable Medusa/EAGLE paths in sweeps
                 )
                 logger.info(f"  Pipeline for K={k} created successfully")
             except Exception as e:
@@ -296,7 +342,7 @@ def run_comprehensive_k_sweep(
                 f"  K={k}: All {total_attempts} attempts failed ({k_failures} failures)"
             )
 
-    return results, detailed_results
+    return results, detailed_results, {"kernel_info": kinfo, "deterministic": deterministic}
 
 
 def save_results(results, detailed_results, system_info, output_dir, device):
@@ -482,6 +528,11 @@ def main():
         action="store_true",
         help="Enable CUDA graph capture (CUDA only)",
     )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic mode (seeds, cudnn.deterministic, disable experimental draftors)",
+    )
 
     args = parser.parse_args()
 
@@ -502,19 +553,27 @@ def main():
     logger.info(f"Max tokens: {args.max_tokens}, Iterations: {args.iterations}")
     logger.info(f"Prompt suite: {len(PROMPT_SUITE)} prompts")
 
-    # Get system info
+    # Get system info (add kernel info + deterministic)
     system_info = get_system_info(resolved_device)
+    system_info["deterministic"] = args.deterministic or (
+        os.getenv("SPECDEC_DETERMINISTIC", "0").lower() in ("1", "true", "yes")
+    )
+    system_info["kernel_backends"] = get_kernel_info()
 
     # Run tests
-    results, detailed_results = run_comprehensive_k_sweep(
+    results, detailed_results, run_meta = run_comprehensive_k_sweep(
         base_model=args.base_model,
         draft_model=args.draft_model,
         max_tokens=args.max_tokens,
         iterations=args.iterations,
         device=args.device,
+        deterministic=args.deterministic,
     )
 
     # Save results
+    # Merge run metadata into system info for JSON
+    system_info.update(run_meta)
+
     csv_file, json_file = save_results(
         results, detailed_results, system_info, args.output_dir, resolved_device
     )
