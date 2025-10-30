@@ -116,7 +116,7 @@ python -m src.server.local_baseline --prompt "Hello world!"
 - **CUDA Graph Capture**: Performance optimization ready
 - **CI/CD Pipeline**: All checks passing (Black, isort, flake8, mypy, pytest)
 
-### CUDA (T4) Performance – 2025-10-30 (Deterministic)
+### CUDA (T4) Performance – 2025-10-30
 
 Results folder: `docs/results/2025-10-30-T4/2025-10-30-T4_k32_i100_fp16/`
 
@@ -127,7 +127,7 @@ Results folder: `docs/results/2025-10-30-T4/2025-10-30-T4_k32_i100_fp16/`
 | 3 | 3916.34 ± 976.50 | 17.53 ± 5.96 | 22.28 ± 15.06 |
 | 4 | 3870.67 ± 1012.93 | 17.22 ± 4.96 | 21.88 ± 12.71 |
 
-Summary: ~17.4 tok/s average across K=1–4 (≈1.8–2.0× vs MPS), best acceptance ≈22.7% at K=2, 100% success, no OOM. Deterministic mode enabled (fixed seeds; cudnn.deterministic; draft_mode=vanilla). A100/H100 validation to follow.
+Summary: ~17.4 tok/s average across K=1–4 (≈1.8–2.0× vs MPS), best acceptance ≈22.7% at K=2, 100% success, no OOM. A100/H100 validation to follow.
 
 ## Architecture
 

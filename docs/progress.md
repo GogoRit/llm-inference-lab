@@ -341,21 +341,6 @@ Across K=1–4, throughput averages ≈ 17.4 tok/s with overall acceptance ≈ 2
 
 ---
 
-#### Tesla T4 CUDA Run (Deterministic) (32 tokens × 100 samples fp16 – 2025-10-30)
-
-| K | Latency (ms mean ± std) | Throughput (tok/s mean ± std) | Acceptance (%) mean ± std |
-|---|-------------------------|--------------------------------|----------------------------|
-| 1 | 3743.07 ± 1031.39 | 17.24 ± 4.96 | 21.38 ± 12.43 |
-| 2 | 3904.52 ± 908.77 | 17.66 ± 5.67 | 22.72 ± 14.20 |
-| 3 | 3916.34 ± 976.50 | 17.53 ± 5.96 | 22.28 ± 15.06 |
-| 4 | 3870.67 ± 1012.93 | 17.22 ± 4.96 | 21.88 ± 12.71 |
-
-- Deterministic mode: ON (fixed seeds; CUDA cudnn.deterministic; draft_mode=vanilla)
-- Kernel backends: logged at run start and embedded in JSON (`verify`, `kv_append`, device, dtype)
-- Performance vs MPS: ~1.8–2.0× throughput uplift at 32 tokens; ~22% acceptance
-- Stability: 100% success, no OOMs
-- Artifacts: `docs/results/2025-10-30-T4/2025-10-30-T4_k32_i100_fp16/`
-
 ## Next Step – Phase 3E (A100/H100 Runs & SDK Packaging)
 
 - Run canonical CUDA benchmarks on A100 and H100 (bf16/fp16; graph capture toggle)
