@@ -319,3 +319,32 @@ python -m pytest tests/test_cpu_smoke.py -v
 ---
 
 *Last Updated: Phase 3C.4 Complete - MPS Final Validation (2025-10-06)*
+
+### Phase 3D – CUDA Validation
+
+#### Tesla T4 CUDA Run (32 tokens × 100 samples fp16 – 2025-10-30)
+
+| K | Latency (ms mean ± std) | Throughput (tok/s mean ± std) | Acceptance (%) mean ± std |
+|---|-------------------------|--------------------------------|----------------------------|
+| 1 | 3743.07 ± 1031.39 | 17.24 ± 4.96 | 21.38 ± 12.43 |
+| 2 | 3904.52 ± 908.77 | 17.66 ± 5.67 | 22.72 ± 14.20 |
+| 3 | 3916.34 ± 976.50 | 17.53 ± 5.96 | 22.28 ± 15.06 |
+| 4 | 3870.67 ± 1012.93 | 17.22 ± 4.96 | 21.88 ± 12.71 |
+
+Across K=1–4, throughput averages ≈ 17.4 tok/s with overall acceptance ≈ 22% and 100% success (0 failures in 400 runs). Compared to the latest MPS results (~9–9.5 tok/s), T4 achieves ~1.8–2.0× higher throughput at 32 tokens. No OOMs or kernel build issues were observed; fp16 was used end-to-end.
+
+- Device: Tesla T4
+- Dtype: float16
+- Models: base `gpt2`, draft `distilgpt2`
+- Iterations: 100 per K (K=1–4)
+- Manifest: `docs/results/2025-10-30-T4/2025-10-30-T4_k32_i100_fp16/MANIFEST.json`
+
+---
+
+## Next Step – Phase 3E (A100/H100 Runs & SDK Packaging)
+
+- Run canonical CUDA benchmarks on A100 and H100 (bf16/fp16; graph capture toggle)
+- Package SDK 0.1.0 (pip-installable) with CLI (`specdec bench`, `specdec run`)
+- Integrate minimal vLLM/TGI adapter shim for speculative decoding
+- Add determinism flag/profile for benchmarks (fixed seeds; disable experimental draft modes)
+- Mark T4 CUDA validation as complete and publish blog summary
