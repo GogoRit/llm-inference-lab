@@ -26,8 +26,8 @@ sys.path.insert(0, str(SRC_DIR))
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from specdec.pipeline import SpeculativePipeline  # noqa: E402
 from kernels import get_kernel_info  # noqa: E402
+from specdec.pipeline import SpeculativePipeline  # noqa: E402
 
 # Set up logging
 logging.basicConfig(
@@ -91,6 +91,7 @@ def set_deterministic_mode(enable: bool):
         return
     try:
         import random
+
         import numpy as np
         import torch
 
@@ -125,7 +126,9 @@ def run_comprehensive_k_sweep(
     deterministic = deterministic or env_det
     set_deterministic_mode(deterministic)
     if deterministic:
-        logger.info("Deterministic mode: ON (fixed seeds; cudnn.deterministic; no benchmark)")
+        logger.info(
+            "Deterministic mode: ON (fixed seeds; cudnn.deterministic; no benchmark)"
+        )
     else:
         logger.info("Deterministic mode: OFF")
 
@@ -342,7 +345,11 @@ def run_comprehensive_k_sweep(
                 f"  K={k}: All {total_attempts} attempts failed ({k_failures} failures)"
             )
 
-    return results, detailed_results, {"kernel_info": kinfo, "deterministic": deterministic}
+    return (
+        results,
+        detailed_results,
+        {"kernel_info": kinfo, "deterministic": deterministic},
+    )
 
 
 def save_results(results, detailed_results, system_info, output_dir, device):

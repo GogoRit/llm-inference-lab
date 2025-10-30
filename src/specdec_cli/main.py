@@ -3,8 +3,8 @@ import os
 import sys
 from pathlib import Path
 
-from specdec.pipeline import SpeculativePipeline
 from kernels import get_kernel_info
+from specdec.pipeline import SpeculativePipeline
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
@@ -12,10 +12,10 @@ def cmd_bench(args: argparse.Namespace) -> int:
     scripts_dir = Path(__file__).parent.parent.parent / "scripts"
     sys.path.insert(0, str(scripts_dir))
     from comprehensive_k_sweep import (  # type: ignore
-        run_comprehensive_k_sweep,
-        save_results,
         get_system_info,
         resolve_device,
+        run_comprehensive_k_sweep,
+        save_results,
     )
 
     resolved_device = resolve_device(args.device)
@@ -57,7 +57,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         do_sample=args.do_sample,
     )
     kinfo = get_kernel_info()
-    print(f"Device: {res.get('device')} | Dtype: {res.get('dtype')} | Backends: verify={kinfo.get('verify_backend')}, kv_append={kinfo.get('kv_append_backend')}")
+    print(
+        f"Device: {res.get('device')} | Dtype: {res.get('dtype')} | Backends: verify={kinfo.get('verify_backend')}, kv_append={kinfo.get('kv_append_backend')}"
+    )
     print(f"Text: {res.get('text', '')}")
     return 0
 
@@ -95,5 +97,3 @@ def main() -> None:
     args = parser.parse_args()
     code = args.func(args)
     raise SystemExit(code)
-
-
