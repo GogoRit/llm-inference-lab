@@ -322,7 +322,7 @@ python -m pytest tests/test_cpu_smoke.py -v
 
 ### Phase 3D – CUDA Validation
 
-#### Tesla T4 CUDA Run (32 tokens × 100 samples fp16 – 2025-10-30)
+#### Tesla T4 CUDA Run #1 (32 tokens × 100 samples fp16 – 2025-10-30)
 
 | K | Latency (ms mean ± std) | Throughput (tok/s mean ± std) | Acceptance (%) mean ± std |
 |---|-------------------------|--------------------------------|----------------------------|
@@ -338,6 +338,30 @@ Across K=1–4, throughput averages ≈ 17.4 tok/s with overall acceptance ≈ 2
 - Models: base `gpt2`, draft `distilgpt2`
 - Iterations: 100 per K (K=1–4)
 - Manifest: `docs/results/2025-10-30-T4/2025-10-30-T4_k32_i100_fp16/MANIFEST.json`
+
+#### Tesla T4 CUDA Run #2 (64 tokens × 100 samples fp16 deterministic – 2025-10-30)
+
+**In Progress**: Running with deterministic mode enabled (fixed seeds, cudnn.deterministic=True, vanilla draft mode only).
+
+| K | Latency (ms mean ± std) | Throughput (tok/s mean ± std) | Acceptance (%) mean ± std |
+|---|-------------------------|--------------------------------|----------------------------|
+| 1 | TBD | TBD | TBD |
+| 2 | TBD | TBD | TBD |
+| 3 | TBD | TBD | TBD |
+| 4 | TBD | TBD | TBD |
+
+**Expected outcomes**:
+- Longer sequences (64 vs 32 tokens) should show improved amortization of draft overhead
+- Deterministic mode enables reproducible benchmarks for publication
+- Target: ~18–20 tok/s average with similar acceptance rates
+- Validation: kernel backend selection logged in JSON; 100% success expected
+
+- Device: Tesla T4
+- Dtype: float16
+- Deterministic: Yes (SPECDEC_DETERMINISTIC=1)
+- Models: base `gpt2`, draft `distilgpt2`
+- Iterations: 100 per K (K=1–4)
+- Expected manifest: `docs/results/2025-10-30-T4/2025-10-30-T4_k64_i100_fp16_det/MANIFEST.json`
 
 ---
 
