@@ -1,0 +1,16 @@
+{
+  "export_created_at": "2025-10-30T21:46:33Z",
+  "device": "Tesla T4",
+  "dtype": "float16",
+  "max_tokens": 32,
+  "iterations_per_k": 100,
+  "models": {
+    "base": "gpt2",
+    "draft": "distilgpt2"
+  },
+  "artifacts": {
+    "summary_json": "specdec_cuda_20251030_212942.json",
+    "summary_csv": "specdec_cuda_20251030_212942.csv"
+  },
+  "source_dir": "/kaggle/working/llm-inference-lab/results_gpu_quick"
+}

@@ -106,6 +106,37 @@ class LanguageModel(ABC):
         """Get the model name/identifier."""
         pass
 
+    def supports_kv_append(self) -> bool:
+        """
+        Check if this model supports KV cache appending.
+
+        Returns:
+            True if the model can append to KV cache without recomputation
+        """
+        return False
+
+    def get_kv_cache(self) -> Any:
+        """
+        Get the current KV cache from the model.
+
+        Returns:
+            KVCache object or None if not available
+        """
+        return None
+
+    def append_kv_cache(self, kv_chunk: Any) -> None:
+        """
+        Append a KV cache chunk to the model's cache.
+
+        Args:
+            kv_chunk: KVCache object containing keys and values to append
+        """
+        pass
+
+    def clear_kv_cache(self) -> None:
+        """Clear the model's KV cache."""
+        pass
+
 
 class SpeculativeDecoder(ABC):
     """Abstract base class for speculative decoding algorithms."""

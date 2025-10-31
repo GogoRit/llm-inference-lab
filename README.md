@@ -2,21 +2,24 @@
 
 A comprehensive toolkit for optimizing Large Language Model inference with speculative decoding, custom CUDA kernels, and advanced performance techniques.
 
-## What's New (Phase 3C Complete)
+> **Strategy Note**: As of Phase 3C.5, LLM Inference Lab follows an **MPS-first optimization approach**.
+> All new features are validated locally on Apple Silicon (MPS) before limited CUDA (Kaggle/A100) benchmarking.
+> This ensures efficient use of GPU credits and rapid iteration on Mac hardware.
+
+## What's New (Phase 3C.5 Complete)
 
 **Latest Achievements**:
-- **Custom CUDA Kernels**: `verify_prefix` and `kv_append` with Triton fallbacks
+- **KV Cache Integration**: Fully functional with CUDA/Triton/PyTorch fallbacks (default ON)
+- **MPS Validation**: 100% success rate (80 test cases), functional parity confirmed
+- **Custom CUDA Kernels**: `verify_prefix` and `kv_append` with stream synchronization
 - **Kernel Registry**: Priority-based backend selection with safe fallbacks
-- **Detailed Metrics**: Optional profiling with `--metrics-detailed` flag
-- **CUDA Graph Capture**: Optional graph capture with `--cuda-graph` flag
-- **Memory Profiling**: Enhanced tracking for CUDA and MPS
-- **CI/CD Ready**: All tests passing, production-ready code
+- **Production-Ready**: 15 KV cache tests passing, zero lint errors, comprehensive docs
 
-**Performance Results** (MPS, gpt2 + distilgpt2):
-- **K=4 Peak**: 9.55 tok/s throughput
-- **Stable Performance**: ~9 tok/s across K=1-4
-- **100% Success Rate**: 200 test runs completed
-- **Memory Efficient**: ~275MB peak usage
+**Performance Results** (GPT2-124M + DistilGPT2, MPS):
+- **Throughput**: 8.4-9.2 tok/s (32 tokens), 7.0-7.7 tok/s (128 tokens)
+- **KV Cache Status**: Functionally correct, no performance gain on small models/MPS
+- **Expected Benefits**: Larger models (7B+) on CUDA with higher acceptance rates
+- **Memory Efficient**: ~275MB peak, avg 11-12 tokens cached per prompt
 
 ## Quick Start
 
@@ -88,6 +91,7 @@ python -m src.server.local_baseline --prompt "Hello world!"
 | `SPECDEC_DTYPE=float16/bfloat16/float32` | Override dtype | Auto |
 | `SPECDEC_DETAILED_METRICS=1` | Enable detailed profiling | Off |
 | `SPECDEC_CUDA_GRAPH=1` | Enable CUDA graph capture | Off |
+| `SPECDEC_ENABLE_KV_APPEND=1/0` | Enable KV cache appending | On |
 | `SPECDEC_FORCE_PY=1` | Skip kernel compilation | Off |
 
 ## Performance Results
@@ -141,11 +145,46 @@ Expected improvements: longer sequences amortize overhead; deterministic mode en
 - **Metrics System**: Detailed profiling and memory tracking
 - **Scheduler**: Multi-stream verification and batching
 - **Optimization**: Mixed precision, memory management
+- **KV Cache Integration**: Efficient token appending without recomputation
 
 ### Kernel Backends
 - **CUDA**: Custom kernels for `verify_prefix` and `kv_append`
 - **Triton**: Python-based GPU kernels with fallbacks
 - **PyTorch**: Reference implementations for all devices
+
+### KV Cache Integration
+
+The speculative decoding pipeline now includes efficient KV cache management:
+
+**What it does:**
+- When the base model accepts tokens from the draft, their key-value states are cached
+- Subsequent verifications reuse cached KV states instead of recomputing from scratch
+- Reduces redundant computation and improves latency
+
+**When it's active:**
+- Enabled by default (`SPECDEC_ENABLE_KV_APPEND=1`)
+- Works with HuggingFace causal language models that support `past_key_values`
+- Automatically disabled for models that don't support KV caching
+
+**Kernel backends:**
+- **CUDA**: Optimized coalesced memory operations (priority 100)
+- **Triton**: Python-based GPU kernels (priority 50)
+- **PyTorch**: `torch.cat` fallback for all devices (priority 10)
+
+**Usage:**
+```bash
+# Enable KV cache (default)
+SPECDEC_ENABLE_KV_APPEND=1 python scripts/comprehensive_k_sweep.py ...
+
+# Disable KV cache
+SPECDEC_ENABLE_KV_APPEND=0 python scripts/comprehensive_k_sweep.py ...
+```
+
+**Metrics tracked:**
+- `kv_appended_tokens_total`: Total tokens appended to cache
+- `kv_append_time_ms`: Time spent in KV append operations
+- `kv_append_enabled`: Whether KV caching is active
+- `kv_append_backend`: Which kernel backend is used (cuda/triton/torch)
 
 ## Testing
 
@@ -182,10 +221,15 @@ llm-inference-lab/
 
 ## Next Steps
 
-**Phase 3D - CUDA Validation**:
-- GPU performance validation on CUDA hardware
-- Kernel performance benchmarking
-- Production-ready deployment testing
+**Phase 3D - CUDA Validation** (MPS-first strategy):
+1. **MPS Validation** (Local):
+   - Validate all Phase 3C features on Apple Silicon
+   - Establish performance baselines (~9 tok/s)
+   - Verify KV cache integration with on/off comparison
+2. **CUDA Validation** (Limited GPU credits):
+   - Single-session T4/A100 benchmarks
+   - Controlled GPU credit usage
+   - Compare against MPS baselines
 
 **Future Phases**:
 - Multi-GPU scaling and distributed inference

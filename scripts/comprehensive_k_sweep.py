@@ -52,6 +52,9 @@ PROMPT_SUITE = [
 
 def get_system_info(device):
     """Get system and environment metadata."""
+    # Get kernel backend info
+    kinfo = get_kernel_info()
+
     return {
         "timestamp": datetime.now().isoformat(),
         "platform": platform.platform(),
@@ -70,6 +73,12 @@ def get_system_info(device):
         "cuda_available": torch.cuda.is_available(),
         "mps_available": torch.backends.mps.is_available(),
         "dtype": "float16" if device in ["cuda", "mps"] else "float32",
+        "kernel_backends": {
+            "verify": kinfo.get("verify_backend", "unknown"),
+            "kv_append": kinfo.get("kv_append_backend", "unknown"),
+        },
+        "kv_append_enabled": os.getenv("SPECDEC_ENABLE_KV_APPEND", "1").lower()
+        in ("1", "true", "yes"),
     }
 
 
@@ -136,8 +145,10 @@ def run_comprehensive_k_sweep(
     kinfo = get_kernel_info()
     dtype_str = "float16" if resolved_device in ["cuda", "mps"] else "float32"
     logger.info(
-        f"Kernel backends: verify={kinfo.get('verify_backend')}, "
-        f"kv_append={kinfo.get('kv_append_backend')}, device={resolved_device}, dtype={dtype_str}"
+        "Kernel backends: "
+        f"verify={kinfo.get('verify_backend')}, "
+        f"kv_append={kinfo.get('kv_append_backend')}, "
+        f"device={resolved_device}, dtype={dtype_str}"
     )
     if resolved_device == "cuda" and kinfo.get("verify_backend") != "cuda":
         logger.warning(
@@ -210,6 +221,10 @@ def run_comprehensive_k_sweep(
                     proposed = result.get("proposed", 0)
                     accepted = result.get("accepted", 0)
                     text = result.get("text", "")
+                    kv_appended = result.get("kv_appended_tokens_total", 0)
+                    kv_append_time = result.get("kv_append_time_ms", 0.0)
+                    kv_append_enabled = result.get("kv_append_enabled", False)
+                    kv_append_backend = result.get("kv_append_backend", "unknown")
 
                     # Store detailed result
                     detailed_result = {
@@ -222,6 +237,10 @@ def run_comprehensive_k_sweep(
                         "acceptance_rate": acceptance_rate,
                         "proposed": proposed,
                         "accepted": accepted,
+                        "kv_appended_tokens": kv_appended,
+                        "kv_append_time_ms": kv_append_time,
+                        "kv_append_enabled": kv_append_enabled,
+                        "kv_append_backend": kv_append_backend,
                         "text": text[:100] + "..." if len(text) > 100 else text,
                         "success": True,
                         "device": resolved_device,
@@ -241,6 +260,8 @@ def run_comprehensive_k_sweep(
                             "acceptance_rate": acceptance_rate,
                             "proposed": proposed,
                             "accepted": accepted,
+                            "kv_appended_tokens": kv_appended,
+                            "kv_append_time_ms": kv_append_time,
                         }
                     )
 
@@ -285,6 +306,8 @@ def run_comprehensive_k_sweep(
             acceptance_rates = [r["acceptance_rate"] for r in valid_results]
             proposed_counts = [r["proposed"] for r in valid_results]
             accepted_counts = [r["accepted"] for r in valid_results]
+            kv_appended_counts = [r["kv_appended_tokens"] for r in valid_results]
+            kv_append_times = [r["kv_append_time_ms"] for r in valid_results]
 
             results.append(
                 {
@@ -298,6 +321,10 @@ def run_comprehensive_k_sweep(
                     "tokens_per_sec_std": np.std(throughputs),
                     "acceptance_rate_mean": np.mean(acceptance_rates),
                     "acceptance_rate_std": np.std(acceptance_rates),
+                    "kv_appended_tokens_mean": np.mean(kv_appended_counts),
+                    "kv_appended_tokens_std": np.std(kv_appended_counts),
+                    "kv_append_time_ms_mean": np.mean(kv_append_times),
+                    "kv_append_time_ms_std": np.std(kv_append_times),
                     "proposed_mean": np.mean(proposed_counts),
                     "proposed_std": np.std(proposed_counts),
                     "accepted_mean": np.mean(accepted_counts),
@@ -538,7 +565,10 @@ def main():
     parser.add_argument(
         "--deterministic",
         action="store_true",
-        help="Enable deterministic mode (seeds, cudnn.deterministic, disable experimental draftors)",
+        help=(
+            "Enable deterministic mode "
+            "(seeds, cudnn.deterministic, disable experimental draftors)"
+        ),
     )
 
     args = parser.parse_args()

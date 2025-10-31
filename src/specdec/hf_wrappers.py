@@ -6,12 +6,14 @@ for tiny models only (smoke runs) and MPS memory hygiene.
 """
 
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .interfaces import LanguageModel
+from .kv_types import KVCache
 
 
 class HFWrapper(LanguageModel):
@@ -41,6 +43,12 @@ class HFWrapper(LanguageModel):
         self._torch_dtype = torch_dtype or self._select_dtype()
         self._max_memory_mb = max_memory_mb
         self._tokenizer = tokenizer
+
+        # KV cache management
+        self._kv_cache: Optional[KVCache] = None
+        self._kv_append_enabled = os.getenv(
+            "SPECDEC_ENABLE_KV_APPEND", "1"
+        ).lower() in ("1", "true", "yes")
 
         # Load model and tokenizer
         self._load_model()
@@ -102,12 +110,14 @@ class HFWrapper(LanguageModel):
                 self._model_name, **model_kwargs
             )
 
-            # Move to device if needed (device_map handles this for GPU if accelerate is available)
+            # Move to device if needed
+            # (device_map handles this for GPU if accelerate is available)
             if self._device != "auto" and self._device != "cpu":
                 try:
                     # # import accelerate  # Unused import  # Unused import
 
-                    # If accelerate is available and device_map was used, model is already on device
+                    # If accelerate is available and device_map was used,
+                    # model is already on device
                     if "device_map" not in model_kwargs or not hasattr(
                         self._model, "hf_device_map"
                     ):
@@ -139,6 +149,13 @@ class HFWrapper(LanguageModel):
                 if input_ids.device != torch.device(self._device):
                     input_ids = input_ids.to(self._device)
 
+                # Use KV-aware generation if supported and enabled
+                if self.supports_kv_append() and self._kv_cache is not None:
+                    return self._generate_with_kv_cache(
+                        input_ids, max_new_tokens, temperature, do_sample, **kwargs
+                    )
+
+                # Standard generation without KV cache
                 # Create attention mask for proper padding handling
                 attention_mask = torch.ones_like(input_ids)
 
@@ -170,11 +187,122 @@ class HFWrapper(LanguageModel):
                         last_hidden_states = self._model(input_ids).logits
                         logits = last_hidden_states[:, -max_new_tokens:, :]
 
+                # Capture KV cache if enabled (from the generation)
+                if (
+                    self.supports_kv_append()
+                    and hasattr(outputs, "past_key_values")
+                    and outputs.past_key_values is not None  # type: ignore
+                ):
+                    self._last_generated_kv = KVCache.from_hf_output(
+                        outputs.past_key_values  # type: ignore
+                    )
+                else:
+                    self._last_generated_kv = None
+
                 return generated_ids, logits
 
         except Exception as e:
             self.logger.error(f"Failed to generate tokens: {e}")
             raise
+
+    def _generate_with_kv_cache(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        do_sample: bool,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate tokens using cached KV states.
+
+        Args:
+            input_ids: Input token IDs
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature
+            do_sample: Whether to use sampling
+            **kwargs: Additional generation parameters
+
+        Returns:
+            Tuple of (generated_ids, logits)
+        """
+        # Use forward() directly to avoid generate() cache_position issues
+        # Only pass the new tokens (not cached ones) as input
+        cache_len = self._kv_cache.seq_len if self._kv_cache else 0
+        new_input_ids = input_ids[:, cache_len:]
+
+        if new_input_ids.shape[1] == 0:
+            # No new tokens to process - shouldn't happen in normal flow
+            raise ValueError(
+                f"No new tokens after cache (cache_len={cache_len}, "
+                f"input_len={input_ids.shape[1]})"
+            )
+
+        # Run forward pass with cached KV
+        with torch.no_grad():
+            outputs = self._model(  # type: ignore
+                new_input_ids,
+                past_key_values=(
+                    self._kv_cache.past_key_values if self._kv_cache else None
+                ),
+                use_cache=True,
+            )
+
+        logits = outputs.logits  # [batch, seq, vocab]
+        past_key_values = outputs.past_key_values
+
+        # Sample from logits for max_new_tokens
+        generated_tokens = []
+        all_logits = []
+
+        # First token from current logits
+        next_token_logits = logits[:, -1, :] / temperature
+        all_logits.append(next_token_logits)
+
+        if do_sample:
+            probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+        else:
+            next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+
+        generated_tokens.append(next_token)
+
+        # Generate remaining tokens
+        for _ in range(max_new_tokens - 1):
+            with torch.no_grad():
+                outputs = self._model(  # type: ignore
+                    next_token, past_key_values=past_key_values, use_cache=True
+                )
+
+            logits = outputs.logits
+            past_key_values = outputs.past_key_values
+
+            next_token_logits = logits[:, -1, :] / temperature
+            all_logits.append(next_token_logits)
+
+            if do_sample:
+                probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+
+            generated_tokens.append(next_token)
+
+        # Concatenate results
+        generated_ids = torch.cat(generated_tokens, dim=1)
+        logits_stacked = torch.stack(all_logits, dim=1)
+
+        # Store updated KV cache
+        if past_key_values is not None:
+            self._last_generated_kv = KVCache.from_hf_output(past_key_values)
+        else:
+            self._last_generated_kv = None
+
+        return generated_ids, logits_stacked
+
+    def get_last_generated_kv(self) -> Optional[KVCache]:
+        """Get the KV cache from the last generation."""
+        return getattr(self, "_last_generated_kv", None)
 
     def get_tokenizer_info(self) -> Dict[str, Any]:
         """Get tokenizer information for compatibility checking."""
@@ -233,6 +361,150 @@ class HFWrapper(LanguageModel):
         """Optimize the model using the provided optimization manager."""
         if optimization_manager and hasattr(self, "_model") and self._model is not None:
             self._model = optimization_manager.optimize_model(self._model)
+
+    def supports_kv_append(self) -> bool:
+        """
+        Check if this model supports KV cache appending.
+
+        Returns:
+            True if KV append is enabled and model is a causal LM
+        """
+        if not self._kv_append_enabled:
+            return False
+
+        # HF causal LMs support past_key_values
+        return hasattr(self._model, "forward") and hasattr(self._model, "config")
+
+    def get_kv_cache(self) -> Optional[KVCache]:
+        """
+        Get the current KV cache from the model.
+
+        Returns:
+            KVCache object or None if not available
+        """
+        return self._kv_cache
+
+    def append_kv_cache(self, kv_chunk: KVCache) -> None:
+        """
+        Append a KV cache chunk to the model's cache.
+
+        Args:
+            kv_chunk: KVCache object containing keys and values to append
+        """
+        if not self.supports_kv_append():
+            self.logger.warning("KV append not supported, ignoring")
+            return
+
+        # Import kernel here to avoid circular dependency
+        try:
+            from kernels import get_kv_append
+
+            kv_append_fn = get_kv_append(self._device)
+        except ImportError:
+            kv_append_fn = None
+
+        if self._kv_cache is None:
+            # First chunk, just store it
+            self._kv_cache = kv_chunk.to(torch.device(self._device))
+            self.logger.debug(f"Initialized KV cache with {kv_chunk.seq_len} positions")
+        else:
+            # Append to existing cache
+            if kv_append_fn is not None:
+                # Use kernel for efficient append
+                self._kv_cache = self._append_kv_with_kernel(
+                    kv_append_fn, self._kv_cache, kv_chunk
+                )
+            else:
+                # Fallback to PyTorch concat
+                self._kv_cache = self._append_kv_pytorch(self._kv_cache, kv_chunk)
+
+            self.logger.debug(
+                f"Appended {kv_chunk.seq_len} positions to KV cache, "
+                f"total: {self._kv_cache.seq_len}"
+            )
+
+    def _append_kv_pytorch(self, base_cache: KVCache, new_cache: KVCache) -> KVCache:
+        """
+        Append KV cache using PyTorch concat (fallback).
+
+        Args:
+            base_cache: Existing base cache
+            new_cache: New cache to append
+
+        Returns:
+            Updated KVCache
+        """
+        # Ensure same device
+        new_cache = new_cache.to(torch.device(self._device))
+
+        # Concatenate along sequence dimension (dim=2)
+        appended_kv = tuple(
+            (
+                torch.cat([base_k, new_k], dim=2),
+                torch.cat([base_v, new_v], dim=2),
+            )
+            for (base_k, base_v), (new_k, new_v) in zip(
+                base_cache.past_key_values, new_cache.past_key_values
+            )
+        )
+
+        return KVCache(
+            past_key_values=appended_kv,
+            seq_len=base_cache.seq_len + new_cache.seq_len,
+            dtype=base_cache.dtype,
+            device=base_cache.device,
+        )
+
+    def _append_kv_with_kernel(
+        self, kv_append_fn: Any, base_cache: KVCache, new_cache: KVCache
+    ) -> KVCache:
+        """
+        Append KV cache using kernel implementation.
+
+        Args:
+            kv_append_fn: Kernel function for KV append
+            base_cache: Existing base cache
+            new_cache: New cache to append
+
+        Returns:
+            Updated KVCache
+        """
+        # Ensure same device
+        new_cache = new_cache.to(torch.device(self._device))
+
+        # Use kernel for each layer
+        appended_kv = []
+        for (base_k, base_v), (new_k, new_v) in zip(
+            base_cache.past_key_values, new_cache.past_key_values
+        ):
+            try:
+                # Call kernel (signature: base_k, base_v, new_k, new_v)
+                out_k, out_v = kv_append_fn(base_k, base_v, new_k, new_v)
+                appended_kv.append((out_k, out_v))
+            except Exception as e:
+                self.logger.warning(
+                    f"Kernel append failed, falling back to PyTorch: {e}"
+                )
+                # Fallback to concat
+                out_k = torch.cat([base_k, new_k], dim=2)
+                out_v = torch.cat([base_v, new_v], dim=2)
+                appended_kv.append((out_k, out_v))
+
+        # Synchronize CUDA stream if on CUDA device
+        if self._device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        return KVCache(
+            past_key_values=tuple(appended_kv),
+            seq_len=base_cache.seq_len + new_cache.seq_len,
+            dtype=base_cache.dtype,
+            device=base_cache.device,
+        )
+
+    def clear_kv_cache(self) -> None:
+        """Clear the model's KV cache."""
+        self._kv_cache = None
+        self.logger.debug("Cleared KV cache")
 
     def cleanup(self) -> None:
         """Clean up model memory (useful for MPS)."""

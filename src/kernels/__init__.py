@@ -49,6 +49,7 @@ def _register_kernels():
 
     # Register reference implementations (fallback)
     registry.register("verify_prefix", verify_prefix_ref, priority=10, device="auto")
+    # Register simplified kv_append (simple concat version)
     registry.register("kv_append", kv_append_ref, priority=10, device="auto")
 
 

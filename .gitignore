@@ -136,8 +136,8 @@ dmypy.json
 *.fatbin
 *.ptx
 *.cuh
-*.cu
-*.c
+# Keep our CUDA kernel source files
+# *.cu
 *.o
 *.obj
 *.exe
@@ -164,11 +164,21 @@ nvcc_log.txt
 # Large datasets
 data/
 datasets/
-*.csv
-*.json
 *.jsonl
 *.parquet
 *.arrow
+
+# But keep benchmark results and config files
+!docs/results/**/*.json
+!docs/results/**/*.csv
+!configs/*.yaml
+!*.json
+!*.csv
+
+# Except large data files and old results at root
+/results/
+/results_*/
+/k_sweep_results.json
 
 # Logs and monitoring
 logs/

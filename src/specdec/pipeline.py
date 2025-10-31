@@ -216,6 +216,8 @@ class SpeculativePipeline(SpeculativeDecoder):
             "total_steps": 0,
             "total_verification_time_ms": 0.0,
             "total_generation_time_ms": 0.0,
+            "kv_appended_tokens_total": 0,
+            "kv_append_time_ms": 0.0,
         }
 
     def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
@@ -278,7 +280,8 @@ class SpeculativePipeline(SpeculativeDecoder):
 
             kernel_info = get_kernel_info()
             self.logger.info(
-                f"Kernel backends: verify={kernel_info['verify_backend']}, kv_append={kernel_info['kv_append_backend']}"
+                f"Kernel backends: verify={kernel_info['verify_backend']}, "
+                f"kv_append={kernel_info['kv_append_backend']}"
             )
         except ImportError:
             self.logger.info("Kernels not available, using fallback implementation")
@@ -733,7 +736,15 @@ class SpeculativePipeline(SpeculativeDecoder):
             "total_steps": 0,
             "total_verification_time_ms": 0.0,
             "total_generation_time_ms": 0.0,
+            "kv_appended_tokens_total": 0,
+            "kv_append_time_ms": 0.0,
         }
+
+        # Clear KV cache at start of new generation
+        if hasattr(self.base_lm, "clear_kv_cache"):
+            self.base_lm.clear_kv_cache()
+        if hasattr(self.draft_lm, "clear_kv_cache"):
+            self.draft_lm.clear_kv_cache()
 
         try:
             # Use optimization context if available, otherwise use AMP context
@@ -893,6 +904,44 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Step 3: Handle results
                 if accepted_len > 0:
+                    # KV cache integration: append accepted tokens' KV
+                    # to base model cache
+                    if (
+                        hasattr(self.base_lm, "supports_kv_append")
+                        and self.base_lm.supports_kv_append()
+                    ):
+                        kv_append_start = time.time()
+                        try:
+                            # Get the base model's last generated KV cache
+                            if hasattr(self.base_lm, "get_last_generated_kv"):
+                                base_kv = self.base_lm.get_last_generated_kv()
+                                if (
+                                    base_kv is not None
+                                    and accepted_len <= base_kv.seq_len
+                                ):
+                                    # Slice to accepted length
+                                    accepted_kv = base_kv.slice_prefix(accepted_len)
+                                    # Append to base model's cache
+                                    self.base_lm.append_kv_cache(accepted_kv)
+                                    # Update metrics
+                                    self.metrics[
+                                        "kv_appended_tokens_total"
+                                    ] += accepted_len
+                                    kv_append_time_ms = (
+                                        time.time() - kv_append_start
+                                    ) * 1000
+                                    self.metrics[
+                                        "kv_append_time_ms"
+                                    ] += kv_append_time_ms
+                                    self.logger.debug(
+                                        f"Appended {accepted_len} tokens to KV cache "
+                                        f"in {kv_append_time_ms:.2f}ms"
+                                    )
+                        except Exception as e:
+                            self.logger.warning(
+                                f"KV cache append failed, continuing without cache: {e}"
+                            )
+
                     # Accept the proposed tokens (but respect max_tokens limit)
                     if accepted_tokens.numel() > 0:
                         # Calculate how many tokens we can still accept
@@ -1010,6 +1059,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                 actual_dtype = opt_info.get("dtype", actual_dtype)
                 actual_amp_enabled = opt_info.get("enabled", actual_amp_enabled)
 
+            # Get kernel backend info
+            try:
+                from kernels import get_kernel_info
+
+                kernel_info = get_kernel_info()
+                kv_append_backend = kernel_info.get("kv_append_backend", "unknown")
+            except ImportError:
+                kv_append_backend = "unavailable"
+
             result = {
                 "text": generated_text,
                 "generated_tokens": generated_tokens,
@@ -1021,6 +1079,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                 "steps": step,
                 "verification_time_ms": self.metrics["total_verification_time_ms"],
                 "generation_time_ms": self.metrics["total_generation_time_ms"],
+                "kv_appended_tokens_total": self.metrics["kv_appended_tokens_total"],
+                "kv_append_time_ms": self.metrics["kv_append_time_ms"],
+                "kv_append_enabled": (
+                    hasattr(self.base_lm, "supports_kv_append")
+                    and self.base_lm.supports_kv_append()
+                ),
+                "kv_append_backend": kv_append_backend,
                 "mem_rss_mb": mem_rss_mb,
                 "cuda_mem_allocated_mb": cuda_mem_allocated,
                 "cuda_mem_peak_mb": cuda_mem_peak,

@@ -59,6 +59,43 @@ def verify_prefix_ref(
 def kv_append_ref(
     base_k: torch.Tensor,
     base_v: torch.Tensor,
+    new_k: torch.Tensor,
+    new_v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Reference implementation of KV cache append in pure PyTorch.
+
+    Simple concatenation along sequence dimension.
+
+    Args:
+        base_k: [B][H][L][D] base key cache
+        base_v: [B][H][L][D] base value cache
+        new_k: [B][H][K][D] new key cache to append
+        new_v: [B][H][K][D] new value cache to append
+
+    Returns:
+        output_k: [B][H][L+K][D] output key cache
+        output_v: [B][H][L+K][D] output value cache
+    """
+    # Input validation
+    assert base_k.dim() == 4, "base_k must be 4D tensor [B][H][L][D]"
+    assert base_v.dim() == 4, "base_v must be 4D tensor [B][H][L][D]"
+    assert new_k.dim() == 4, "new_k must be 4D tensor [B][H][K][D]"
+    assert new_v.dim() == 4, "new_v must be 4D tensor [B][H][K][D]"
+    assert base_k.shape[0] == new_k.shape[0], "Batch size mismatch"
+    assert base_k.shape[1] == new_k.shape[1], "Num heads mismatch"
+    assert base_k.shape[3] == new_k.shape[3], "Head dim mismatch"
+
+    # Simple concatenation along sequence dimension (dim=2)
+    output_k = torch.cat([base_k, new_k], dim=2)
+    output_v = torch.cat([base_v, new_v], dim=2)
+
+    return output_k, output_v
+
+
+def kv_append_with_mask_ref(
+    base_k: torch.Tensor,
+    base_v: torch.Tensor,
     draft_k: torch.Tensor,
     draft_v: torch.Tensor,
     accepted_mask: torch.Tensor,
@@ -66,7 +103,10 @@ def kv_append_ref(
     offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Reference implementation of KV cache append in pure PyTorch.
+    Reference implementation of KV cache append with acceptance mask.
+
+    This is the more complex version that handles selective appending based on
+    acceptance mask. Used for advanced verification scenarios.
 
     Args:
         base_k: [B][H][L][D] base key cache

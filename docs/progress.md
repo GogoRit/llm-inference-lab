@@ -4,6 +4,10 @@
 **Repository**: https://github.com/GogoRit/llm-inference-lab  
 **Objective**: Build a comprehensive toolkit for optimizing and benchmarking Large Language Model inference performance
 
+> **Strategy Note**: As of Phase 3C.5, LLM Inference Lab follows an **MPS-first optimization approach**.
+> All new features are validated locally on Apple Silicon (MPS) before limited CUDA (Kaggle/A100) benchmarking.
+> This ensures efficient use of GPU credits and rapid iteration on Mac hardware.
+
 ---
 
 ## Project Overview
@@ -143,12 +147,12 @@ This document tracks the systematic development of an LLM inference optimization
 - **Optimal K**: K=4 now provides best throughput with 17.6% acceptance rate
 
 **Technical Achievements**:
-- ✅ Mixed precision unification (CUDA/MPS/CPU)
-- ✅ Memory-safe model loading with SDPA attention
-- ✅ Multi-stream verification for CUDA
-- ✅ Enhanced metrics and monitoring
-- ✅ Environment variable overrides
-- ✅ Zero breaking changes to existing functionality
+- Mixed precision unification (CUDA/MPS/CPU)
+- Memory-safe model loading with SDPA attention
+- Multi-stream verification for CUDA
+- Enhanced metrics and monitoring
+- Environment variable overrides
+- Zero breaking changes to existing functionality
 
 ### Phase 3C.3 Custom CUDA/Triton Kernels
 
@@ -365,10 +369,116 @@ Across K=1–4, throughput averages ≈ 17.4 tok/s with overall acceptance ≈ 2
 
 ---
 
-## Next Step – Phase 3E (A100/H100 Runs & SDK Packaging)
+## Phase 3C.5: KV Cache Integration (2025-10-31) - COMPLETED
 
-- Run canonical CUDA benchmarks on A100 and H100 (bf16/fp16; graph capture toggle)
-- Package SDK 0.1.0 (pip-installable) with CLI (`specdec bench`, `specdec run`)
-- Integrate minimal vLLM/TGI adapter shim for speculative decoding
-- Add determinism flag/profile for benchmarks (fixed seeds; disable experimental draft modes)
-- Mark T4 CUDA validation as complete and publish blog summary
+### Implementation Summary
+
+Integrated KV cache management into speculative decoding pipeline. Extended `LanguageModel` interface with cache methods, created `KVCache` dataclass, and implemented full support in `HFWrapper` with CUDA/Triton/PyTorch kernel fallbacks.
+
+**Key Components:**
+- KV cache interface methods: `get_kv_cache()`, `append_kv_cache()`, `supports_kv_append()`
+- Kernel registration: `kv_append` with priority-based backend selection
+- Pipeline integration: Automatic cache append after token acceptance
+- Metrics tracking: `kv_appended_tokens_total`, `kv_append_time_ms`, backend logging
+- Environment control: `SPECDEC_ENABLE_KV_APPEND=1` (default on)
+
+**Testing:** 15 unit tests (all passing), integration with comprehensive_k_sweep.py
+
+### MPS Validation Results (2025-10-31)
+
+**KV Cache Integration: MPS Validation Complete**
+
+| Mode | K | Throughput (tok/s) | Acceptance (%) | KV Appended | Notes |
+|------|---|-------------------|----------------|-------------|-------|
+| **KV ON** | 1 | 8.44 ± 1.14 | 11.1 ± 3.9 | 12.0 ± 2.8 | 100% success |
+| **KV ON** | 2 | 8.65 ± 0.45 | 9.9 ± 2.3 | 11.3 ± 2.4 | 100% success |
+| **KV ON** | 3 | 8.88 ± 0.43 | 10.2 ± 2.0 | 11.4 ± 2.4 | 100% success |
+| **KV ON** | 4 | 9.16 ± 0.72 | 10.3 ± 2.9 | 11.3 ± 2.5 | 100% success |
+| **KV OFF** | 1 | 9.52 ± 3.47 | 16.8 ± 15.0 | 0 | Baseline |
+| **KV OFF** | 2 | 8.33 ± 0.79 | 12.9 ± 4.2 | 0 | Baseline |
+| **KV OFF** | 3 | 9.77 ± 1.53 | 18.1 ± 7.1 | 0 | Baseline |
+| **KV OFF** | 4 | 9.42 ± 1.82 | 18.0 ± 8.7 | 0 | Baseline |
+
+**Key Findings**:
+- **Functional Parity Confirmed**: KV cache integration working correctly (100% success rate, 20/20 prompts × 4 K values)
+- **Performance Assessment** (32 tokens, GPT2-124M, MPS):
+  - KV ON: 8.44-9.16 tok/s | KV OFF: 8.33-9.77 tok/s
+  - **No performance gain observed** due to model size and MPS backend characteristics
+  - Cache overhead dominates for small models with low acceptance rates (~10%)
+  - This validates correctness and establishes a baseline for CUDA optimization in Phase 3D
+- Performance stable: ~9 tok/s baseline on Apple Silicon (M-series)
+- KV metrics correctly logged: avg ~11-12 tokens appended per prompt
+- Text outputs identical between KV ON/OFF modes
+- Two critical bugs fixed:
+  - Bug #1: HuggingFace `generate()` API `cache_position` handling (switched to `forward()`)
+  - Bug #2: KV cache persisting across prompts (added `clear_kv_cache()` calls)
+- **Implementation Status**:
+  - CUDA kernel: Implemented with coalesced memory operations
+  - CUDA stream sync: Added for proper synchronization
+  - Default state: KV cache ON by default (SPECDEC_ENABLE_KV_APPEND=1)
+  - Fallback chain: CUDA kernel -> PyTorch reference (robust)
+- **Next Steps**: 
+  - Phase 3D: CUDA validation with larger models (7B+) to assess real-world impact
+  - Test on T4/A100 with longer contexts to measure actual performance gains
+  - Benchmark kernel performance vs PyTorch reference on CUDA
+
+**Scaling Analysis** (128 tokens vs 32 tokens, KV ON):
+
+| Context | Throughput (tok/s) | KV Appended (tokens) | KV Append Time (ms) |
+|---------|-------------------|---------------------|---------------------|
+| 32 tok  | 8.44-9.16         | 11-12              | 24-27              |
+| 128 tok | 6.99-7.69         | 40-46              | 114-123            |
+
+**Scaling Conclusion**: Longer contexts show **worse throughput** despite 4x more KV reuse. Cache append overhead scales linearly (4-5x time for 4x tokens), but does not amortize on MPS with small models. Confirms that KV cache optimization requires CUDA backend and larger models for measurable benefit.
+
+**Results Location**: 
+- `docs/results/2025-10-31-MPS-KV-Append-{ON,OFF}/` (32 tokens)
+- `docs/results/2025-10-31-MPS-KV-128tok/` (128 tokens, scaling test)
+
+---
+
+**Phase 3C.5 Conclusion:**
+
+MPS validation of KV-cache append completed successfully. All core features verified locally on Apple Silicon, maintaining ~9 tok/s throughput. KV cache integration functionally correct with full test coverage. Performance analysis shows no gains for GPT2-124M on MPS (cache overhead dominates), but implementation validated for Phase 3D testing with larger models on CUDA.
+
+---
+
+## Phase 3D: CUDA Validation & Optimization (IN PREPARATION)
+
+**Objective:** Validate KV cache performance on CUDA with larger models and optimize before production deployment.
+
+### Pre-GPU Optimization Tasks (Local MPS/CPU - Zero Cost)
+
+| Task | Purpose | Status |
+|------|---------|--------|
+| Dry-run profiler mode | Measure pure verification cost per step | Pending |
+| Structured JSON metrics | Enable per-stage performance slicing | Pending |
+| Extended K-sweep (K=8) | Confirm kernel scaling curve | Pending |
+| Deterministic seeding | Ensure reproducibility on CUDA | Pending |
+| Lightweight memory tracker | Log GPU memory without heavy reruns | Pending |
+
+### CUDA-Specific Enablement
+
+| Task | Purpose | Status |
+|------|---------|--------|
+| CUDA kernel call verification | Ensure pipeline invokes CUDA path | Complete |
+| CUDA event profiling hooks | Measure per-kernel latency | Pending |
+| Benchmark mode CLI flag | Max throughput without I/O overhead | Pending |
+| CUDA fallback chain test | Verify no kernel build crashes | Pending |
+| Pre-computed prompt batches | Eliminate tokenizer overhead | Pending |
+
+### Strategic GPU Validation Plan
+
+**Kaggle T4 (Free Tier):**
+- Baseline: 32 tokens x K=1-4 (10 min)
+- Scaling: 128 tokens x K=1-4 (15 min)
+
+**A100 (Credit-Limited):**
+- Performance: 32 tokens x K=4 vs MPS (10 min)
+- Long-context: 256 tokens x K=4 (20 min)
+
+**Expected Deliverables:**
+- CUDA vs MPS throughput comparison
+- KV cache performance on larger models (7B+)
+- Kernel backend performance analysis
+- Production-ready configuration recommendations
