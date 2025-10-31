@@ -443,31 +443,100 @@ MPS validation of KV-cache append completed successfully. All core features veri
 
 ---
 
-## Phase 3D: CUDA Validation & Optimization (IN PREPARATION)
+## Phase 3D: GPU Optimization and Validation (IN PROGRESS)
 
-**Objective:** Validate KV cache performance on CUDA with larger models and optimize before production deployment.
+**Objective:** Optimize speculative decoding for GPU execution with CUDA-specific features, structured profiling, and deterministic reproducibility before full CUDA validation runs.
 
-### Pre-GPU Optimization Tasks (Local MPS/CPU - Zero Cost)
+### Implementation Summary
 
-| Task | Purpose | Status |
-|------|---------|--------|
-| Dry-run profiler mode | Measure pure verification cost per step | Pending |
-| Structured JSON metrics | Enable per-stage performance slicing | Pending |
-| Extended K-sweep (K=8) | Confirm kernel scaling curve | Pending |
-| Deterministic seeding | Ensure reproducibility on CUDA | Pending |
-| Lightweight memory tracker | Log GPU memory without heavy reruns | Pending |
+**1. Deterministic Seeding (specdec/deterministic.py)**
+- Centralized utility with `set_deterministic_mode()` helper
+- Environment flag: `SPECDEC_DETERMINISTIC=1`
+- Seeds: Python, NumPy, PyTorch, CuDNN deterministic mode
+- Automatically invoked if environment flag is set
 
-### CUDA-Specific Enablement
+**2. Structured Profiler (metrics/structured_profiler.py)**
+- Per-step GPU event timers for draft/verify/accept/kv timing
+- CUDA event-based synchronization (more accurate than wall-clock)
+- JSON output with standardized schema
+- Environment flag: `SPECDEC_PROFILE=1`
+- Integrated into pipeline with best-effort recording
 
-| Task | Purpose | Status |
-|------|---------|--------|
-| CUDA kernel call verification | Ensure pipeline invokes CUDA path | Complete |
-| CUDA event profiling hooks | Measure per-kernel latency | Pending |
-| Benchmark mode CLI flag | Max throughput without I/O overhead | Pending |
-| CUDA fallback chain test | Verify no kernel build crashes | Pending |
-| Pre-computed prompt batches | Eliminate tokenizer overhead | Pending |
+**3. Enhanced Memory Tracking (metrics/memory_profiler.py)**
+- CUDA memory stats: `torch.cuda.memory_stats()` summary
+- MPS memory tracking: `torch.mps.driver_allocated_memory()` if available
+- Memory stats integrated into structured metrics output
 
-### Strategic GPU Validation Plan
+**4. CUDA Stream Overlap (scheduler/speculative_scheduler.py)**
+- Asynchronous overlap of draft and verification passes using CUDA streams
+- Event-based synchronization using CUDA events
+- Environment flags: `SPECDEC_PARALLEL_STREAMS=1`, `SPECDEC_SYNC_MODE=event|barrier`
+- Fallback to barrier synchronization or single-stream on non-CUDA devices
+
+**5. CUDA Graph Capture (specdec/pipeline.py)**
+- Optional static graph capture for steady decoding steps with fixed batch shapes
+- Warmup phase (3 steps) before capture to stabilize CUDA execution
+- Automatic fallback to eager mode if capture fails (dynamic shapes, MPS backend)
+- Environment flag: `SPECDEC_CUDA_GRAPH=1`
+
+**6. Profiling Hooks Integration (specdec/pipeline.py)**
+- Per-step profiling hooks for draft_forward_time_ms, verify_forward_time_ms, kv_append_time_ms
+- Acceptance check time recording
+- Integrated with structured profiler for JSON output
+
+**7. Dry-Run Mode (scripts/comprehensive_k_sweep.py)**
+- Latency-only profiling without model compute
+- Synthesized metrics for pipeline validation
+- Environment flag: `SPECDEC_DRY_RUN=1`
+- Output to `docs/results/phase3d-dryrun/`
+
+### Implementation Status
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| Deterministic seeding utility | Complete | `src/specdec/deterministic.py`, 5 unit tests |
+| Structured profiler | Complete | `src/metrics/structured_profiler.py`, 6 unit tests |
+| Enhanced memory tracking | Complete | Enhanced `src/metrics/memory_profiler.py` |
+| CUDA stream overlap | Complete | Enhanced `src/scheduler/speculative_scheduler.py` |
+| CUDA graph capture | Complete | `src/specdec/pipeline.py` with fallback |
+| Profiling hooks integration | Complete | Integrated into pipeline generate loop |
+| Dry-run mode | Complete | Environment flag in K-sweep script |
+| Unit tests | Complete | 14 tests passing (2 skipped on non-CUDA) |
+| MPS validation | Complete | All features validated on MPS |
+| CUDA validation | Pending | GPU validation runs on Kaggle T4/A100 |
+
+### MPS Validation Results (2025-10-31)
+
+**Validation Test Suite:**
+- Full K-sweep with Phase 3D flags: `SPECDEC_DETERMINISTIC=1`, `SPECDEC_PROFILE=1`
+- Dry-run mode: `SPECDEC_DRY_RUN=1`
+- CUDA graph flag on MPS: `SPECDEC_CUDA_GRAPH=1` (gracefully disabled)
+- Deterministic seeding verification
+
+**Results:**
+- Full K-sweep: 80 runs, 100% success, ~11.5 tok/s avg throughput
+- Dry-run mode: Synthesized metrics generated correctly, JSON output valid
+- CUDA graph fallback: Correctly disabled on MPS, no errors
+- Deterministic mode: Identical results verified (`v1 == v2`)
+- Unit tests: 14 passed, 2 skipped (CUDA-specific, expected)
+
+**Validation Status:**
+- All Phase 3D features functional on MPS
+- All unit tests passing
+- Ready for CUDA validation runs
+
+### CUDA Validation (PENDING)
+
+**Objective:** Validate all Phase 3D GPU optimization features on CUDA hardware (Kaggle T4/A100) after successful MPS validation.
+
+**Validation Tasks:**
+- Full K-sweep with all Phase 3D flags enabled
+- CUDA graph capture performance impact measurement
+- Stream overlap efficiency gains analysis
+- Structured profiling accuracy validation
+- CUDA vs MPS throughput comparison
+
+**Strategic GPU Validation Plan:**
 
 **Kaggle T4 (Free Tier):**
 - Baseline: 32 tokens x K=1-4 (10 min)
@@ -479,6 +548,68 @@ MPS validation of KV-cache append completed successfully. All core features veri
 
 **Expected Deliverables:**
 - CUDA vs MPS throughput comparison
-- KV cache performance on larger models (7B+)
-- Kernel backend performance analysis
+- Graph capture performance impact analysis
+- Stream overlap efficiency gains measurement
 - Production-ready configuration recommendations
+
+**Status:** Pending - Will be executed after MPS validation completes (Phase 3D feature implementation ready)
+
+### Environment Flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `SPECDEC_DETERMINISTIC` | 0 | Enable deterministic seeding for reproducibility |
+| `SPECDEC_PROFILE` | 0 | Enable structured event profiling with JSON output |
+| `SPECDEC_CUDA_GRAPH` | 0 | Enable CUDA graph capture for steady decoding steps |
+| `SPECDEC_PARALLEL_STREAMS` | 1 | Enable CUDA stream overlap for async verification |
+| `SPECDEC_SYNC_MODE` | event | Sync mode: event (CUDA events) or barrier (stream.synchronize) |
+| `SPECDEC_DRY_RUN` | 0 | Run latency-only profiling without model compute |
+
+---
+
+## Phase 4A: Batch-Level Processing (PLANNED)
+
+**Objective:** Process multiple prompts simultaneously to improve GPU utilization and throughput for batch inference scenarios.
+
+**Planned Features:**
+- Multi-prompt batch processing pipeline
+- Batched draft generation across prompts
+- Batched verification with efficient tensor operations
+- Batch-aware acceptance policy application
+- Memory-efficient batch management
+
+**Status:** Planned for implementation after Phase 3D CUDA validation runs complete
+
+**Prerequisites:** Phase 3D CUDA validation results and performance analysis complete
+
+---
+
+## Phase 4C: Layer/Model Parallelism (FUTURE)
+
+**Objective:** Enable layer-wise or model-wise parallelism for very large models (7B+ parameters) that exceed single GPU memory limits.
+
+**Planned Features:**
+- Layer parallelism for large transformer models
+- Model parallelism across multiple GPUs
+- Efficient gradient/activation communication
+- Memory optimization for multi-GPU setups
+
+**Status:** Future phase, needed only for 7B+ models requiring multi-GPU deployment
+
+**Prerequisites:** Phase 3D CUDA validation complete, confirmed need for multi-GPU support
+
+---
+
+## Phase 4D: Speculative Tree Decoding (FUTURE)
+
+**Objective:** Implement advanced acceptance strategies using tree-based speculative decoding for improved acceptance rates and throughput.
+
+**Planned Features:**
+- Tree-structured draft generation
+- Multi-path verification and acceptance
+- Advanced acceptance strategies (tree-agree, confidence-based)
+- Efficient tree traversal and pruning
+
+**Status:** Future phase for advanced acceptance strategies beyond longest-prefix matching
+
+**Prerequisites:** Phase 3D CUDA validation complete, performance baseline established

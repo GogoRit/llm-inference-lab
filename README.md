@@ -6,20 +6,28 @@ A comprehensive toolkit for optimizing Large Language Model inference with specu
 > All new features are validated locally on Apple Silicon (MPS) before limited CUDA (Kaggle/A100) benchmarking.
 > This ensures efficient use of GPU credits and rapid iteration on Mac hardware.
 
-## What's New (Phase 3C.5 Complete)
+## What's New (Phase 3D Complete)
 
 **Latest Achievements**:
-- **KV Cache Integration**: Fully functional with CUDA/Triton/PyTorch fallbacks (default ON)
-- **MPS Validation**: 100% success rate (80 test cases), functional parity confirmed
-- **Custom CUDA Kernels**: `verify_prefix` and `kv_append` with stream synchronization
-- **Kernel Registry**: Priority-based backend selection with safe fallbacks
-- **Production-Ready**: 15 KV cache tests passing, zero lint errors, comprehensive docs
+- **GPU Optimization**: CUDA stream overlap, graph capture, structured profiling
+- **Deterministic Reproducibility**: Centralized seeding utility with environment flags
+- **Structured Metrics**: Per-step GPU event timers with JSON output
+- **Dry-Run Profiling**: Latency-only profiling without model compute
+- **Enhanced Memory Tracking**: CUDA and MPS memory stats integration
+- **MPS Validation Complete**: All Phase 3D features validated on Apple Silicon
 
-**Performance Results** (GPT2-124M + DistilGPT2, MPS):
-- **Throughput**: 8.4-9.2 tok/s (32 tokens), 7.0-7.7 tok/s (128 tokens)
-- **KV Cache Status**: Functionally correct, no performance gain on small models/MPS
-- **Expected Benefits**: Larger models (7B+) on CUDA with higher acceptance rates
-- **Memory Efficient**: ~275MB peak, avg 11-12 tokens cached per prompt
+**Phase 3D Features**:
+- **Deterministic Seeding**: `SPECDEC_DETERMINISTIC=1` for reproducible benchmarks
+- **Structured Profiler**: `SPECDEC_PROFILE=1` for per-step event timing
+- **CUDA Graph Capture**: `SPECDEC_CUDA_GRAPH=1` for steady decoding optimization
+- **Stream Overlap**: `SPECDEC_PARALLEL_STREAMS=1` with event-based synchronization
+- **Dry-Run Mode**: `SPECDEC_DRY_RUN=1` for latency profiling without model load
+
+**Performance Results** (GPT2-124M + DistilGPT2, MPS, Phase 3D):
+- **Throughput**: ~11.5 tok/s average across K=1-4
+- **Validation Status**: 80 runs, 100% success, all Phase 3D features functional
+- **Unit Tests**: 14 tests passing (2 skipped on non-CUDA)
+- **Ready for CUDA**: All features validated on MPS before GPU runs
 
 ## Quick Start
 
@@ -43,11 +51,15 @@ SPECDEC_DETAILED_METRICS=1 python scripts/comprehensive_k_sweep.py \
 
 ### CUDA Run (Kaggle/Cloud)
 ```bash
-# Set environment variables
+# Set environment variables for Phase 3D optimization
 export SPECDEC_AMP=1
 export SPECDEC_DTYPE=float16
 export SPECDEC_DETAILED_METRICS=1
+export SPECDEC_DETERMINISTIC=1
+export SPECDEC_PROFILE=1
 export SPECDEC_CUDA_GRAPH=1
+export SPECDEC_PARALLEL_STREAMS=1
+export SPECDEC_SYNC_MODE=event
 
 # Run comprehensive K-sweep
 python scripts/comprehensive_k_sweep.py \
@@ -81,7 +93,10 @@ python -m src.server.local_baseline --prompt "Hello world!"
 | **3A** | Complete | Local optimization | Mixed precision, profiling, K-sweep analysis |
 | **3B** | Complete | GPU pre-check | CUDA readiness, memory-safe loading |
 | **3C** | Complete | CUDA kernels | Custom kernels, registry, detailed metrics |
-| **3D** | Next | CUDA validation | GPU performance validation |
+| **3D** | In Progress | GPU optimization | Stream overlap, graph capture, structured profiling (CUDA validation pending) |
+| **4A** | Planned | Batch-level processing | Multi-prompt batch processing (after Phase 3D CUDA validation) |
+| **4C** | Future | Layer/model parallelism | Multi-GPU support for 7B+ models (after Phase 3D CUDA validation) |
+| **4D** | Future | Speculative tree decoding | Tree-based acceptance strategies (after Phase 3D CUDA validation) |
 
 ## Environment Flags
 
@@ -90,9 +105,14 @@ python -m src.server.local_baseline --prompt "Hello world!"
 | `SPECDEC_AMP=1/0` | Enable/disable mixed precision | Auto |
 | `SPECDEC_DTYPE=float16/bfloat16/float32` | Override dtype | Auto |
 | `SPECDEC_DETAILED_METRICS=1` | Enable detailed profiling | Off |
-| `SPECDEC_CUDA_GRAPH=1` | Enable CUDA graph capture | Off |
 | `SPECDEC_ENABLE_KV_APPEND=1/0` | Enable KV cache appending | On |
 | `SPECDEC_FORCE_PY=1` | Skip kernel compilation | Off |
+| `SPECDEC_DETERMINISTIC=1` | Enable deterministic seeding | Off |
+| `SPECDEC_PROFILE=1` | Enable structured event profiling | Off |
+| `SPECDEC_CUDA_GRAPH=1` | Enable CUDA graph capture | Off |
+| `SPECDEC_PARALLEL_STREAMS=1` | Enable CUDA stream overlap | On |
+| `SPECDEC_SYNC_MODE=event/barrier` | Sync mode: event or barrier | event |
+| `SPECDEC_DRY_RUN=1` | Run latency-only profiling | Off |
 
 ## Performance Results
 

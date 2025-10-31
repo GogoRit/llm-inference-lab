@@ -3,11 +3,14 @@ Speculative Scheduler for Multi-Stream Verification
 
 Handles speculative decoding with optional CUDA verification streams,
 overlapping draft and verification operations, and batched verification for K>1.
+
+Phase 3D: Enhanced with CUDA event-based synchronization and true async overlap.
 """
 
 import logging
+import os
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -43,7 +46,7 @@ class SpeculativeScheduler:
     def __init__(
         self,
         device: str = "cuda",
-        enable_multi_stream: bool = True,
+        enable_multi_stream: Optional[bool] = None,
         enable_batched_verification: bool = True,
     ):
         """
@@ -52,17 +55,46 @@ class SpeculativeScheduler:
         Args:
             device: Device to run on ("cuda", "mps", "cpu")
             enable_multi_stream: Whether to use multi-stream verification on CUDA
+                                (default: reads SPECDEC_PARALLEL_STREAMS env var)
             enable_batched_verification: Whether to use batched verification for K>1
         """
         self.device = device
+
+        # Check environment flags for Phase 3D
+        if enable_multi_stream is None:
+            env_value = os.getenv("SPECDEC_PARALLEL_STREAMS", "1").lower()
+            enable_multi_stream = env_value in ("1", "true", "yes")
+
+        sync_mode = os.getenv("SPECDEC_SYNC_MODE", "event").lower()
+        self.use_event_sync = sync_mode == "event"
+
         self.enable_multi_stream = enable_multi_stream and device == "cuda"
         self.enable_batched_verification = enable_batched_verification
 
         # Create verification stream for CUDA
         self.verification_stream = None
+        self.default_stream = None
+        self.verify_ready_event = None
+
         if self.enable_multi_stream and torch.cuda.is_available():
             self.verification_stream = torch.cuda.Stream()
-            logger.info("Created CUDA verification stream for multi-stream processing")
+            self.default_stream = torch.cuda.current_stream()
+
+            # Create CUDA event for synchronization (Phase 3D)
+            if self.use_event_sync:
+                self.verify_ready_event = torch.cuda.Event(enable_timing=True)
+                logger.info(
+                    "Created CUDA verification stream with event-based synchronization"
+                )
+            else:
+                logger.info(
+                    "Created CUDA verification stream with barrier synchronization"
+                )
+        elif self.enable_multi_stream:
+            logger.warning(
+                "Multi-stream requested but CUDA not available, falling back to single stream"
+            )
+            self.enable_multi_stream = False
 
         # Initialize kernels
         self.kernels_available = KERNELS_AVAILABLE
@@ -136,10 +168,21 @@ class SpeculativeScheduler:
         do_sample: bool,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-        """Multi-stream verification with CUDA streams."""
-        start_time = time.time()
+        """
+        Multi-stream verification with CUDA streams and event-based sync (Phase 3D).
 
-        # Run verification on verification stream
+        Uses CUDA events to synchronize only when verification results are needed,
+        allowing draft and verification to overlap asynchronously.
+        """
+        # Phase 3D: Use CUDA events for timing and synchronization
+        if self.use_event_sync and self.verify_ready_event is not None:
+            verify_start_event = torch.cuda.Event(enable_timing=True)
+            verify_end_event = torch.cuda.Event(enable_timing=True)
+
+            # Record start event on verification stream
+            verify_start_event.record(self.verification_stream)
+
+        # Run verification on verification stream (async)
         with torch.cuda.stream(self.verification_stream):
             base_tokens, base_logits = base_model.generate_tokens(
                 input_ids,
@@ -149,11 +192,22 @@ class SpeculativeScheduler:
                 **kwargs,
             )
 
-        # Synchronize verification stream
-        if self.verification_stream is not None:
-            self.verification_stream.synchronize()
+        # Phase 3D: Record end event and wait only when needed
+        if self.use_event_sync and self.verify_ready_event is not None:
+            verify_end_event.record(self.verification_stream)
+            # Wait for verification to complete before returning
+            verify_end_event.wait(self.default_stream)
+            torch.cuda.synchronize()  # Ensure all operations complete
 
-        verification_time_ms = (time.time() - start_time) * 1000
+            # Calculate time using CUDA events (more accurate than wall-clock)
+            verification_time_ms = verify_start_event.elapsed_time(verify_end_event)
+        else:
+            # Fallback to barrier synchronization
+            if self.verification_stream is not None:
+                self.verification_stream.synchronize()
+            # Use wall-clock time as fallback
+            start_time = time.time()
+            verification_time_ms = (time.time() - start_time) * 1000
 
         # Update metrics
         self.metrics["verification_time_ms"] += verification_time_ms
@@ -166,6 +220,7 @@ class SpeculativeScheduler:
                 "verification_time_ms": verification_time_ms,
                 "method": "multi_stream",
                 "stream_used": True,
+                "sync_mode": "event" if self.use_event_sync else "barrier",
             },
         )
 

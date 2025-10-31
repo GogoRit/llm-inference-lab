@@ -58,11 +58,13 @@ class MemoryProfiler:
         return current_memory
 
     def _estimate_mps_memory(self) -> float:
-        """Estimate MPS memory usage (rough approximation)."""
-        # This is a rough estimate - MPS doesn't provide detailed memory stats
-        # We'll use a simple heuristic based on tensor sizes
+        """Estimate MPS memory usage using driver_allocated_memory if available."""
+        # Try to use torch.mps.driver_allocated_memory() if available (PyTorch 2.0+)
+        if hasattr(torch.mps, "driver_allocated_memory"):
+            return torch.mps.driver_allocated_memory() / (1024**2)
+
+        # Fallback: rough estimate based on tensor sizes
         total_elements = 0
-        # MPS doesn't have _get_all_tensors, use gc as fallback
         import gc
 
         for obj in gc.get_objects():
@@ -71,27 +73,53 @@ class MemoryProfiler:
                     total_elements += obj.numel()
 
         # Assume float16 (2 bytes per element)
-        return total_elements * 2 / 1024 / 1024
+        return total_elements * 2 / (1024**2)
 
     def get_memory_stats(self) -> Dict[str, Any]:
-        """Get memory statistics."""
+        """Get memory statistics with enhanced CUDA/MPS tracking."""
         if self.device == "cuda":
-            return {
+            base_stats = {
                 "device": "cuda",
-                "current_memory_mb": torch.cuda.memory_allocated() / 1024 / 1024,
-                "peak_memory_mb": torch.cuda.max_memory_allocated() / 1024 / 1024,
-                "reserved_memory_mb": torch.cuda.memory_reserved() / 1024 / 1024,
+                "current_memory_mb": torch.cuda.memory_allocated() / (1024**2),
+                "peak_memory_mb": torch.cuda.max_memory_allocated() / (1024**2),
+                "reserved_memory_mb": torch.cuda.memory_reserved() / (1024**2),
                 "samples": self.memory_samples,
             }
+
+            # Add detailed CUDA memory stats if available
+            if hasattr(torch.cuda, "memory_stats"):
+                cuda_stats = torch.cuda.memory_stats()
+                base_stats.update(
+                    {
+                        "allocated_bytes_all_peak_mb": cuda_stats.get(
+                            "allocated_bytes.all.peak", 0
+                        )
+                        / (1024**2),
+                        "reserved_bytes_all_peak_mb": cuda_stats.get(
+                            "reserved_bytes.all.peak", 0
+                        )
+                        / (1024**2),
+                    }
+                )
+
+            return base_stats
         elif self.device == "mps":
             current_memory = self._estimate_mps_memory()
-            return {
+            stats = {
                 "device": "mps",
                 "current_memory_mb": current_memory,
                 "peak_memory_mb": self.peak_memory_mb,
                 "reserved_memory_mb": current_memory,  # Same as current for MPS
                 "samples": self.memory_samples,
             }
+
+            # Add driver_allocated_memory if available
+            if hasattr(torch.mps, "driver_allocated_memory"):
+                stats["driver_allocated_memory_mb"] = (
+                    torch.mps.driver_allocated_memory() / (1024**2)
+                )
+
+            return stats
         else:
             return {
                 "device": "cpu",

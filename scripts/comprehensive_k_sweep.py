@@ -130,6 +130,38 @@ def run_comprehensive_k_sweep(
     resolved_device = resolve_device(device)
     logger.info(f"Using device: {resolved_device}")
 
+    # Phase 3D: Dry-run mode (env flag only, minimal surface change)
+    if os.getenv("SPECDEC_DRY_RUN", "0").lower() in ("1", "true", "yes"):
+        out_dir = Path("docs/results/phase3d-dryrun")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        summary = []
+        for k in [1, 2, 3, 4]:
+            draft_ms = float(5.0 * k)
+            verify_ms = float(6.0 * k)
+            kv_ms = 1.0
+            tok_s = 1000.0 / (draft_ms + verify_ms)
+            summary.append(
+                {
+                    "device": resolved_device,
+                    "dtype": (
+                        "float16" if resolved_device in ["cuda", "mps"] else "float32"
+                    ),
+                    "k": k,
+                    "tokens_per_sec": tok_s,
+                    "acceptance_rate": 0.1,
+                    "draft_forward_time_ms": draft_ms,
+                    "verify_forward_time_ms": verify_ms,
+                    "kv_append_time_ms": kv_ms,
+                    "run_id": f"phase3d_dryrun_K{k}",
+                }
+            )
+        out_path = out_dir / f"dryrun_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(out_path, "w") as f:
+            json.dump({"summary_results": summary}, f, indent=2)
+        logger.info("Dry-run mode complete. Results saved to %s", out_path)
+        # Return empty results compatible with normal flow
+        return [], [], get_system_info(resolved_device)
+
     # Deterministic mode (optional via flag/env)
     env_det = os.getenv("SPECDEC_DETERMINISTIC", "0").lower() in ("1", "true", "yes")
     deterministic = deterministic or env_det

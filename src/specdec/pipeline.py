@@ -9,6 +9,7 @@ Orchestrates the speculative decoding loop:
 """
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -18,6 +19,7 @@ import torch
 import yaml
 
 from .controllers import KController, create_controller
+from .deterministic import ensure_deterministic
 from .fake_lm import create_fake_lm
 from .hf_wrappers import create_tiny_hf_wrapper
 from .interfaces import LanguageModel, SpeculativeDecoder
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 # Import optimization modules (conditional to avoid import errors during development)
 try:
     from benchmarks.profiler import create_profiler
+    from metrics.structured_profiler import create_structured_profiler
     from optimization import (
         amp_context,
         create_optimization_manager,
@@ -45,6 +48,19 @@ except ImportError:
 
     def create_profiler(*args, **kwargs):
         return None
+
+    def create_structured_profiler(*args, **kwargs):
+        # Return dummy structured profiler for development
+        class DummyProfiler:
+            enable_profiling = False
+
+            def record_step(self, *args, **kwargs):
+                pass
+
+            def record_kv_append_time(self, *args, **kwargs):
+                pass
+
+        return DummyProfiler()
 
     def create_speculative_scheduler(*args, **kwargs):
         return None
@@ -138,6 +154,35 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         self.implementation = self.config.get("implementation", "fake")
         self.force_device = self.config.get("force_device")
+
+        # Phase 3D: ensure deterministic mode if requested via env
+        ensure_deterministic()
+
+        # Phase 3D: structured profiler (off unless SPECDEC_PROFILE=1)
+        self.structured_profiler = create_structured_profiler(
+            device=self.device if isinstance(self.device, str) else str(self.device),
+            enable_profiling=False,
+        )
+
+        # Phase 3D: CUDA graph capture setup
+        self.enable_cuda_graph = (
+            os.getenv("SPECDEC_CUDA_GRAPH", "0").lower() in ("1", "true", "yes")
+            and self.device == "cuda"
+            and torch.cuda.is_available()
+        )
+        self.cuda_graph = None
+        self.cuda_graph_warmup_steps = 3  # Warmup steps before capture
+        self.cuda_graph_warmup_done = False
+        self.cuda_graph_captured = False
+        self.graph_input_tensor = None
+        self.graph_output_tokens = None
+        self.graph_output_logits = None
+        self.graph_outputs = None
+
+        if self.enable_cuda_graph:
+            logger.info("CUDA graph capture enabled (will warmup before capture)")
+        else:
+            logger.debug("CUDA graph capture disabled or not on CUDA device")
 
         # Set deterministic flags
         self.deterministic = self.config.get("deterministic", False)
@@ -693,6 +738,160 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         return draft_tokens, draft_logits, draft_info
 
+    def _attempt_cuda_graph_capture(
+        self,
+        base_model,
+        input_ids: torch.Tensor,
+        k: int,
+        temperature: float,
+        do_sample: bool,
+        **kwargs: Any,
+    ) -> bool:
+        """
+        Attempt CUDA graph capture for verification step (Phase 3D).
+
+        Captures the base model forward pass if shapes are stable.
+        Falls back to eager mode if capture fails.
+
+        Args:
+            base_model: Base language model
+            input_ids: Input token IDs
+            k: Number of tokens to generate (must be stable)
+            temperature: Sampling temperature
+            do_sample: Whether to use sampling
+            **kwargs: Additional generation parameters
+
+        Returns:
+            True if capture succeeded, False otherwise
+        """
+        if not self.enable_cuda_graph or not torch.cuda.is_available():
+            return False
+
+        if self.cuda_graph_captured:
+            return True  # Already captured
+
+        try:
+            # Create static dummy inputs for capture
+            # Note: CUDA graphs require fixed shapes
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+
+            # Create static input tensors
+            static_input_ids = torch.zeros(
+                (batch_size, seq_len),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+
+            # Create static input tensor (will be modified in-place during replay)
+            self.graph_input_tensor = static_input_ids.clone()  # type: ignore[assignment]
+            self.graph_k = k
+            self.graph_temperature = temperature
+            self.graph_do_sample = do_sample
+            self.graph_kwargs = kwargs
+
+            # Create dummy outputs for graph
+            vocab_size = (
+                base_model._tokenizer.vocab_size
+                if hasattr(base_model, "_tokenizer")
+                else 50257
+            )
+            graph_output_tokens = torch.zeros(
+                (batch_size, k), dtype=torch.long, device=input_ids.device
+            )
+            graph_output_logits = torch.zeros(
+                (batch_size, k, vocab_size), device=input_ids.device
+            )
+            self.graph_output_tokens = graph_output_tokens  # type: ignore[assignment]
+            self.graph_output_logits = graph_output_logits  # type: ignore[assignment]
+            self.graph_outputs = (graph_output_tokens, graph_output_logits)  # type: ignore[assignment]
+
+            # Warmup run (not captured)
+            with torch.cuda.stream(torch.cuda.Stream()):
+                _ = base_model.generate_tokens(
+                    static_input_ids,
+                    max_new_tokens=k,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    **kwargs,
+                )
+            torch.cuda.synchronize()
+
+            # Attempt graph capture
+            cuda_graph = torch.cuda.CUDAGraph()
+            self.cuda_graph = cuda_graph  # type: ignore[assignment]
+            with torch.cuda.graph(cuda_graph):
+                out_tokens, out_logits = base_model.generate_tokens(
+                    self.graph_input_tensor,
+                    max_new_tokens=k,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    **kwargs,
+                )
+                # Capture outputs into pre-allocated tensors
+                assert (
+                    self.graph_output_tokens is not None
+                    and self.graph_output_logits is not None
+                )
+                self.graph_output_tokens.copy_(out_tokens)
+                self.graph_output_logits.copy_(out_logits)
+
+            self.cuda_graph_captured = True
+            logger.info(
+                f"CUDA graph captured successfully for K={k}, seq_len={seq_len}"
+            )
+            return True
+
+        except Exception as e:
+            # Fallback to eager mode
+            logger.warning(
+                f"CUDA graph capture failed, falling back to eager mode: {e}"
+            )
+            self.enable_cuda_graph = False
+            self.cuda_graph_captured = False
+            return False
+
+    def _replay_cuda_graph(
+        self, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Replay captured CUDA graph for verification step (Phase 3D).
+
+        Args:
+            input_ids: Input token IDs (must match captured shape)
+
+        Returns:
+            Tuple of (generated_tokens, logits)
+        """
+        if (
+            not self.cuda_graph_captured
+            or self.cuda_graph is None
+            or self.graph_input_tensor is None
+            or self.graph_outputs is None
+        ):
+            raise RuntimeError("CUDA graph not captured or not available")
+
+        # Update graph inputs with current input_ids
+        # Note: Must match captured shape exactly
+        if input_ids.shape != self.graph_input_tensor.shape:
+            # Shape changed, fallback to eager
+            logger.warning(
+                f"Input shape changed from {self.graph_input_tensor.shape} to "
+                f"{input_ids.shape}, falling back to eager mode"
+            )
+            self.enable_cuda_graph = False
+            self.cuda_graph_captured = False
+            raise RuntimeError("Input shape mismatch")
+
+        # Copy current input to graph input tensor (in-place modification)
+        self.graph_input_tensor.copy_(input_ids)
+
+        # Replay graph
+        self.cuda_graph.replay()
+
+        # Return outputs (already populated in graph_output_tokens/logits)
+        return self.graph_outputs
+
     def generate(
         self,
         prompt: str,
@@ -846,28 +1045,74 @@ class SpeculativePipeline(SpeculativeDecoder):
                 )
 
                 # Step 2: Verify with base model using scheduler
-                if self.scheduler:
-                    base_tokens, base_logits, verify_info = (
-                        self.scheduler.schedule_verification(
-                            self.base_lm,
-                            draft_tokens,
+                # Phase 3D: Attempt CUDA graph capture after warmup
+                if (
+                    self.enable_cuda_graph
+                    and step > self.cuda_graph_warmup_steps
+                    and not self.cuda_graph_warmup_done
+                ):
+                    self.cuda_graph_warmup_done = True
+                    self._attempt_cuda_graph_capture(
+                        self.base_lm,
+                        current_input,
+                        k,
+                        temperature,
+                        do_sample,
+                        **kwargs,
+                    )
+
+                # Phase 3D: Use CUDA graph replay if captured and shapes match
+                use_graph = (
+                    self.enable_cuda_graph
+                    and self.cuda_graph_captured
+                    and self.graph_input_tensor is not None
+                    and current_input.shape == self.graph_input_tensor.shape
+                )
+
+                if use_graph:
+                    try:
+                        verify_start = time.time()
+                        base_tokens, base_logits = self._replay_cuda_graph(
+                            current_input
+                        )
+                        verify_time_ms = (time.time() - verify_start) * 1000
+                        verify_info = {
+                            "verification_time_ms": verify_time_ms,
+                            "method": "cuda_graph",
+                        }
+                    except Exception as e:
+                        # Graph replay failed, fallback to scheduler
+                        logger.debug(f"CUDA graph replay failed, using scheduler: {e}")
+                        use_graph = False
+
+                if not use_graph:
+                    # Use scheduler or direct call
+                    if self.scheduler:
+                        base_tokens, base_logits, verify_info = (
+                            self.scheduler.schedule_verification(
+                                self.base_lm,
+                                draft_tokens,
+                                current_input,
+                                temperature=temperature,
+                                do_sample=do_sample,
+                                **kwargs,
+                            )
+                        )
+                        verify_time_ms = verify_info.get("verification_time_ms", 0.0)
+                    else:
+                        verify_start = time.time()
+                        base_tokens, base_logits = self.base_lm.generate_tokens(
                             current_input,
+                            max_new_tokens=k,
                             temperature=temperature,
                             do_sample=do_sample,
                             **kwargs,
                         )
-                    )
-                    verify_time_ms = verify_info.get("verification_time_ms", 0.0)
-                else:
-                    verify_start = time.time()
-                    base_tokens, base_logits = self.base_lm.generate_tokens(
-                        current_input,
-                        max_new_tokens=k,
-                        temperature=temperature,
-                        do_sample=do_sample,
-                        **kwargs,
-                    )
-                    verify_time_ms = (time.time() - verify_start) * 1000
+                        verify_time_ms = (time.time() - verify_start) * 1000
+                        verify_info = {
+                            "verification_time_ms": verify_time_ms,
+                            "method": "eager",
+                        }
 
                 # Step 3: Apply acceptance policy
                 if self.scheduler:
@@ -933,6 +1178,18 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     self.metrics[
                                         "kv_append_time_ms"
                                     ] += kv_append_time_ms
+                                    # Phase 3D: structured profiling hook for KV append
+                                    try:
+                                        if getattr(
+                                            self.structured_profiler,
+                                            "enable_profiling",
+                                            False,
+                                        ):
+                                            self.structured_profiler.record_kv_append_time(
+                                                kv_append_time_ms
+                                            )
+                                    except Exception:
+                                        pass
                                     self.logger.debug(
                                         f"Appended {accepted_len} tokens to KV cache "
                                         f"in {kv_append_time_ms:.2f}ms"
@@ -966,6 +1223,22 @@ class SpeculativePipeline(SpeculativeDecoder):
                         f"{draft_tokens.shape[1]} tokens, "
                         f"total: {len(generated_tokens)}/{max_tokens}"
                     )
+                # Phase 3D: structured per-step record (best-effort)
+                try:
+                    if getattr(self.structured_profiler, "enable_profiling", False):
+                        self.structured_profiler.record_step(
+                            step=step,
+                            draft_time_ms=draft_time_ms,
+                            verify_time_ms=verify_time_ms,
+                            acceptance_time_ms=0.0,
+                            kv_append_time_ms=self.metrics.get(
+                                "kv_append_time_ms", 0.0
+                            ),
+                            accepted_len=accepted_len,
+                            proposed_len=int(draft_tokens.shape[1]),
+                        )
+                except Exception:
+                    pass
                 else:
                     # Fallback: generate one token with base model
                     # (if we haven't reached max_tokens)
