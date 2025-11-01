@@ -2103,6 +2103,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                         "total_generated_tokens"
                     ] += accepted_len  # Track total generated
 
+                    # Track per-prompt metrics for accurate reporting
+                    per_prompt_proposed_counts[global_idx] += prompt_draft_tokens.shape[
+                        1
+                    ]
+                    per_prompt_accepted_counts[global_idx] += accepted_len
+
                     # Update current input for next iteration
                     # Concatenate accepted tokens to current input (no padding, keep as 1D)
                     # Use accepted_tokens directly (already extracted above)
@@ -2270,10 +2276,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                         "tokens_per_sec": prompt_throughput,  # Key expected by script
                         "throughput_tokens_per_sec": prompt_throughput,
                         "acceptance_rate": prompt_acceptance_rate,
-                        "proposed": total_proposed_per_prompt,  # Estimated per-prompt proposed
-                        "accepted": len(
-                            generated_tokens
-                        ),  # Actual tokens generated for this prompt
+                        "proposed": per_prompt_proposed_counts[
+                            i
+                        ],  # Actual proposed for this prompt
+                        "accepted": per_prompt_accepted_counts[
+                            i
+                        ],  # Actual accepted for this prompt
                         "draft_avg_ms": avg_draft_time,
                         "verify_avg_ms": avg_verify_time,
                         "batch_metrics": batch_metrics,
