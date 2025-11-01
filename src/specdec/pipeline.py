@@ -1517,7 +1517,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 for prompt in prompts
             ]
 
-        # Tokenize with padding
+        # Tokenize with padding (pre-tokenize once, reuse across iterations)
         print(f"[BATCH] Tokenizing {batch_size} prompts with padding...", flush=True)
         encoded = tokenizer(
             prompts,
@@ -1526,8 +1526,19 @@ class SpeculativePipeline(SpeculativeDecoder):
             return_attention_mask=True,
         )
 
-        batch_input_ids = encoded["input_ids"].to(self.device)
-        print(f"[BATCH] Tokenized batch shape: {batch_input_ids.shape}", flush=True)
+        # Use pinned memory for faster CPU->GPU transfer (if CUDA)
+        if self.device == "cuda" and torch.cuda.is_available():
+            # Allocate tensor with pinned memory for faster transfer
+            batch_input_ids = (
+                encoded["input_ids"].pin_memory().to(self.device, non_blocking=True)
+            )
+        else:
+            batch_input_ids = encoded["input_ids"].to(self.device)
+        print(
+            f"[BATCH] Tokenized batch shape: {batch_input_ids.shape} "
+            f"(pinned={'yes' if self.device == 'cuda' and torch.cuda.is_available() else 'no'})",
+            flush=True,
+        )
 
         # Track memory before batch
         mem_before = (
@@ -1541,26 +1552,389 @@ class SpeculativePipeline(SpeculativeDecoder):
                 flush=True,
             )
 
-        # Process batch through speculative decoding
-        # Note: This is a simplified batch implementation
-        # For full parallelism, we'd need to refactor the entire generate() loop
-        # For now, we'll process in batch but still iterate sequentially
+        # VECTORIZED BATCH PROCESSING: Process all prompts together in parallel
+        # This enables true GPU parallelism with batched tensor operations
+        print(
+            f"[BATCH] Starting vectorized speculative decoding for {batch_size} prompts",
+            flush=True,
+        )
 
-        results = []
-        for i, prompt in enumerate(prompts):
-            # Generate for single prompt (but models are already loaded and warm)
-            result = self.generate(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-                **kwargs,
+        # Pre-tokenize all prompts once (already done above)
+        attention_mask = encoded.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        # Use optimization context
+        if self.optimization_manager:
+            optimization_context = self.optimization_manager.get_optimization_context()
+        else:
+            optimization_context = (
+                amp_context(self.device, self.dtype)
+                if self.amp_enabled
+                else torch.no_grad()
             )
 
-            # Add batch metadata
-            result["batch_index"] = i
-            result["batch_size"] = batch_size
-            results.append(result)
+        # Clear KV caches for batch
+        # NOTE: KV cache updates are disabled for batched operations due to complexity
+        # of tracking per-prompt sequence states. Each prompt in a batch has independent
+        # generation sequences, making shared KV cache management non-trivial.
+        # Future optimization: implement per-prompt KV cache tracking for batched mode.
+        if hasattr(self.base_lm, "clear_kv_cache"):
+            self.base_lm.clear_kv_cache()
+        if hasattr(self.draft_lm, "clear_kv_cache"):
+            self.draft_lm.clear_kv_cache()
+
+        kv_cache_enabled = (
+            hasattr(self.base_lm, "supports_kv_append")
+            and self.base_lm.supports_kv_append()
+        )
+        if kv_cache_enabled:
+            print(
+                "[BATCH] Note: KV cache updates disabled in batched mode "
+                "(per-prompt tracking not yet implemented)",
+                flush=True,
+            )
+
+        # Reset metrics for batch
+        batch_metrics = {
+            "total_proposed": 0,
+            "total_accepted": 0,
+            "total_steps": 0,
+            "total_verification_time_ms": 0.0,
+            "total_generation_time_ms": 0.0,
+        }
+
+        with optimization_context:
+            # Vectorized speculative decoding loop
+            # All prompts processed together in batched tensor operations
+            current_input_ids = batch_input_ids.clone()  # [batch_size, seq_len]
+            batch_generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
+            batch_active = [
+                True
+            ] * batch_size  # Track which prompts are still generating
+
+            step = 0
+            generation_start = time.time()
+
+            # Create CUDA streams for draft/verify overlap
+            draft_stream = None
+            verify_stream = None
+            if self.device == "cuda" and torch.cuda.is_available():
+                # Use scheduler's streams if available, otherwise create new ones
+                if (
+                    hasattr(self.scheduler, "verification_stream")
+                    and self.scheduler.verification_stream
+                ):
+                    verify_stream = self.scheduler.verification_stream
+                    draft_stream = torch.cuda.current_stream()
+                else:
+                    draft_stream = torch.cuda.Stream()
+                    verify_stream = torch.cuda.Stream()
+
+            while step < max_tokens:
+                step += 1
+                active_count = sum(batch_active)
+                if active_count == 0:
+                    break  # All prompts finished
+
+                # Get K from controller (same K for all active prompts)
+                context = {
+                    "step": step,
+                    "generated_tokens": max(
+                        len(tokens) for tokens in batch_generated_tokens
+                    ),
+                    "acceptance_rate": (
+                        batch_metrics["total_accepted"]
+                        / max(batch_metrics["total_proposed"], 1)
+                    ),
+                }
+                k = self.controller.get_k(step, context)
+
+                # Filter to active prompts only
+                active_indices = [i for i, active in enumerate(batch_active) if active]
+                if not active_indices:
+                    break
+
+                # Create batched input for active prompts only
+                active_input_ids = current_input_ids[
+                    active_indices
+                ]  # [active_count, seq_len]
+
+                # Step 1: Generate draft tokens in batch (on draft stream)
+                draft_start_event = None
+                draft_end_event = None
+                if (
+                    self.device == "cuda"
+                    and torch.cuda.is_available()
+                    and draft_stream is not None
+                ):
+                    draft_start_event = torch.cuda.Event(enable_timing=True)
+                    draft_end_event = torch.cuda.Event(enable_timing=True)
+                    draft_start_event.record(draft_stream)
+
+                draft_start = time.time()
+                if draft_stream is not None:
+                    with torch.cuda.stream(draft_stream):
+                        draft_tokens, draft_logits = self.draft_lm.generate_tokens(
+                            active_input_ids,
+                            max_new_tokens=k,
+                            temperature=temperature,
+                            do_sample=do_sample,
+                            stream=draft_stream,
+                            **kwargs,
+                        )
+                    if draft_end_event is not None:
+                        draft_end_event.record(draft_stream)
+                else:
+                    draft_tokens, draft_logits = self.draft_lm.generate_tokens(
+                        active_input_ids,
+                        max_new_tokens=k,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        **kwargs,
+                    )
+                draft_time_ms = (time.time() - draft_start) * 1000
+
+                # Step 2: Verify with base model in batch (on verify stream for true overlap)
+                # Use scheduler for batched verification if available, otherwise direct call
+                # Verification can start immediately on separate stream (uses same input_ids and k)
+                # This enables true parallel execution of draft and verify
+                verify_start_event = None
+                verify_end_event = None
+                if (
+                    self.device == "cuda"
+                    and torch.cuda.is_available()
+                    and verify_stream is not None
+                ):
+                    verify_start_event = torch.cuda.Event(enable_timing=True)
+                    verify_end_event = torch.cuda.Event(enable_timing=True)
+
+                verify_start = time.time()
+
+                # Use scheduler's multi-stream verification if available for proper stream management
+                # Create dummy draft tokens tensor for scheduler API (it needs draft_tokens shape)
+                dummy_draft_tokens = torch.zeros(
+                    (active_input_ids.shape[0], k),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+
+                # Try to use scheduler for verification (better stream management)
+                if (
+                    self.scheduler is not None
+                    and self.scheduler.enable_multi_stream
+                    and verify_stream is not None
+                    and draft_stream is not None
+                ):
+                    # TRUE OVERLAP: Scheduler handles multi-stream verification
+                    # Both operations run concurrently on GPU via scheduler
+                    with torch.cuda.stream(verify_stream):
+                        if verify_start_event is not None:
+                            verify_start_event.record(verify_stream)
+                        # Use scheduler's verification (it manages streams internally)
+                        base_tokens, base_logits, verify_info = (
+                            self.scheduler.schedule_verification(
+                                self.base_lm,
+                                dummy_draft_tokens,  # Shape only, not actual draft tokens
+                                active_input_ids,
+                                temperature=temperature,
+                                do_sample=do_sample,
+                                **kwargs,
+                            )
+                        )
+                        if verify_end_event is not None:
+                            verify_end_event.record(verify_stream)
+
+                    # Synchronize both streams (they may have overlapped significantly)
+                    # Wait for draft to complete first (we need its outputs for acceptance)
+                    if draft_end_event is not None:
+                        draft_end_event.synchronize()
+                    # Then wait for verify (may already be done due to overlap)
+                    if verify_end_event is not None:
+                        verify_end_event.synchronize()
+                elif verify_stream is not None and draft_stream is not None:
+                    # Manual stream management if scheduler not available
+                    with torch.cuda.stream(verify_stream):
+                        if verify_start_event is not None:
+                            verify_start_event.record(verify_stream)
+                        base_tokens, base_logits = self.base_lm.generate_tokens(
+                            active_input_ids,
+                            max_new_tokens=k,  # Use k directly, not draft_tokens.shape[1]
+                            temperature=temperature,
+                            do_sample=do_sample,
+                            stream=verify_stream,
+                            **kwargs,
+                        )
+                        if verify_end_event is not None:
+                            verify_end_event.record(verify_stream)
+
+                    # Synchronize both streams
+                    if draft_end_event is not None:
+                        draft_end_event.synchronize()
+                    if verify_end_event is not None:
+                        verify_end_event.synchronize()
+                else:
+                    # Fallback: sequential execution
+                    if draft_stream is not None and draft_end_event is not None:
+                        draft_end_event.synchronize()
+                    base_tokens, base_logits = self.base_lm.generate_tokens(
+                        active_input_ids,
+                        max_new_tokens=k,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        **kwargs,
+                    )
+                verify_time_ms = (time.time() - verify_start) * 1000
+
+                # Calculate actual overlap time using CUDA events if available
+                if (
+                    draft_start_event is not None
+                    and draft_end_event is not None
+                    and verify_start_event is not None
+                    and verify_end_event is not None
+                ):
+                    draft_time_cuda = draft_start_event.elapsed_time(draft_end_event)
+                    verify_time_cuda = verify_start_event.elapsed_time(verify_end_event)
+                    # Overlap = min(draft_time, verify_time) since they run concurrently
+                    # The actual time saved depends on when verify starts
+                    max_time = max(draft_time_cuda, verify_time_cuda)
+                    sequential_time = draft_time_cuda + verify_time_cuda
+                    overlap_saved_ms = sequential_time - max_time
+                    if overlap_saved_ms > 1.0:  # Only log if significant overlap
+                        print(
+                            f"[BATCH] Stream overlap: saved {overlap_saved_ms:.1f}ms "
+                            f"(draft={draft_time_cuda:.1f}ms, verify={verify_time_cuda:.1f}ms)",
+                            flush=True,
+                        )
+
+                batch_metrics["total_proposed"] += (
+                    draft_tokens.shape[0] * draft_tokens.shape[1]
+                )
+                batch_metrics["total_verification_time_ms"] += verify_time_ms
+
+                # Step 3: Apply acceptance policy in batch
+                accepted_lengths = []
+                accepted_tokens_list = []
+
+                # Process each active prompt's acceptance
+                for idx_in_active, global_idx in enumerate(active_indices):
+                    # Extract tokens/logits for this prompt
+                    prompt_draft_tokens = draft_tokens[
+                        idx_in_active : idx_in_active + 1
+                    ]
+                    prompt_base_tokens = base_tokens[idx_in_active : idx_in_active + 1]
+                    prompt_draft_logits = draft_logits[
+                        idx_in_active : idx_in_active + 1
+                    ]
+                    prompt_base_logits = base_logits[idx_in_active : idx_in_active + 1]
+
+                    # Apply policy
+                    accepted_len, policy_info = self.policy.accept_tokens(
+                        prompt_draft_tokens,
+                        prompt_base_tokens,
+                        prompt_draft_logits,
+                        prompt_base_logits,
+                    )
+
+                    # Get accepted tokens
+                    if accepted_len > 0:
+                        accepted_tokens = (
+                            prompt_draft_tokens[0, :accepted_len].cpu().tolist()
+                        )
+                        batch_generated_tokens[global_idx].extend(accepted_tokens)
+                        accepted_tokens_list.append(accepted_tokens)
+                    else:
+                        # Rejected all - accept first base token
+                        first_base = prompt_base_tokens[0, 0:1].cpu().tolist()
+                        batch_generated_tokens[global_idx].extend(first_base)
+                        accepted_tokens_list.append(first_base)
+                        accepted_len = 1
+
+                    accepted_lengths.append(accepted_len)
+                    batch_metrics["total_accepted"] += accepted_len
+
+                    # Update current input for next iteration
+                    # Concatenate accepted tokens to current input
+                    accepted_tensor = torch.tensor(
+                        accepted_tokens_list[-1], device=self.device, dtype=torch.long
+                    ).unsqueeze(0)
+                    current_input_ids[global_idx] = torch.cat(
+                        [current_input_ids[global_idx], accepted_tensor], dim=-1
+                    )
+
+                    # Check if this prompt is done
+                    eos_token_id = 50256  # Default GPT-2 EOS token
+                    if tokenizer is not None:
+                        eos_token_id = tokenizer.eos_token_id
+                    elif (
+                        hasattr(self.base_lm, "_tokenizer")
+                        and self.base_lm._tokenizer is not None
+                    ):
+                        base_tokenizer = self.base_lm._tokenizer
+                        if base_tokenizer is not None and hasattr(
+                            base_tokenizer, "eos_token_id"
+                        ):
+                            eos_token_id = base_tokenizer.eos_token_id
+                    if len(batch_generated_tokens[global_idx]) >= max_tokens or (
+                        accepted_tokens_list
+                        and accepted_tokens_list[-1][-1] == eos_token_id
+                    ):
+                        batch_active[global_idx] = False
+
+                batch_metrics["total_steps"] += 1
+
+                # Log batch progress
+                if step % 8 == 0 or step == 1:
+                    print(
+                        f"[BATCH] Step {step}/{max_tokens} | "
+                        f"Active: {active_count}/{batch_size} | "
+                        f"K={k} | "
+                        f"Draft: {draft_time_ms:.1f}ms | "
+                        f"Verify: {verify_time_ms:.1f}ms | "
+                        f"Accepted: {sum(accepted_lengths)}/{len(accepted_lengths)*k}",
+                        flush=True,
+                    )
+
+            total_time_ms = (time.time() - generation_start) * 1000
+            batch_metrics["total_generation_time_ms"] = total_time_ms
+
+            # Convert batched results to per-prompt dictionaries
+            results = []
+            for i, (prompt, generated_tokens) in enumerate(
+                zip(prompts, batch_generated_tokens)
+            ):
+                # Decode generated tokens
+                if generated_tokens:
+                    generated_text = self.base_lm.decode(
+                        torch.tensor(generated_tokens, device=self.device).unsqueeze(0)
+                    )
+                else:
+                    generated_text = ""
+
+                # Calculate per-prompt metrics
+                prompt_acceptance_rate = batch_metrics["total_accepted"] / max(
+                    batch_metrics["total_proposed"], 1
+                )
+                prompt_throughput = (
+                    len(generated_tokens) / (total_time_ms / 1000.0)
+                    if total_time_ms > 0
+                    else 0.0
+                )
+
+                results.append(
+                    {
+                        "prompt": prompt,
+                        "generated_text": generated_text,
+                        "generated_tokens": generated_tokens,
+                        "num_generated": len(generated_tokens),
+                        "batch_index": i,
+                        "batch_size": batch_size,
+                        "total_time_ms": total_time_ms,
+                        "throughput_tokens_per_sec": prompt_throughput,
+                        "acceptance_rate": prompt_acceptance_rate,
+                        "batch_metrics": batch_metrics,
+                    }
+                )
 
         # Track memory after batch
         mem_after = (
