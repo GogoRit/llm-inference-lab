@@ -1654,10 +1654,25 @@ class SpeculativePipeline(SpeculativeDecoder):
                 }
                 k = self.controller.get_k(step, context)
 
+                # Validate K - must be > 0 for generation
+                if k <= 0:
+                    print(
+                        f"[WARNING] Step {step}: K={k} <= 0, skipping generation",
+                        flush=True,
+                    )
+                    break
+
                 # Filter to active prompts only
                 active_indices = [i for i, active in enumerate(batch_active) if active]
                 if not active_indices:
                     break
+
+                # Debug: log loop entry
+                print(
+                    f"[DEBUG] Step {step} entry - active_count={len(active_indices)}, "
+                    f"K={k}, max_tokens={max_tokens}",
+                    flush=True,
+                )
 
                 # Create batched input for active prompts only
                 # Handle variable-length sequences by padding to max length
@@ -1707,14 +1722,43 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # Mask out padding tokens
                         active_attention_mask[i, orig_len:] = 0
 
-                # Debug: print shapes for first step
+                # Debug: validate input_ids are not all padding
+                non_pad_tokens = (active_input_ids != pad_value).sum().item()
+                total_tokens = active_input_ids.numel()
+
                 if step == 1:
                     print(
                         f"[BATCH] Batched active_input_ids shape: {active_input_ids.shape} "
                         f"(active={len(active_indices)}, max_len={max_seq_len}, "
-                        f"original_lens={original_lengths})",
+                        f"original_lens={original_lengths}, non_pad={non_pad_tokens}/{total_tokens})",
                         flush=True,
                     )
+                    # Decode and print first prompt for verification
+                    if tokenizer is not None and active_input_ids.shape[0] > 0:
+                        first_prompt_tokens = active_input_ids[0]
+                        # Remove padding before decoding
+                        first_prompt_non_pad = first_prompt_tokens[
+                            first_prompt_tokens != pad_value
+                        ]
+                        if len(first_prompt_non_pad) > 0:
+                            try:
+                                decoded_text = tokenizer.decode(first_prompt_non_pad)
+                                print(
+                                    f"[DEBUG] First prompt decoded: {decoded_text[:100]}...",
+                                    flush=True,
+                                )
+                            except Exception as e:
+                                print(
+                                    f"[DEBUG] Failed to decode first prompt: {e}",
+                                    flush=True,
+                                )
+
+                if non_pad_tokens == 0:
+                    print(
+                        f"[WARNING] Step {step}: All tokens are padding, skipping generation",
+                        flush=True,
+                    )
+                    break
 
                 # Step 1: Generate draft tokens in batch (on draft stream)
                 draft_start_event = None
@@ -1730,6 +1774,15 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Use CUDA events for accurate timing (same as verify)
                 draft_start_wall = time.time()
+
+                # Debug: log before draft execution
+                if step == 1:
+                    print(
+                        f"[DEBUG] Before draft - input shape: {active_input_ids.shape}, "
+                        f"K={k}, device={active_input_ids.device}",
+                        flush=True,
+                    )
+
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
                         draft_tokens, draft_logits = self.draft_lm.generate_tokens(
@@ -1751,6 +1804,26 @@ class SpeculativePipeline(SpeculativeDecoder):
                         **kwargs,
                     )
 
+                # Validate draft outputs
+                if draft_tokens.numel() == 0 or draft_tokens.shape[1] == 0:
+                    print(
+                        f"[ERROR] Step {step}: Draft model returned empty tokens! "
+                        f"Shape: {draft_tokens.shape}",
+                        flush=True,
+                    )
+                    break
+
+                # Debug: decode draft tokens
+                if step == 1 and tokenizer is not None:
+                    try:
+                        draft_text = tokenizer.decode(draft_tokens[0])
+                        print(
+                            f"[DEBUG] Draft tokens decoded (first prompt): {draft_text[:100]}...",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"[DEBUG] Failed to decode draft tokens: {e}", flush=True)
+
                 # Calculate draft time using CUDA events if available, otherwise wall-clock
                 if draft_start_event is not None and draft_end_event is not None:
                     draft_end_event.synchronize()
@@ -1758,12 +1831,19 @@ class SpeculativePipeline(SpeculativeDecoder):
                 else:
                     draft_time_ms = (time.time() - draft_start_wall) * 1000
 
-                # Debug: log draft outputs shape
+                # Debug: log draft outputs shape and sample tokens
+                print(
+                    f"[DEBUG] Draft execution - tokens shape: {draft_tokens.shape}, "
+                    f"logits shape: {draft_logits.shape}, "
+                    f"time: {draft_time_ms:.2f}ms, "
+                    f"proposed_tokens: {draft_tokens.shape[0] * draft_tokens.shape[1]}",
+                    flush=True,
+                )
                 if step == 1:
+                    # Log sample token IDs
                     print(
-                        f"[DEBUG] Draft execution - draft_tokens shape: {draft_tokens.shape}, "
-                        f"draft_logits shape: {draft_logits.shape}, "
-                        f"draft_time: {draft_time_ms:.2f}ms",
+                        f"[DEBUG] Sample draft token IDs (first batch): "
+                        f"{draft_tokens[0, :min(5, draft_tokens.shape[1])].tolist()}",
                         flush=True,
                     )
 
@@ -1920,13 +2000,26 @@ class SpeculativePipeline(SpeculativeDecoder):
                 accepted_tokens_list = []
 
                 # Debug: log verify outputs shape
+                print(
+                    f"[DEBUG] Verify execution - base_tokens shape: {base_tokens.shape}, "
+                    f"base_logits shape: {base_logits.shape}, "
+                    f"verify_time: {verify_time_ms:.2f}ms",
+                    flush=True,
+                )
                 if step == 1:
-                    print(
-                        f"[DEBUG] Verify execution - base_tokens shape: {base_tokens.shape}, "
-                        f"base_logits shape: {base_logits.shape}, "
-                        f"verify_time: {verify_time_ms:.2f}ms",
-                        flush=True,
-                    )
+                    # Decode verify tokens
+                    if tokenizer is not None:
+                        try:
+                            verify_text = tokenizer.decode(base_tokens[0])
+                            print(
+                                f"[DEBUG] Verify tokens decoded (first prompt): {verify_text[:100]}...",
+                                flush=True,
+                            )
+                        except Exception as e:
+                            print(
+                                f"[DEBUG] Failed to decode verify tokens: {e}",
+                                flush=True,
+                            )
 
                 # Process each active prompt's acceptance
                 for idx_in_active, global_idx in enumerate(active_indices):
@@ -1948,12 +2041,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                         prompt_base_logits,
                     )
 
-                    # Debug: log acceptance per prompt (first step only)
-                    if step == 1 and idx_in_active == 0:
+                    # Debug: log acceptance per prompt
+                    if step <= 3 or idx_in_active == 0:
                         print(
-                            f"[DEBUG] Acceptance for prompt {global_idx} - "
+                            f"[DEBUG] Acceptance - prompt {global_idx}, "
                             f"proposed={prompt_draft_tokens.shape[1]}, "
-                            f"accepted={accepted_len}",
+                            f"accepted={accepted_len}, "
+                            f"tokens: {accepted_tokens_list[-1][:min(5, len(accepted_tokens_list[-1]))]}",
                             flush=True,
                         )
 
