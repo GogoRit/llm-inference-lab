@@ -2034,6 +2034,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                     prompt_base_logits = base_logits[idx_in_active : idx_in_active + 1]
 
                     # Apply policy
+                    # Debug: log tokens before policy
+                    if step <= 2 and idx_in_active == 0:
+                        print(
+                            f"[DEBUG] Policy input - draft_tokens[0]: {prompt_draft_tokens[0, :min(3, prompt_draft_tokens.shape[1])].tolist()}, "
+                            f"base_tokens[0]: {prompt_base_tokens[0, :min(3, prompt_base_tokens.shape[1])].tolist()}",
+                            flush=True,
+                        )
+
                     accepted_len, policy_info = self.policy.accept_tokens(
                         prompt_draft_tokens,
                         prompt_base_tokens,
@@ -2041,45 +2049,80 @@ class SpeculativePipeline(SpeculativeDecoder):
                         prompt_base_logits,
                     )
 
-                    # Debug: log acceptance per prompt
-                    if step <= 3 or idx_in_active == 0:
+                    # Debug: log policy result
+                    if step <= 2:
                         print(
-                            f"[DEBUG] Acceptance - prompt {global_idx}, "
-                            f"proposed={prompt_draft_tokens.shape[1]}, "
-                            f"accepted={accepted_len}, "
-                            f"tokens: {accepted_tokens_list[-1][:min(5, len(accepted_tokens_list[-1]))]}",
+                            f"[DEBUG] Policy result - accepted_len={accepted_len}, "
+                            f"policy_info={policy_info}",
                             flush=True,
                         )
 
-                    # Get accepted tokens
+                    # Get accepted tokens - ensure we always have something
+                    accepted_tokens = []
                     if accepted_len > 0:
+                        # Extract accepted draft tokens
                         accepted_tokens = (
                             prompt_draft_tokens[0, :accepted_len].cpu().tolist()
                         )
                         batch_generated_tokens[global_idx].extend(accepted_tokens)
                         accepted_tokens_list.append(accepted_tokens)
                     else:
-                        # Rejected all - accept first base token
+                        # Rejected all - accept first base token as fallback
                         first_base = prompt_base_tokens[0, 0:1].cpu().tolist()
+                        accepted_tokens = first_base
                         batch_generated_tokens[global_idx].extend(first_base)
                         accepted_tokens_list.append(first_base)
                         accepted_len = 1
+                        if step <= 3 or idx_in_active == 0:
+                            print(
+                                f"[DEBUG] No draft tokens accepted - accepting first base token: {first_base}",
+                                flush=True,
+                            )
+
+                    # Debug: log acceptance per prompt (after append)
+                    if step <= 3 or idx_in_active == 0:
+                        print(
+                            f"[DEBUG] Acceptance - prompt {global_idx}, "
+                            f"proposed={prompt_draft_tokens.shape[1]}, "
+                            f"accepted={accepted_len}, "
+                            f"tokens: {accepted_tokens[:min(5, len(accepted_tokens))]}",
+                            flush=True,
+                        )
 
                     accepted_lengths.append(accepted_len)
                     batch_metrics["total_accepted"] += accepted_len
 
                     # Update current input for next iteration
                     # Concatenate accepted tokens to current input (no padding, keep as 1D)
-                    accepted_tokens_tensor = torch.tensor(
-                        accepted_tokens_list[-1], device=self.device, dtype=torch.long
-                    )  # Shape: [accepted_len]
-                    current_seq = current_input_ids[global_idx]  # Shape: [seq_len]
-                    # Concatenate along sequence dimension (both are 1D)
-                    updated_seq = torch.cat(
-                        [current_seq, accepted_tokens_tensor], dim=0
-                    )
-                    # Update sequence (keep as 1D list item, no padding)
-                    current_input_ids[global_idx] = updated_seq
+                    # Use accepted_tokens directly (already extracted above)
+                    if len(accepted_tokens) > 0:
+                        accepted_tokens_tensor = torch.tensor(
+                            accepted_tokens, device=self.device, dtype=torch.long
+                        )  # Shape: [accepted_len]
+                        current_seq = current_input_ids[global_idx]  # Shape: [seq_len]
+
+                        # Debug: log before/after append
+                        if step <= 2:
+                            print(
+                                f"[DEBUG] Sequence update - prompt {global_idx}: "
+                                f"before_len={current_seq.shape[0]}, "
+                                f"accepted_len={len(accepted_tokens)}, "
+                                f"after_len={current_seq.shape[0] + len(accepted_tokens)}",
+                                flush=True,
+                            )
+
+                        # Concatenate along sequence dimension (both are 1D)
+                        updated_seq = torch.cat(
+                            [current_seq, accepted_tokens_tensor], dim=0
+                        )
+                        # Update sequence (keep as 1D list item, no padding)
+                        current_input_ids[global_idx] = updated_seq
+                    else:
+                        # No tokens accepted - log warning but continue with next base token
+                        print(
+                            f"[WARNING] Step {step}, prompt {global_idx}: No tokens to append!",
+                            flush=True,
+                        )
 
                     # Check if this prompt is done
                     eos_token_id = 50256  # Default GPT-2 EOS token
@@ -2094,9 +2137,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                             base_tokenizer, "eos_token_id"
                         ):
                             eos_token_id = base_tokenizer.eos_token_id
-                    if len(batch_generated_tokens[global_idx]) >= max_tokens or (
-                        accepted_tokens_list
-                        and accepted_tokens_list[-1][-1] == eos_token_id
+                    # Check if prompt is done
+                    if len(batch_generated_tokens[global_idx]) >= max_tokens:
+                        batch_active[global_idx] = False
+                    elif (
+                        len(accepted_tokens) > 0 and accepted_tokens[-1] == eos_token_id
                     ):
                         batch_active[global_idx] = False
 
