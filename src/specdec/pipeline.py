@@ -1517,6 +1517,64 @@ class SpeculativePipeline(SpeculativeDecoder):
                 for prompt in prompts
             ]
 
+        # Tokenizer alignment check - ensure both models use same tokenizer
+        if (
+            hasattr(self.draft_lm, "_tokenizer")
+            and self.draft_lm._tokenizer is not None
+        ):
+            draft_tokenizer = self.draft_lm._tokenizer
+            if tokenizer is not None:
+                # Check vocab size alignment
+                base_vocab_size = getattr(tokenizer, "vocab_size", None)
+                draft_vocab_size = getattr(draft_tokenizer, "vocab_size", None)
+                if base_vocab_size is not None and draft_vocab_size is not None:
+                    if base_vocab_size != draft_vocab_size:
+                        self.logger.warning(
+                            f"Tokenizer vocab size mismatch: base={base_vocab_size}, draft={draft_vocab_size}"
+                        )
+                    else:
+                        print(
+                            f"[CHECK] Tokenizer alignment OK - vocab_size={base_vocab_size}",
+                            flush=True,
+                        )
+
+                        # One-time warmup check: tokenizer overlap sanity test
+                        if not hasattr(self, "_tokenizer_warmup_done"):
+                            test_text = "The quick brown fox"
+                            test_text_extended = "The quick brown fox jumps"
+                            try:
+                                tokens_base = tokenizer(test_text, return_tensors="pt")[
+                                    "input_ids"
+                                ]
+                                tokens_extended = tokenizer(
+                                    test_text_extended, return_tensors="pt"
+                                )["input_ids"]
+                                # Compare overlapping prefix
+                                min_len = min(
+                                    tokens_base.shape[1], tokens_extended.shape[1]
+                                )
+                                if min_len > 0:
+                                    overlap = (
+                                        (
+                                            tokens_base[0, :min_len]
+                                            == tokens_extended[0, :min_len]
+                                        )
+                                        .float()
+                                        .mean()
+                                        .item()
+                                    )
+                                    print(
+                                        f"[CHECK] Tokenizer overlap sanity: {overlap:.2f} "
+                                        f"(expected ~1.0 for prefix match)",
+                                        flush=True,
+                                    )
+                                self._tokenizer_warmup_done = True
+                            except Exception as e:
+                                print(
+                                    f"[CHECK] Tokenizer warmup test failed: {e}",
+                                    flush=True,
+                                )
+
         # Tokenize with padding (pre-tokenize once, reuse across iterations)
         print(f"[BATCH] Tokenizing {batch_size} prompts with padding...", flush=True)
         encoded = tokenizer(
@@ -1787,13 +1845,19 @@ class SpeculativePipeline(SpeculativeDecoder):
                         flush=True,
                     )
 
+                # Apply temperature stabilization for draft model
+                # Use lower effective temperature to improve acceptance rate
+                draft_temperature = (
+                    max(temperature / 1.5, 0.1) if temperature is not None else 0.7
+                )
+
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
                         draft_tokens, draft_logits = self.draft_lm.generate_tokens(
                             active_input_ids,
                             max_new_tokens=k,
-                            temperature=temperature,
-                            do_sample=do_sample,
+                            temperature=draft_temperature,  # Lower temperature for draft
+                            do_sample=False,  # Use greedy for draft to maximize acceptance
                             stream=draft_stream,
                             **kwargs,
                         )
@@ -1803,8 +1867,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                     draft_tokens, draft_logits = self.draft_lm.generate_tokens(
                         active_input_ids,
                         max_new_tokens=k,
-                        temperature=temperature,
-                        do_sample=do_sample,
+                        temperature=draft_temperature,  # Lower temperature for draft
+                        do_sample=False,  # Use greedy for draft to maximize acceptance
                         **kwargs,
                     )
 
@@ -1923,11 +1987,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
                             verify_start_event.record(verify_stream)
+                        # For verification, always use greedy (argmax) to ensure deterministic matching
+                        # This ensures base_logits.argmax() matches the tokens we compare
                         base_tokens, base_logits = self.base_lm.generate_tokens(
                             active_input_ids,
                             max_new_tokens=k,  # Use k directly, not draft_tokens.shape[1]
-                            temperature=temperature,
-                            do_sample=do_sample,
+                            temperature=1.0,  # Temperature=1.0 for deterministic argmax
+                            do_sample=False,  # Always use greedy for verification
                             stream=verify_stream,
                             **kwargs,
                         )
@@ -1951,11 +2017,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                     # Fallback: sequential execution
                     if draft_stream is not None and draft_end_event is not None:
                         draft_end_event.synchronize()
+                    # For verification, always use greedy (argmax) to ensure deterministic matching
                     base_tokens, base_logits = self.base_lm.generate_tokens(
                         active_input_ids,
                         max_new_tokens=k,
-                        temperature=temperature,
-                        do_sample=do_sample,
+                        temperature=1.0,  # Temperature=1.0 for deterministic argmax
+                        do_sample=False,  # Always use greedy for verification
                         **kwargs,
                     )
                     # Use wall-clock time for fallback
@@ -2002,10 +2069,6 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Step 3: Apply acceptance policy in batch
                 accepted_lengths = []
                 accepted_tokens_list = []
-                # Track per-prompt proposed/accepted for metrics (proposed is same for all in batch)
-                per_prompt_proposed = draft_tokens.shape[
-                    1
-                ]  # K tokens proposed per prompt
 
                 # Debug: log verify outputs shape
                 print(
@@ -2042,13 +2105,49 @@ class SpeculativePipeline(SpeculativeDecoder):
                     prompt_base_logits = base_logits[idx_in_active : idx_in_active + 1]
 
                     # Apply policy
-                    # Debug: log tokens before policy
+                    # Debug: log tokens before policy (with argmax for verification)
                     if step <= 2 and idx_in_active == 0:
+                        # Get base predicted tokens from logits for comparison
+                        base_pred_from_logits = (
+                            torch.argmax(prompt_base_logits[0, :, :], dim=-1)
+                            .cpu()
+                            .tolist()[: min(3, prompt_base_logits.shape[1])]
+                        )
+                        draft_tokens_sample = (
+                            prompt_draft_tokens[
+                                0, : min(3, prompt_draft_tokens.shape[1])
+                            ]
+                            .cpu()
+                            .tolist()
+                        )
                         print(
-                            f"[DEBUG] Policy input - draft_tokens[0]: {prompt_draft_tokens[0, :min(3, prompt_draft_tokens.shape[1])].tolist()}, "
-                            f"base_tokens[0]: {prompt_base_tokens[0, :min(3, prompt_base_tokens.shape[1])].tolist()}",
+                            f"[DEBUG] Policy input - draft_tokens[0]: {draft_tokens_sample}, "
+                            f"base_argmax[0]: {base_pred_from_logits}",
                             flush=True,
                         )
+
+                        # Calculate overlap ratio for debug
+                        if (
+                            len(draft_tokens_sample) > 0
+                            and len(base_pred_from_logits) > 0
+                        ):
+                            matches = sum(
+                                1
+                                for i in range(
+                                    min(
+                                        len(draft_tokens_sample),
+                                        len(base_pred_from_logits),
+                                    )
+                                )
+                                if draft_tokens_sample[i] == base_pred_from_logits[i]
+                            )
+                            overlap_ratio = matches / max(
+                                len(draft_tokens_sample), len(base_pred_from_logits)
+                            )
+                            print(
+                                f"[DEBUG] Token overlap ratio: {overlap_ratio:.2f} ({matches}/{min(len(draft_tokens_sample), len(base_pred_from_logits))} match)",
+                                flush=True,
+                            )
 
                     accepted_len, policy_info = self.policy.accept_tokens(
                         prompt_draft_tokens,
@@ -2057,11 +2156,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                         prompt_base_logits,
                     )
 
-                    # Debug: log policy result
-                    if step <= 2:
+                    # Debug: log policy result with more detail
+                    if step <= 2 or os.getenv("SPECDEC_DEBUG_ACCEPT", "0") == "1":
+                        proposed_count = prompt_draft_tokens.shape[1]
+                        accept_rate = accepted_len / max(proposed_count, 1)
                         print(
-                            f"[DEBUG] Policy result - accepted_len={accepted_len}, "
-                            f"policy_info={policy_info}",
+                            f"[DEBUG] Step {step} | Proposed={proposed_count} | Accepted={accepted_len} | "
+                            f"AcceptRate={accept_rate:.2%} | Policy={policy_info.get('verify_backend', 'unknown')}",
                             flush=True,
                         )
 

@@ -121,14 +121,49 @@ class LongestPrefixPolicy(AcceptancePolicy):
                 )
 
         # Fallback to PyTorch implementation
-        max_len = min(proposed_tokens.shape[1], base_tokens.shape[1])
-        accepted_len = 0
+        # Use base_logits.argmax() for consistent verification (matches kernel path)
+        # This ensures we're comparing the base model's predicted tokens (argmax) with draft tokens
+        if base_logits is not None:
+            # Get predicted tokens from base logits (argmax)
+            # base_logits shape: [batch, seq_len, vocab_size]
+            # We only need the first K positions where K = proposed_tokens.shape[1]
+            base_predicted = torch.argmax(
+                base_logits[:, : proposed_tokens.shape[1], :], dim=-1
+            )  # [batch, K]
 
-        for i in range(max_len):
-            if torch.equal(proposed_tokens[:, i], base_tokens[:, i]):
-                accepted_len = i + 1
-            else:
-                break
+            # Ensure both tensors are on same device and dtype for comparison
+            proposed_tokens_aligned = proposed_tokens.long()
+            base_predicted_aligned = base_predicted.long()
+
+            # Compare sequences position by position
+            max_len = min(
+                proposed_tokens_aligned.shape[1], base_predicted_aligned.shape[1]
+            )
+            accepted_len = 0
+
+            for i in range(max_len):
+                if torch.equal(
+                    proposed_tokens_aligned[:, i], base_predicted_aligned[:, i]
+                ):
+                    accepted_len = i + 1
+                else:
+                    break
+        else:
+            # If no logits available, fall back to token comparison (less accurate)
+            max_len = min(proposed_tokens.shape[1], base_tokens.shape[1])
+            accepted_len = 0
+
+            # Ensure same dtype for comparison
+            proposed_tokens_aligned = proposed_tokens.long()
+            base_tokens_aligned = base_tokens.long()
+
+            for i in range(max_len):
+                if torch.equal(
+                    proposed_tokens_aligned[:, i], base_tokens_aligned[:, i]
+                ):
+                    accepted_len = i + 1
+                else:
+                    break
 
         return accepted_len, {
             "policy": self.name,

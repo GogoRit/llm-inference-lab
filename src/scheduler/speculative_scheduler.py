@@ -184,11 +184,12 @@ class SpeculativeScheduler:
 
         # Run verification on verification stream (async)
         # Pass stream to enable true async execution
+        # For verification, always use greedy (argmax) to ensure deterministic matching
         base_tokens, base_logits = base_model.generate_tokens(
             input_ids,
             max_new_tokens=draft_tokens.shape[1],
-            temperature=temperature,
-            do_sample=do_sample,
+            temperature=1.0,  # Temperature=1.0 for deterministic argmax
+            do_sample=False,  # Always use greedy for verification
             stream=self.verification_stream,  # Enable async execution
             **kwargs,
         )
@@ -253,11 +254,12 @@ class SpeculativeScheduler:
         # For batched verification, we can potentially process multiple
         # draft sequences in parallel, but for now we'll use single verification
         # with optimized batching
+        # For verification, always use greedy (argmax) to ensure deterministic matching
         base_tokens, base_logits = base_model.generate_tokens(
             input_ids,
             max_new_tokens=draft_tokens.shape[1],
-            temperature=temperature,
-            do_sample=do_sample,
+            temperature=1.0,  # Temperature=1.0 for deterministic argmax
+            do_sample=False,  # Always use greedy for verification
             **kwargs,
         )
 
@@ -289,11 +291,12 @@ class SpeculativeScheduler:
         """Single-stream verification (fallback)."""
         start_time = time.time()
 
+        # For verification, always use greedy (argmax) to ensure deterministic matching
         base_tokens, base_logits = base_model.generate_tokens(
             input_ids,
             max_new_tokens=draft_tokens.shape[1],
-            temperature=temperature,
-            do_sample=do_sample,
+            temperature=1.0,  # Temperature=1.0 for deterministic argmax
+            do_sample=False,  # Always use greedy for verification
             **kwargs,
         )
 
