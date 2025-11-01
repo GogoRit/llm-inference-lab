@@ -140,10 +140,30 @@ class HFWrapper(LanguageModel):
         max_new_tokens: int,
         temperature: float = 0.7,
         do_sample: bool = True,
+        stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate tokens using the Hugging Face model."""
+        """
+        Generate tokens using the Hugging Face model.
+
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature
+            do_sample: Whether to use sampling
+            stream: Optional CUDA stream for async execution
+            **kwargs: Additional generation parameters
+
+        Returns:
+            Tuple of (generated_ids, logits)
+        """
         try:
+            # Use async generation if stream is provided and device is CUDA
+            if stream is not None and self._device == "cuda":
+                return self._generate_tokens_async(
+                    input_ids, max_new_tokens, temperature, do_sample, stream, **kwargs
+                )
+
             with torch.no_grad():
                 # Move input to device if needed
                 if input_ids.device != torch.device(self._device):
@@ -204,6 +224,100 @@ class HFWrapper(LanguageModel):
         except Exception as e:
             self.logger.error(f"Failed to generate tokens: {e}")
             raise
+
+    def _generate_tokens_async(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        do_sample: bool,
+        stream: torch.cuda.Stream,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate tokens asynchronously using manual forward loop in CUDA stream.
+        This enables true async overlap between draft and verification.
+
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature
+            do_sample: Whether to use sampling
+            stream: CUDA stream for async execution
+            **kwargs: Additional generation parameters
+
+        Returns:
+            Tuple of (generated_ids, logits)
+        """
+        with torch.cuda.stream(stream):
+            with torch.no_grad():
+                # Move input to device if needed
+                if input_ids.device != torch.device(self._device):
+                    input_ids = input_ids.to(self._device)
+
+                batch_size, seq_len = input_ids.shape
+                generated_tokens = []
+                generated_logits = []
+
+                current_input = input_ids
+
+                for step in range(max_new_tokens):
+                    # Forward pass
+                    outputs = self._model(current_input, use_cache=False)  # type: ignore
+                    logits = outputs.logits  # [batch_size, seq_len, vocab_size]
+
+                    # Get logits for last position
+                    next_token_logits = logits[:, -1, :]  # [batch_size, vocab_size]
+
+                    # Apply temperature
+                    if temperature != 1.0:
+                        next_token_logits = next_token_logits / temperature
+
+                    # Sample or greedy
+                    if do_sample:
+                        probs = torch.softmax(next_token_logits, dim=-1)
+                        next_token = torch.multinomial(
+                            probs, num_samples=1
+                        )  # [batch_size, 1]
+                    else:
+                        next_token = torch.argmax(
+                            next_token_logits, dim=-1, keepdim=True
+                        )  # [batch_size, 1]
+
+                    # Store generated token and logits
+                    generated_tokens.append(next_token)
+                    generated_logits.append(
+                        next_token_logits.unsqueeze(1)
+                    )  # [batch_size, 1, vocab_size]
+
+                    # Append to input for next step
+                    current_input = torch.cat([current_input, next_token], dim=1)
+
+                    # Progress print every 8 tokens
+                    if step % 8 == 0 or step == max_new_tokens - 1:
+                        print(
+                            f"[GEN] Step {step+1}/{max_new_tokens} | "
+                            f"Current seq len: {current_input.shape[-1]}",
+                            flush=True,
+                        )
+
+                    # Early stopping on EOS (optional)
+                    if (
+                        hasattr(self._tokenizer, "eos_token_id")
+                        and self._tokenizer.eos_token_id is not None
+                    ):
+                        if (next_token == self._tokenizer.eos_token_id).all():
+                            break
+
+                # Concatenate results
+                generated_ids = torch.cat(
+                    generated_tokens, dim=1
+                )  # [batch_size, max_new_tokens]
+                logits = torch.cat(
+                    generated_logits, dim=1
+                )  # [batch_size, max_new_tokens, vocab_size]
+
+                return generated_ids, logits
 
     def _generate_with_kv_cache(
         self,

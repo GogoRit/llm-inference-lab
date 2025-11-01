@@ -55,7 +55,7 @@ def get_system_info(device):
     # Get kernel backend info
     kinfo = get_kernel_info()
 
-    return {
+    info = {
         "timestamp": datetime.now().isoformat(),
         "platform": platform.platform(),
         "python_version": platform.python_version(),
@@ -79,7 +79,22 @@ def get_system_info(device):
         },
         "kv_append_enabled": os.getenv("SPECDEC_ENABLE_KV_APPEND", "1").lower()
         in ("1", "true", "yes"),
+        "batch_size": int(os.getenv("SPECDEC_BATCH_SIZE", "8")),
+        "parallel_streams": os.getenv("SPECDEC_PARALLEL_STREAMS", "1").lower()
+        in ("1", "true", "yes"),
+        "cuda_graph": os.getenv("SPECDEC_CUDA_GRAPH", "0").lower()
+        in ("1", "true", "yes"),
     }
+
+    # Add GPU memory info if CUDA
+    if device == "cuda" and torch.cuda.is_available():
+        info["cuda_total_memory_gb"] = torch.cuda.get_device_properties(
+            0
+        ).total_memory / (1024**3)
+        info["cuda_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
+        info["cuda_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
+
+    return info
 
 
 def resolve_device(device_arg):
@@ -129,6 +144,38 @@ def run_comprehensive_k_sweep(
     # Resolve device
     resolved_device = resolve_device(device)
     logger.info(f"Using device: {resolved_device}")
+
+    # Startup diagnostics block
+    print("=" * 80, flush=True)
+    print("[STARTUP] CUDA GPU Optimization Diagnostics", flush=True)
+    print("=" * 80, flush=True)
+
+    if resolved_device == "cuda" and torch.cuda.is_available():
+        print(f"[STARTUP] CUDA Device: {torch.cuda.get_device_name(0)}", flush=True)
+        print(f"[STARTUP] CUDA Version: {torch.version.cuda}", flush=True)
+        print(f"[STARTUP] PyTorch Version: {torch.__version__}", flush=True)
+
+        # Environment variables
+        batch_size = os.getenv("SPECDEC_BATCH_SIZE", "8")
+        parallel_streams = os.getenv("SPECDEC_PARALLEL_STREAMS", "1")
+        dtype_env = os.getenv("SPECDEC_DTYPE", "auto")
+        print(f"[STARTUP] SPECDEC_BATCH_SIZE: {batch_size}", flush=True)
+        print(f"[STARTUP] SPECDEC_PARALLEL_STREAMS: {parallel_streams}", flush=True)
+        print(f"[STARTUP] SPECDEC_DTYPE: {dtype_env}", flush=True)
+
+        # GPU memory
+        total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        allocated_mb = torch.cuda.memory_allocated() / (1024**2)
+        reserved_mb = torch.cuda.memory_reserved() / (1024**2)
+        print(f"[STARTUP] GPU Memory: {total_mem_gb:.2f} GB total", flush=True)
+        print(
+            f"[STARTUP] GPU Memory: {allocated_mb:.2f} MB allocated, {reserved_mb:.2f} MB reserved",
+            flush=True,
+        )
+    else:
+        print(f"[STARTUP] Running on {resolved_device} (not CUDA)", flush=True)
+
+    print("=" * 80, flush=True)
 
     # Phase 3D: Dry-run mode (env flag only, minimal surface change)
     if os.getenv("SPECDEC_DRY_RUN", "0").lower() in ("1", "true", "yes"):
@@ -220,11 +267,55 @@ def run_comprehensive_k_sweep(
         k_results = []
         k_failures = 0
 
+        # OPTIMIZATION: Use batching to process multiple prompts at once
+        BATCH_SIZE = int(os.getenv("SPECDEC_BATCH_SIZE", "8"))
+        logger.info(f"  Using batch size: {BATCH_SIZE}")
+
+        # Heartbeat tracking
+        last_heartbeat_time = time.time()
+        last_batch_idx = 0
+
         for iteration in range(iterations):
             logger.info(f"  Iteration {iteration+1}/{iterations}")
+            iter_start_time = time.time()
+            iter_results = []
 
-            for prompt_idx, prompt in enumerate(PROMPT_SUITE):
-                logger.info(f"    Prompt {prompt_idx+1}/10: '{prompt[:30]}...'")
+            # Process prompts in batches
+            num_batches = (len(PROMPT_SUITE) + BATCH_SIZE - 1) // BATCH_SIZE
+            for batch_idx, batch_start in enumerate(
+                range(0, len(PROMPT_SUITE), BATCH_SIZE)
+            ):
+                batch_end = min(batch_start + BATCH_SIZE, len(PROMPT_SUITE))
+                batch_prompts = PROMPT_SUITE[batch_start:batch_end]
+                batch_indices = list(range(batch_start, batch_end))
+
+                # Heartbeat check (every 60 seconds)
+                current_time = time.time()
+                if current_time - last_heartbeat_time >= 60.0:
+                    print(
+                        f"[HEARTBEAT] {time.strftime('%H:%M:%S')} still running... "
+                        f"K={k}, Iter={iteration+1}/{iterations}, Batch={batch_idx+1}/{num_batches}",
+                        flush=True,
+                    )
+                    last_heartbeat_time = current_time
+
+                # GPU utilization estimate (memory-based proxy)
+                if resolved_device == "cuda" and torch.cuda.is_available():
+                    gpu_mem_mb = torch.cuda.memory_allocated() / (1024**2)
+                    gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (
+                        1024**3
+                    )
+                    gpu_util_est = min(100.0, (gpu_mem_mb / (gpu_mem_gb * 1024)) * 100)
+                else:
+                    gpu_util_est = 0.0
+
+                print(
+                    f"[INFO] Iteration {iteration+1}/{iterations} | "
+                    f"Batch {batch_idx+1}/{num_batches} (prompts {batch_start+1}-{batch_end}) | "
+                    f"GPU util: {gpu_util_est:.1f}% | "
+                    f"Elapsed: {time.time() - iter_start_time:.2f}s",
+                    flush=True,
+                )
 
                 try:
                     # Use cached pipeline
@@ -232,61 +323,83 @@ def run_comprehensive_k_sweep(
                     if pipeline is None:
                         raise Exception("Pipeline creation failed for this K")
 
-                    # Generate text
-                    start_time = time.time()
-                    result = pipeline.generate(
-                        prompt=prompt,
+                    # Generate for batch
+                    batch_start_time = time.time()
+                    batch_results = pipeline.generate_batch(
+                        prompts=batch_prompts,
                         max_tokens=max_tokens,
                         temperature=0.7,
                         do_sample=True,
                     )
-                    end_time = time.time()
+                    batch_end_time = time.time()
 
-                    # Extract metrics
-                    latency_ms = result.get(
-                        "latency_ms", (end_time - start_time) * 1000
+                    batch_time_ms = (batch_end_time - batch_start_time) * 1000
+                    batch_time_s = batch_end_time - batch_start_time
+
+                    # Post-batch GPU utilization
+                    if resolved_device == "cuda" and torch.cuda.is_available():
+                        gpu_mem_mb_after = torch.cuda.memory_allocated() / (1024**2)
+                        gpu_util_est_after = min(
+                            100.0, (gpu_mem_mb_after / (gpu_mem_gb * 1024)) * 100
+                        )
+                    else:
+                        gpu_util_est_after = gpu_util_est
+
+                    print(
+                        f"[INFO] Batch {batch_idx+1} completed | "
+                        f"Time: {batch_time_s:.2f}s ({batch_time_ms:.1f}ms) | "
+                        f"GPU util: {gpu_util_est_after:.1f}% | "
+                        f"Prompts: {len(batch_prompts)}",
+                        flush=True,
                     )
-                    tokens_per_sec = result.get(
-                        "tokens_per_sec", max_tokens / (latency_ms / 1000)
-                    )
-                    acceptance_rate = result.get("acceptance_rate", 0.0)
-                    proposed = result.get("proposed", 0)
-                    accepted = result.get("accepted", 0)
-                    text = result.get("text", "")
-                    kv_appended = result.get("kv_appended_tokens_total", 0)
-                    kv_append_time = result.get("kv_append_time_ms", 0.0)
-                    kv_append_enabled = result.get("kv_append_enabled", False)
-                    kv_append_backend = result.get("kv_append_backend", "unknown")
 
-                    # Store detailed result
-                    detailed_result = {
-                        "k": k,
-                        "iteration": iteration + 1,
-                        "prompt_idx": prompt_idx + 1,
-                        "prompt": prompt,
-                        "latency_ms": latency_ms,
-                        "tokens_per_sec": tokens_per_sec,
-                        "acceptance_rate": acceptance_rate,
-                        "proposed": proposed,
-                        "accepted": accepted,
-                        "kv_appended_tokens": kv_appended,
-                        "kv_append_time_ms": kv_append_time,
-                        "kv_append_enabled": kv_append_enabled,
-                        "kv_append_backend": kv_append_backend,
-                        "text": text[:100] + "..." if len(text) > 100 else text,
-                        "success": True,
-                        "device": resolved_device,
-                        "dtype": (
-                            "float16"
-                            if resolved_device in ["cuda", "mps"]
-                            else "float32"
-                        ),
-                    }
-                    detailed_results.append(detailed_result)
+                    last_batch_idx = batch_idx
 
-                    # Store for K-level aggregation
-                    k_results.append(
-                        {
+                    # Process each result in the batch
+                    for prompt_idx, result in zip(batch_indices, batch_results):
+                        prompt = PROMPT_SUITE[prompt_idx]
+
+                        # Extract metrics
+                        latency_ms = result.get("latency_ms", 0)
+                        tokens_per_sec = result.get("tokens_per_sec", 0)
+                        acceptance_rate = result.get("acceptance_rate", 0.0)
+                        proposed = result.get("proposed", 0)
+                        accepted = result.get("accepted", 0)
+                        text = result.get("text", "")
+                        kv_appended = result.get("kv_appended_tokens_total", 0)
+                        kv_append_time = result.get("kv_append_time_ms", 0.0)
+                        kv_append_enabled = result.get("kv_append_enabled", False)
+                        kv_append_backend = result.get("kv_append_backend", "unknown")
+
+                        # Store detailed result (minimal logging during generation)
+                        detailed_result = {
+                            "k": k,
+                            "iteration": iteration + 1,
+                            "prompt_idx": prompt_idx + 1,
+                            "prompt": prompt,
+                            "latency_ms": latency_ms,
+                            "tokens_per_sec": tokens_per_sec,
+                            "acceptance_rate": acceptance_rate,
+                            "proposed": proposed,
+                            "accepted": accepted,
+                            "kv_appended_tokens": kv_appended,
+                            "kv_append_time_ms": kv_append_time,
+                            "kv_append_enabled": kv_append_enabled,
+                            "kv_append_backend": kv_append_backend,
+                            "text": text[:100] + "..." if len(text) > 100 else text,
+                            "success": True,
+                            "device": resolved_device,
+                            "dtype": (
+                                "float16"
+                                if resolved_device in ["cuda", "mps"]
+                                else "float32"
+                            ),
+                            "batch_size": result.get("batch_size", 1),
+                        }
+                        detailed_results.append(detailed_result)
+
+                        # Store for K-level aggregation
+                        result_data = {
                             "latency_ms": latency_ms,
                             "tokens_per_sec": tokens_per_sec,
                             "acceptance_rate": acceptance_rate,
@@ -295,38 +408,58 @@ def run_comprehensive_k_sweep(
                             "kv_appended_tokens": kv_appended,
                             "kv_append_time_ms": kv_append_time,
                         }
-                    )
-
-                    logger.info(
-                        f"      K={k}, Iter={iteration+1}, Prompt={prompt_idx+1}: "
-                        f"{tokens_per_sec:.2f} tok/s, {acceptance_rate:.3f} accept rate"
-                    )
+                        k_results.append(result_data)
+                        iter_results.append(result_data)
 
                 except Exception as e:
-                    k_failures += 1
+                    k_failures += len(batch_prompts)
                     error_traceback = traceback.format_exc()
                     logger.error(
-                        f"      K={k}, Iter={iteration+1}, Prompt={prompt_idx+1} "
+                        f"      K={k}, Iter={iteration+1}, Batch {batch_start}-{batch_end} "
                         f"failed: {e}"
                     )
                     logger.error(f"      Traceback: {error_traceback}")
 
-                    detailed_result = {
-                        "k": k,
-                        "iteration": iteration + 1,
-                        "prompt_idx": prompt_idx + 1,
-                        "prompt": prompt,
-                        "error": str(e),
-                        "traceback": error_traceback,
-                        "success": False,
-                        "device": resolved_device,
-                        "dtype": (
-                            "float16"
-                            if resolved_device in ["cuda", "mps"]
-                            else "float32"
-                        ),
-                    }
-                    detailed_results.append(detailed_result)
+                    # Record failure for each prompt in batch
+                    for prompt_idx in batch_indices:
+                        prompt = PROMPT_SUITE[prompt_idx]
+                        detailed_result = {
+                            "k": k,
+                            "iteration": iteration + 1,
+                            "prompt_idx": prompt_idx + 1,
+                            "prompt": prompt,
+                            "error": str(e),
+                            "traceback": error_traceback,
+                            "success": False,
+                            "device": resolved_device,
+                            "dtype": (
+                                "float16"
+                                if resolved_device in ["cuda", "mps"]
+                                else "float32"
+                            ),
+                        }
+                        detailed_results.append(detailed_result)
+
+            # Iteration summary
+            if iter_results:
+                iter_throughputs = [
+                    r["tokens_per_sec"] for r in iter_results if "tokens_per_sec" in r
+                ]
+                iter_accept_rates = [
+                    r["acceptance_rate"] for r in iter_results if "acceptance_rate" in r
+                ]
+                avg_throughput = np.mean(iter_throughputs) if iter_throughputs else 0.0
+                avg_accept_rate = (
+                    np.mean(iter_accept_rates) if iter_accept_rates else 0.0
+                )
+                iter_elapsed = time.time() - iter_start_time
+                print(
+                    f"[SUMMARY] Iteration {iteration+1}: "
+                    f"avg throughput={avg_throughput:.2f} tok/s, "
+                    f"acceptance={avg_accept_rate:.2f}, "
+                    f"elapsed={iter_elapsed:.2f}s",
+                    flush=True,
+                )
 
         # Calculate statistics for this K
         valid_results = [r for r in k_results if "error" not in r]

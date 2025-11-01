@@ -183,14 +183,15 @@ class SpeculativeScheduler:
             verify_start_event.record(self.verification_stream)
 
         # Run verification on verification stream (async)
-        with torch.cuda.stream(self.verification_stream):
-            base_tokens, base_logits = base_model.generate_tokens(
-                input_ids,
-                max_new_tokens=draft_tokens.shape[1],
-                temperature=temperature,
-                do_sample=do_sample,
-                **kwargs,
-            )
+        # Pass stream to enable true async execution
+        base_tokens, base_logits = base_model.generate_tokens(
+            input_ids,
+            max_new_tokens=draft_tokens.shape[1],
+            temperature=temperature,
+            do_sample=do_sample,
+            stream=self.verification_stream,  # Enable async execution
+            **kwargs,
+        )
 
         # Phase 3D: Record end event and wait only when needed
         if self.use_event_sync and self.verify_ready_event is not None:
@@ -212,6 +213,19 @@ class SpeculativeScheduler:
         # Update metrics
         self.metrics["verification_time_ms"] += verification_time_ms
         self.metrics["total_steps"] += 1
+
+        # Log verification step info
+        k = draft_tokens.shape[1] if hasattr(draft_tokens, "shape") else 0
+        draft_time_ms = self.metrics.get("draft_time_ms", 0.0) / max(
+            self.metrics.get("total_steps", 1), 1
+        )
+        print(
+            f"[SCHED] K={k} | "
+            f"verify={verification_time_ms:.1f}ms | "
+            f"draft_avg={draft_time_ms:.1f}ms | "
+            f"stream={True}, sync={('event' if self.use_event_sync else 'barrier')}",
+            flush=True,
+        )
 
         return (
             base_tokens,
