@@ -1600,6 +1600,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             "total_proposed": 0,
             "total_accepted": 0,
             "total_steps": 0,
+            "total_draft_time_ms": 0.0,
             "total_verification_time_ms": 0.0,
             "total_generation_time_ms": 0.0,
         }
@@ -1727,7 +1728,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                     draft_end_event = torch.cuda.Event(enable_timing=True)
                     draft_start_event.record(draft_stream)
 
-                draft_start = time.time()
+                # Use CUDA events for accurate timing (same as verify)
+                draft_start_wall = time.time()
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
                         draft_tokens, draft_logits = self.draft_lm.generate_tokens(
@@ -1748,7 +1750,22 @@ class SpeculativePipeline(SpeculativeDecoder):
                         do_sample=do_sample,
                         **kwargs,
                     )
-                draft_time_ms = (time.time() - draft_start) * 1000
+
+                # Calculate draft time using CUDA events if available, otherwise wall-clock
+                if draft_start_event is not None and draft_end_event is not None:
+                    draft_end_event.synchronize()
+                    draft_time_ms = draft_start_event.elapsed_time(draft_end_event)
+                else:
+                    draft_time_ms = (time.time() - draft_start_wall) * 1000
+
+                # Debug: log draft outputs shape
+                if step == 1:
+                    print(
+                        f"[DEBUG] Draft execution - draft_tokens shape: {draft_tokens.shape}, "
+                        f"draft_logits shape: {draft_logits.shape}, "
+                        f"draft_time: {draft_time_ms:.2f}ms",
+                        flush=True,
+                    )
 
                 # Step 2: Verify with base model in batch (on verify stream for true overlap)
                 # Use scheduler for batched verification if available, otherwise direct call
@@ -1764,10 +1781,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                     verify_start_event = torch.cuda.Event(enable_timing=True)
                     verify_end_event = torch.cuda.Event(enable_timing=True)
 
-                verify_start = time.time()
+                # Use CUDA events for accurate verify timing (same as draft)
+                verify_start_wall = time.time()
 
                 # Use scheduler's multi-stream verification if available for proper stream management
                 # Create dummy draft tokens tensor for scheduler API (it needs draft_tokens shape)
+                # Note: We use actual draft_tokens shape but scheduler doesn't use the values
                 dummy_draft_tokens = torch.zeros(
                     (active_input_ids.shape[0], k),
                     dtype=torch.long,
@@ -1807,6 +1826,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                     # Then wait for verify (may already be done due to overlap)
                     if verify_end_event is not None:
                         verify_end_event.synchronize()
+
+                    # Calculate verify time using CUDA events if available
+                    if verify_start_event is not None and verify_end_event is not None:
+                        verify_time_ms = verify_start_event.elapsed_time(
+                            verify_end_event
+                        )
+                    else:
+                        verify_time_ms = (time.time() - verify_start_wall) * 1000
                 elif verify_stream is not None and draft_stream is not None:
                     # Manual stream management if scheduler not available
                     with torch.cuda.stream(verify_stream):
@@ -1828,6 +1855,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                         draft_end_event.synchronize()
                     if verify_end_event is not None:
                         verify_end_event.synchronize()
+
+                    # Calculate verify time using CUDA events if available
+                    if verify_start_event is not None and verify_end_event is not None:
+                        verify_time_ms = verify_start_event.elapsed_time(
+                            verify_end_event
+                        )
+                    else:
+                        verify_time_ms = (time.time() - verify_start_wall) * 1000
                 else:
                     # Fallback: sequential execution
                     if draft_stream is not None and draft_end_event is not None:
@@ -1839,7 +1874,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                         do_sample=do_sample,
                         **kwargs,
                     )
-                verify_time_ms = (time.time() - verify_start) * 1000
+                    # Use wall-clock time for fallback
+                    verify_time_ms = (time.time() - verify_start_wall) * 1000
 
                 # Calculate actual overlap time using CUDA events if available
                 if (
@@ -1865,11 +1901,32 @@ class SpeculativePipeline(SpeculativeDecoder):
                 batch_metrics["total_proposed"] += (
                     draft_tokens.shape[0] * draft_tokens.shape[1]
                 )
+                batch_metrics["total_draft_time_ms"] += draft_time_ms
                 batch_metrics["total_verification_time_ms"] += verify_time_ms
+
+                # Debug: log batch metrics after each step
+                if step == 1 or step % 8 == 0:
+                    print(
+                        f"[DEBUG] Step {step} metrics - "
+                        f"proposed: {batch_metrics['total_proposed']}, "
+                        f"accepted: {batch_metrics['total_accepted']}, "
+                        f"draft_time_total: {batch_metrics['total_draft_time_ms']:.2f}ms, "
+                        f"verify_time_total: {batch_metrics['total_verification_time_ms']:.2f}ms",
+                        flush=True,
+                    )
 
                 # Step 3: Apply acceptance policy in batch
                 accepted_lengths = []
                 accepted_tokens_list = []
+
+                # Debug: log verify outputs shape
+                if step == 1:
+                    print(
+                        f"[DEBUG] Verify execution - base_tokens shape: {base_tokens.shape}, "
+                        f"base_logits shape: {base_logits.shape}, "
+                        f"verify_time: {verify_time_ms:.2f}ms",
+                        flush=True,
+                    )
 
                 # Process each active prompt's acceptance
                 for idx_in_active, global_idx in enumerate(active_indices):
@@ -1890,6 +1947,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                         prompt_draft_logits,
                         prompt_base_logits,
                     )
+
+                    # Debug: log acceptance per prompt (first step only)
+                    if step == 1 and idx_in_active == 0:
+                        print(
+                            f"[DEBUG] Acceptance for prompt {global_idx} - "
+                            f"proposed={prompt_draft_tokens.shape[1]}, "
+                            f"accepted={accepted_len}",
+                            flush=True,
+                        )
 
                     # Get accepted tokens
                     if accepted_len > 0:
@@ -1942,14 +2008,26 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 batch_metrics["total_steps"] += 1
 
-                # Log batch progress
+                # Log batch progress with accurate timing
                 if step % 8 == 0 or step == 1:
+                    avg_draft_time = (
+                        batch_metrics["total_draft_time_ms"]
+                        / batch_metrics["total_steps"]
+                        if batch_metrics["total_steps"] > 0
+                        else 0.0
+                    )
+                    avg_verify_time = (
+                        batch_metrics["total_verification_time_ms"]
+                        / batch_metrics["total_steps"]
+                        if batch_metrics["total_steps"] > 0
+                        else 0.0
+                    )
                     print(
                         f"[BATCH] Step {step}/{max_tokens} | "
                         f"Active: {active_count}/{batch_size} | "
                         f"K={k} | "
-                        f"Draft: {draft_time_ms:.1f}ms | "
-                        f"Verify: {verify_time_ms:.1f}ms | "
+                        f"Draft: {draft_time_ms:.1f}ms (avg={avg_draft_time:.1f}ms) | "
+                        f"Verify: {verify_time_ms:.1f}ms (avg={avg_verify_time:.1f}ms) | "
                         f"Accepted: {sum(accepted_lengths)}/{len(accepted_lengths)*k}",
                         flush=True,
                     )
@@ -1974,9 +2052,32 @@ class SpeculativePipeline(SpeculativeDecoder):
                 prompt_acceptance_rate = batch_metrics["total_accepted"] / max(
                     batch_metrics["total_proposed"], 1
                 )
+                # Throughput: total tokens generated / total time (in seconds)
+                # Use batch total for accurate throughput measurement
+                batch_total_tokens = sum(
+                    len(tokens) for tokens in batch_generated_tokens
+                )
                 prompt_throughput = (
                     len(generated_tokens) / (total_time_ms / 1000.0)
                     if total_time_ms > 0
+                    else 0.0
+                )
+                batch_throughput = (
+                    batch_total_tokens / (total_time_ms / 1000.0)
+                    if total_time_ms > 0
+                    else 0.0
+                )
+
+                # Calculate averages for reporting
+                avg_draft_time = (
+                    batch_metrics["total_draft_time_ms"] / batch_metrics["total_steps"]
+                    if batch_metrics["total_steps"] > 0
+                    else 0.0
+                )
+                avg_verify_time = (
+                    batch_metrics["total_verification_time_ms"]
+                    / batch_metrics["total_steps"]
+                    if batch_metrics["total_steps"] > 0
                     else 0.0
                 )
 
@@ -1990,7 +2091,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                         "batch_size": batch_size,
                         "total_time_ms": total_time_ms,
                         "throughput_tokens_per_sec": prompt_throughput,
+                        "batch_throughput_tokens_per_sec": batch_throughput,
                         "acceptance_rate": prompt_acceptance_rate,
+                        "draft_avg_ms": avg_draft_time,
+                        "verify_avg_ms": avg_verify_time,
                         "batch_metrics": batch_metrics,
                     }
                 )
