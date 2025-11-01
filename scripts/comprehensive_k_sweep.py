@@ -26,6 +26,28 @@ sys.path.insert(0, str(SRC_DIR))
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
+# Configure PyTorch for CUDA inference
+if torch.cuda.is_available():
+    # Set precision flags for optimal performance
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+    # Enable deterministic algorithms with warnings only
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+    # Reset dynamo and disable dynamic shape capture (fixes graph capture issues)
+    try:
+        import torch._dynamo  # noqa: E402
+
+        torch._dynamo.reset()
+        torch._dynamo.config.suppress_errors = True
+        torch._dynamo.config.capture_dynamic_output_shape_ops = False
+        torch._dynamo.config.capture_scalar_outputs = False
+    except ImportError:
+        pass  # torch._dynamo not available in older PyTorch versions
+
 from kernels import get_kernel_info  # noqa: E402
 from specdec.pipeline import SpeculativePipeline  # noqa: E402
 
@@ -262,6 +284,24 @@ def run_comprehensive_k_sweep(
                     draft_mode="vanilla",  # disable Medusa/EAGLE paths in sweeps
                 )
                 logger.info(f"  Pipeline for K={k} created successfully")
+
+                # GPU warmup: run dummy generation to initialize CUDA kernels
+                if resolved_device == "cuda" and torch.cuda.is_available():
+                    logger.info("  Performing GPU warmup...")
+                    try:
+                        # Use pipeline's generate for warmup (initializes all CUDA contexts)
+                        warmup_prompt = "Hello"
+                        with torch.no_grad():
+                            _ = pipeline_cache[k].generate(
+                                prompt=warmup_prompt,
+                                max_tokens=4,  # Short warmup
+                                temperature=1.0,
+                                do_sample=False,
+                            )
+                        torch.cuda.synchronize()
+                        logger.info("  GPU warmup complete")
+                    except Exception as e:
+                        logger.warning(f"  GPU warmup failed (continuing): {e}")
             except Exception as e:
                 logger.error(f"  Failed to create pipeline for K={k}: {e}")
                 logger.error(f"  Traceback: {traceback.format_exc()}")
@@ -276,7 +316,6 @@ def run_comprehensive_k_sweep(
 
         # Heartbeat tracking
         last_heartbeat_time = time.time()
-        last_batch_idx = 0
 
         for iteration in range(iterations):
             print(
@@ -339,7 +378,6 @@ def run_comprehensive_k_sweep(
                     # GPU sync before batch to ensure clean state
                     if resolved_device == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize()
-                        gpu_start_mem = torch.cuda.memory_allocated() / (1024**2)
 
                     # Generate for batch
                     batch_start_time = time.time()
@@ -375,8 +413,6 @@ def run_comprehensive_k_sweep(
                         f"Prompts: {len(batch_prompts)}",
                         flush=True,
                     )
-
-                    last_batch_idx = batch_idx
 
                     # Process each result in the batch
                     print(

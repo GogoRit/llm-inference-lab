@@ -11,7 +11,6 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +69,8 @@ class MixedPrecisionManager:
         else:
             self.dtype = self._select_optimal_dtype()
 
-        # Initialize gradient scaler for CUDA
-        self.scaler = GradScaler() if self.device == "cuda" and self.enabled else None
+        # Gradient scaler disabled for inference (only needed for training)
+        self.scaler = None
 
         logger.info(
             f"MixedPrecisionManager initialized: device={self.device}, "

@@ -165,11 +165,21 @@ class SpeculativePipeline(SpeculativeDecoder):
         )
 
         # Phase 3D: CUDA graph capture setup
+        # NOTE: CUDA graphs disabled by default for dynamic speculative decoding loops
+        # (shapes change each step, causing "offset increment outside graph capture" errors)
+        # Enable only for static inference patterns via SPECDEC_CUDA_GRAPH=1
         self.enable_cuda_graph = (
             os.getenv("SPECDEC_CUDA_GRAPH", "0").lower() in ("1", "true", "yes")
             and self.device == "cuda"
             and torch.cuda.is_available()
         )
+        # Force disable for speculative decoding (dynamic shapes)
+        if self.enable_cuda_graph:
+            logger.warning(
+                "CUDA graph capture requested but disabled for dynamic loops. "
+                "Use eager mode (SPECDEC_CUDA_GRAPH=0) for speculative decoding."
+            )
+            self.enable_cuda_graph = False
         self.cuda_graph = None
         self.cuda_graph_warmup_steps = 3  # Warmup steps before capture
         self.cuda_graph_warmup_done = False
@@ -179,10 +189,9 @@ class SpeculativePipeline(SpeculativeDecoder):
         self.graph_output_logits = None
         self.graph_outputs = None
 
-        if self.enable_cuda_graph:
-            logger.info("CUDA graph capture enabled (will warmup before capture)")
-        else:
-            logger.debug("CUDA graph capture disabled or not on CUDA device")
+        logger.debug(
+            "CUDA graph capture disabled (required for dynamic speculative decoding)"
+        )
 
         # Set deterministic flags
         self.deterministic = self.config.get("deterministic", False)
@@ -1518,7 +1527,6 @@ class SpeculativePipeline(SpeculativeDecoder):
         )
 
         batch_input_ids = encoded["input_ids"].to(self.device)
-        attention_mask = encoded["attention_mask"].to(self.device)
         print(f"[BATCH] Tokenized batch shape: {batch_input_ids.shape}", flush=True)
 
         # Track memory before batch
@@ -1540,9 +1548,6 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         results = []
         for i, prompt in enumerate(prompts):
-            # Extract single prompt from batch
-            single_input_ids = batch_input_ids[i : i + 1]
-
             # Generate for single prompt (but models are already loaded and warm)
             result = self.generate(
                 prompt=prompt,
