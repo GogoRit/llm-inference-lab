@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 import torch
@@ -1714,7 +1714,24 @@ class SpeculativePipeline(SpeculativeDecoder):
             while step < max_tokens:
                 step += 1
                 active_count = sum(batch_active)
+
+                # Debug print when active_count drops
+                if step > 1 and active_count < batch_size:
+                    finished_count = batch_size - active_count
+                    print(
+                        "[INFO] Step {}: {} sequence(s) finished, {} still active".format(
+                            step, finished_count, active_count
+                        ),
+                        flush=True,
+                    )
+
                 if active_count == 0:
+                    print(
+                        "[INFO] Step {}: All sequences finished, exiting loop".format(
+                            step
+                        ),
+                        flush=True,
+                    )
                     break  # All prompts finished
 
                 # Get K from controller (same K for all active prompts)
@@ -1866,14 +1883,47 @@ class SpeculativePipeline(SpeculativeDecoder):
                 )
 
                 # Prepare past_key_values for draft model if KV cache is enabled
+                # CRITICAL: Filter to only active sequences before passing to model
                 draft_past_kv = None
                 if kv_cache_enabled and draft_kv_cache is not None:
                     # Convert dict format to tuple format expected by model
+                    # Filter cache to only active sequences based on active_indices
                     if len(draft_kv_cache) > 0:
-                        draft_past_kv = tuple(
-                            (draft_kv_cache[i][0], draft_kv_cache[i][1])
-                            for i in sorted(draft_kv_cache.keys())
-                        )
+                        # Check if cache batch dimension matches active_count
+                        first_layer_idx = sorted(draft_kv_cache.keys())[0]
+                        cache_batch_dim = draft_kv_cache[first_layer_idx][0].shape[0]
+
+                        if cache_batch_dim != active_count:
+                            # Filter cache to match active sequences
+                            # If cache has full batch_size, select active_indices
+                            # Otherwise, assume cache already filtered (should match active_count)
+                            if cache_batch_dim == batch_size:
+                                # Cache has full batch - filter to active_indices
+                                draft_past_kv = tuple(
+                                    (
+                                        draft_kv_cache[i][0][
+                                            active_indices
+                                        ],  # Select active sequences
+                                        draft_kv_cache[i][1][active_indices],
+                                    )
+                                    for i in sorted(draft_kv_cache.keys())
+                                )
+                            else:
+                                # Cache mismatch - log warning and skip KV cache for this step
+                                print(
+                                    "[WARNING] Step {}: Draft KV cache batch dim mismatch: "
+                                    "cache={}, active={}".format(
+                                        step, cache_batch_dim, active_count
+                                    ),
+                                    flush=True,
+                                )
+                                draft_past_kv = None
+                        else:
+                            # Cache batch dimension matches active_count - use directly
+                            draft_past_kv = tuple(
+                                (draft_kv_cache[i][0], draft_kv_cache[i][1])
+                                for i in sorted(draft_kv_cache.keys())
+                            )
 
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
@@ -1899,7 +1949,18 @@ class SpeculativePipeline(SpeculativeDecoder):
                     )
 
                 # Extract and update draft KV cache if enabled
+                # CRITICAL: Filter KV cache operations to only active sequences
                 if kv_cache_enabled and draft_kv_cache is not None:
+                    # Early exit if no active sequences (shouldn't happen, but safety check)
+                    if active_count == 0:
+                        print(
+                            "[WARNING] Step {}: active_count=0, skipping KV cache update".format(
+                                step
+                            ),
+                            flush=True,
+                        )
+                        break
+
                     # Get KV cache from draft model - check both _last_generated_kv and _last_generated_kv_raw
                     draft_new_kv = None
                     if (
@@ -1927,32 +1988,64 @@ class SpeculativePipeline(SpeculativeDecoder):
                             kv_list = draft_new_kv
 
                         if len(draft_kv_cache) == 0:
-                            # Initialize KV cache dict from model output
+                            # Initialize KV cache dict from model output (only active sequences)
+                            # kv_list contains tensors with shape [active_count, ...]
                             for i, (k_new, v_new) in enumerate(kv_list):
+                                # Store with active_count batch dimension initially
                                 draft_kv_cache[i] = [
-                                    k_new.detach().contiguous(),
-                                    v_new.detach().contiguous(),
+                                    k_new.detach().contiguous(),  # [active_count, ...]
+                                    v_new.detach().contiguous(),  # [active_count, ...]
                                 ]
                         else:
-                            # Append new KV cache to existing
+                            # Append new KV cache to existing (only for active sequences)
+                            # CRITICAL: Both existing and new cache must have batch dimension = active_count
                             for i, (k_new, v_new) in enumerate(kv_list):
+                                # Verify new cache has correct batch dimension
+                                if k_new.shape[0] != active_count:
+                                    print(
+                                        "[ERROR] Step {}: Draft new KV cache batch mismatch: "
+                                        "expected={}, got={}".format(
+                                            step, active_count, k_new.shape[0]
+                                        ),
+                                        flush=True,
+                                    )
+                                    continue  # Skip this layer
+
                                 if i in draft_kv_cache:
-                                    # Append new key/value tensors along sequence dimension
-                                    draft_kv_cache[i][0] = torch.cat(
-                                        [
-                                            draft_kv_cache[i][0],
+                                    existing_k = draft_kv_cache[i][
+                                        0
+                                    ]  # [active_count, ...]
+                                    existing_v = draft_kv_cache[i][
+                                        1
+                                    ]  # [active_count, ...]
+
+                                    # Verify shape compatibility
+                                    if existing_k.shape[0] != active_count:
+                                        # Cache has wrong batch dimension - reinitialize with new cache
+                                        print(
+                                            "[WARNING] Step {}: Draft KV cache batch mismatch - "
+                                            "existing={}, active={}. Reinitializing cache.".format(
+                                                step, existing_k.shape[0], active_count
+                                            ),
+                                            flush=True,
+                                        )
+                                        # Reinitialize for this layer with new cache
+                                        draft_kv_cache[i] = [
                                             k_new.detach().contiguous(),
-                                        ],
-                                        dim=-2,
-                                    )
-                                    draft_kv_cache[i][1] = torch.cat(
-                                        [
-                                            draft_kv_cache[i][1],
                                             v_new.detach().contiguous(),
-                                        ],
-                                        dim=-2,
-                                    )
+                                        ]
+                                    else:
+                                        # Both have correct batch dimension - safe to concatenate
+                                        draft_kv_cache[i][0] = torch.cat(
+                                            [existing_k, k_new.detach().contiguous()],
+                                            dim=-2,
+                                        )
+                                        draft_kv_cache[i][1] = torch.cat(
+                                            [existing_v, v_new.detach().contiguous()],
+                                            dim=-2,
+                                        )
                                 else:
+                                    # New layer - initialize
                                     draft_kv_cache[i] = [
                                         k_new.detach().contiguous(),
                                         v_new.detach().contiguous(),
@@ -2098,65 +2191,114 @@ class SpeculativePipeline(SpeculativeDecoder):
                             verify_end_event.record(verify_stream)
 
                     # Extract and update base KV cache if enabled
+                    # CRITICAL: Filter KV cache operations to only active sequences
                     if kv_cache_enabled and base_kv_cache is not None:
-                        # Get KV cache from base model - check both _last_generated_kv and _last_generated_kv_raw
-                        base_new_kv = None
-                        if (
-                            hasattr(self.base_lm, "_last_generated_kv_raw")
-                            and self.base_lm._last_generated_kv_raw is not None
-                        ):
-                            base_new_kv = self.base_lm._last_generated_kv_raw
-                        elif (
-                            hasattr(self.base_lm, "_last_generated_kv")
-                            and self.base_lm._last_generated_kv is not None
-                        ):
-                            # Extract from KVCache wrapper if it exists
-                            if hasattr(
-                                self.base_lm._last_generated_kv, "past_key_values"
+                        # Early exit if no active sequences (safety check)
+                        if active_count == 0:
+                            print(
+                                "[WARNING] Step {}: active_count=0, skipping base KV cache update".format(
+                                    step
+                                ),
+                                flush=True,
+                            )
+                        else:
+                            # Get KV cache from base model - check both _last_generated_kv and _last_generated_kv_raw
+                            base_new_kv = None
+                            if (
+                                hasattr(self.base_lm, "_last_generated_kv_raw")
+                                and self.base_lm._last_generated_kv_raw is not None
                             ):
-                                base_new_kv = (
-                                    self.base_lm._last_generated_kv.past_key_values
-                                )
-                            else:
-                                base_new_kv = self.base_lm._last_generated_kv
+                                base_new_kv = self.base_lm._last_generated_kv_raw
+                            elif (
+                                hasattr(self.base_lm, "_last_generated_kv")
+                                and self.base_lm._last_generated_kv is not None
+                            ):
+                                # Extract from KVCache wrapper if it exists
+                                if hasattr(
+                                    self.base_lm._last_generated_kv, "past_key_values"
+                                ):
+                                    base_new_kv = (
+                                        self.base_lm._last_generated_kv.past_key_values
+                                    )
+                                else:
+                                    base_new_kv = self.base_lm._last_generated_kv
 
-                        if base_new_kv is not None:
-                            # Convert to list of (key, value) tuples if needed
-                            if isinstance(base_new_kv, tuple):
-                                kv_list = base_new_kv
-                            else:
-                                kv_list = base_new_kv
+                            if base_new_kv is not None:
+                                # Convert to list of (key, value) tuples if needed
+                                if isinstance(base_new_kv, tuple):
+                                    kv_list = base_new_kv
+                                else:
+                                    kv_list = base_new_kv
 
-                            if len(base_kv_cache) == 0:
-                                # Initialize KV cache dict
-                                for i, (k_new, v_new) in enumerate(kv_list):
-                                    base_kv_cache[i] = [
-                                        k_new.detach().contiguous(),
-                                        v_new.detach().contiguous(),
-                                    ]
-                            else:
-                                # Append new KV cache to existing
-                                for i, (k_new, v_new) in enumerate(kv_list):
-                                    if i in base_kv_cache:
-                                        base_kv_cache[i][0] = torch.cat(
-                                            [
-                                                base_kv_cache[i][0],
-                                                k_new.detach().contiguous(),
-                                            ],
-                                            dim=-2,
-                                        )
-                                        base_kv_cache[i][1] = torch.cat(
-                                            [
-                                                base_kv_cache[i][1],
-                                                v_new.detach().contiguous(),
-                                            ],
-                                            dim=-2,
-                                        )
-                                    else:
+                                if len(base_kv_cache) == 0:
+                                    # Initialize KV cache dict (only active sequences)
+                                    for i, (k_new, v_new) in enumerate(kv_list):
                                         base_kv_cache[i] = [
-                                            k_new.detach().contiguous(),
-                                            v_new.detach().contiguous(),
+                                            k_new.detach().contiguous(),  # [active_count, ...]
+                                            v_new.detach().contiguous(),  # [active_count, ...]
                                         ]
+                                else:
+                                    # Append new KV cache to existing (only for active sequences)
+                                    # CRITICAL: Both existing and new cache must have batch dimension = active_count
+                                    for i, (k_new, v_new) in enumerate(kv_list):
+                                        # Verify new cache has correct batch dimension
+                                        if k_new.shape[0] != active_count:
+                                            print(
+                                                "[ERROR] Step {}: Base new KV cache batch mismatch: "
+                                                "expected={}, got={}".format(
+                                                    step, active_count, k_new.shape[0]
+                                                ),
+                                                flush=True,
+                                            )
+                                            continue  # Skip this layer
+
+                                        if i in base_kv_cache:
+                                            existing_k = base_kv_cache[i][
+                                                0
+                                            ]  # [active_count, ...]
+                                            existing_v = base_kv_cache[i][
+                                                1
+                                            ]  # [active_count, ...]
+
+                                            # Verify shape compatibility
+                                            if existing_k.shape[0] != active_count:
+                                                # Cache has wrong batch dimension - reinitialize with new cache
+                                                print(
+                                                    "[WARNING] Step {}: Base KV cache batch mismatch - "
+                                                    "existing={}, active={}. Reinitializing cache.".format(
+                                                        step,
+                                                        existing_k.shape[0],
+                                                        active_count,
+                                                    ),
+                                                    flush=True,
+                                                )
+                                                # Reinitialize for this layer with new cache
+                                                base_kv_cache[i] = [
+                                                    k_new.detach().contiguous(),
+                                                    v_new.detach().contiguous(),
+                                                ]
+                                            else:
+                                                # Both have correct batch dimension - safe to concatenate
+                                                base_kv_cache[i][0] = torch.cat(
+                                                    [
+                                                        existing_k,
+                                                        k_new.detach().contiguous(),
+                                                    ],
+                                                    dim=-2,
+                                                )
+                                                base_kv_cache[i][1] = torch.cat(
+                                                    [
+                                                        existing_v,
+                                                        v_new.detach().contiguous(),
+                                                    ],
+                                                    dim=-2,
+                                                )
+                                        else:
+                                            # New layer - initialize
+                                            base_kv_cache[i] = [
+                                                k_new.detach().contiguous(),
+                                                v_new.detach().contiguous(),
+                                            ]
 
                     # Synchronize both streams
                     if draft_end_event is not None:
