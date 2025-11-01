@@ -141,6 +141,9 @@ def run_comprehensive_k_sweep(
 ):
     """Run comprehensive K-sweep test with 10-prompt suite."""
 
+    # Track start time for final diagnostics
+    benchmark_start_time = time.time()
+
     # Resolve device
     resolved_device = resolve_device(device)
     logger.info(f"Using device: {resolved_device}")
@@ -276,12 +279,22 @@ def run_comprehensive_k_sweep(
         last_batch_idx = 0
 
         for iteration in range(iterations):
+            print(
+                f"[ITER] ===== Starting Iteration {iteration+1}/{iterations} =====",
+                flush=True,
+            )
             logger.info(f"  Iteration {iteration+1}/{iterations}")
             iter_start_time = time.time()
             iter_results = []
+            iter_samples = 0
 
             # Process prompts in batches
             num_batches = (len(PROMPT_SUITE) + BATCH_SIZE - 1) // BATCH_SIZE
+            print(
+                f"[ITER] Processing {num_batches} batches of up to {BATCH_SIZE} prompts each",
+                flush=True,
+            )
+
             for batch_idx, batch_start in enumerate(
                 range(0, len(PROMPT_SUITE), BATCH_SIZE)
             ):
@@ -323,6 +336,11 @@ def run_comprehensive_k_sweep(
                     if pipeline is None:
                         raise Exception("Pipeline creation failed for this K")
 
+                    # GPU sync before batch to ensure clean state
+                    if resolved_device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        gpu_start_mem = torch.cuda.memory_allocated() / (1024**2)
+
                     # Generate for batch
                     batch_start_time = time.time()
                     batch_results = pipeline.generate_batch(
@@ -331,6 +349,11 @@ def run_comprehensive_k_sweep(
                         temperature=0.7,
                         do_sample=True,
                     )
+
+                    # GPU sync after batch to measure actual GPU time
+                    if resolved_device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+
                     batch_end_time = time.time()
 
                     batch_time_ms = (batch_end_time - batch_start_time) * 1000
@@ -356,20 +379,45 @@ def run_comprehensive_k_sweep(
                     last_batch_idx = batch_idx
 
                     # Process each result in the batch
+                    print(
+                        f"[BATCH] Processing {len(batch_results)} results from batch {batch_idx+1}",
+                        flush=True,
+                    )
+
                     for prompt_idx, result in zip(batch_indices, batch_results):
                         prompt = PROMPT_SUITE[prompt_idx]
 
-                        # Extract metrics
+                        # Extract metrics with validation
                         latency_ms = result.get("latency_ms", 0)
                         tokens_per_sec = result.get("tokens_per_sec", 0)
                         acceptance_rate = result.get("acceptance_rate", 0.0)
                         proposed = result.get("proposed", 0)
                         accepted = result.get("accepted", 0)
+                        generated_tokens_count = result.get("generated_tokens", 0)
+                        if isinstance(generated_tokens_count, list):
+                            generated_tokens_count = len(generated_tokens_count)
                         text = result.get("text", "")
                         kv_appended = result.get("kv_appended_tokens_total", 0)
                         kv_append_time = result.get("kv_append_time_ms", 0.0)
                         kv_append_enabled = result.get("kv_append_enabled", False)
                         kv_append_backend = result.get("kv_append_backend", "unknown")
+
+                        # Validate metrics are not NaN or inf
+                        if np.isnan(tokens_per_sec) or np.isinf(tokens_per_sec):
+                            tokens_per_sec = 0.0
+                        if np.isnan(latency_ms) or np.isinf(latency_ms):
+                            latency_ms = 0.0
+                        if np.isnan(acceptance_rate) or np.isinf(acceptance_rate):
+                            acceptance_rate = 0.0
+
+                        # Log progress for each prompt
+                        print(
+                            f"[PROMPT] {prompt_idx+1}/{len(PROMPT_SUITE)} | "
+                            f"Tokens: {generated_tokens_count} | "
+                            f"Accept: {accepted}/{proposed} ({acceptance_rate:.1%}) | "
+                            f"Throughput: {tokens_per_sec:.2f} tok/s",
+                            flush=True,
+                        )
 
                         # Store detailed result (minimal logging during generation)
                         detailed_result = {
@@ -410,10 +458,59 @@ def run_comprehensive_k_sweep(
                         }
                         k_results.append(result_data)
                         iter_results.append(result_data)
+                        iter_samples += 1
+
+                except AssertionError as e:
+                    # CUDA assertion errors (NaN/inf probability tensors)
+                    error_msg = str(e)
+                    if (
+                        "probability tensor" in error_msg.lower()
+                        or "inf/nan" in error_msg.lower()
+                    ):
+                        print(
+                            f"[ERROR] CUDA Assertion (NaN/Inf) in batch {batch_idx+1}: {error_msg}",
+                            flush=True,
+                        )
+                        print(
+                            f"[ERROR] Skipping batch {batch_idx+1} gracefully (batch {batch_start+1}-{batch_end})",
+                            flush=True,
+                        )
+                    else:
+                        logger.error(f"Assertion error: {e}")
+                        print(
+                            f"[ERROR] Assertion error in batch {batch_idx+1}: {e}",
+                            flush=True,
+                        )
+
+                    k_failures += len(batch_prompts)
+                    # Record failure for each prompt in batch
+                    for prompt_idx in batch_indices:
+                        detailed_result = {
+                            "k": k,
+                            "iteration": iteration + 1,
+                            "prompt_idx": prompt_idx + 1,
+                            "prompt": PROMPT_SUITE[prompt_idx],
+                            "error": f"CUDA Assertion: {error_msg}",
+                            "error_type": "cuda_assertion",
+                            "success": False,
+                            "device": resolved_device,
+                            "dtype": (
+                                "float16"
+                                if resolved_device in ["cuda", "mps"]
+                                else "float32"
+                            ),
+                        }
+                        detailed_results.append(detailed_result)
+                    continue  # Skip to next batch
 
                 except Exception as e:
                     k_failures += len(batch_prompts)
                     error_traceback = traceback.format_exc()
+                    error_type = type(e).__name__
+                    print(
+                        f"[ERROR] Exception in batch {batch_idx+1} ({error_type}): {e}",
+                        flush=True,
+                    )
                     logger.error(
                         f"      K={k}, Iter={iteration+1}, Batch {batch_start}-{batch_end} "
                         f"failed: {e}"
@@ -440,7 +537,9 @@ def run_comprehensive_k_sweep(
                         }
                         detailed_results.append(detailed_result)
 
-            # Iteration summary
+            # Iteration summary (always print, even if no results)
+            iter_elapsed = time.time() - iter_start_time
+
             if iter_results:
                 iter_throughputs = [
                     r["tokens_per_sec"] for r in iter_results if "tokens_per_sec" in r
@@ -448,18 +547,36 @@ def run_comprehensive_k_sweep(
                 iter_accept_rates = [
                     r["acceptance_rate"] for r in iter_results if "acceptance_rate" in r
                 ]
+                iter_latencies = [
+                    r["latency_ms"] for r in iter_results if "latency_ms" in r
+                ]
                 avg_throughput = np.mean(iter_throughputs) if iter_throughputs else 0.0
                 avg_accept_rate = (
                     np.mean(iter_accept_rates) if iter_accept_rates else 0.0
                 )
-                iter_elapsed = time.time() - iter_start_time
+                avg_latency = np.mean(iter_latencies) if iter_latencies else 0.0
+
                 print(
-                    f"[SUMMARY] Iteration {iteration+1}: "
-                    f"avg throughput={avg_throughput:.2f} tok/s, "
-                    f"acceptance={avg_accept_rate:.2f}, "
+                    f"[SUMMARY] Iteration {iteration+1}/{iterations} COMPLETE: "
+                    f"{iter_samples}/{len(PROMPT_SUITE)} samples | "
+                    f"avg throughput={avg_throughput:.2f} tok/s | "
+                    f"acceptance={avg_accept_rate:.2%} | "
+                    f"avg latency={avg_latency:.1f}ms | "
                     f"elapsed={iter_elapsed:.2f}s",
                     flush=True,
                 )
+            else:
+                print(
+                    f"[SUMMARY] Iteration {iteration+1}/{iterations} COMPLETE: "
+                    f"0/{len(PROMPT_SUITE)} samples (all failed) | "
+                    f"elapsed={iter_elapsed:.2f}s",
+                    flush=True,
+                )
+
+            print(
+                f"[ITER] ===== Iteration {iteration+1}/{iterations} finished =====",
+                flush=True,
+            )
 
         # Calculate statistics for this K
         valid_results = [r for r in k_results if "error" not in r]
@@ -501,6 +618,37 @@ def run_comprehensive_k_sweep(
                 }
             )
 
+            # K-level summary with real values
+            print(
+                f"\n[K-SUMMARY] K={k} Results:",
+                flush=True,
+            )
+            print(
+                f"  Throughput: {np.mean(throughputs):.2f}±{np.std(throughputs):.2f} tok/s",
+                flush=True,
+            )
+            print(
+                f"  Acceptance: {np.mean(acceptance_rates):.3%}±{np.std(acceptance_rates):.3%}",
+                flush=True,
+            )
+            print(
+                f"  Latency: {np.mean(latencies):.1f}±{np.std(latencies):.1f} ms",
+                flush=True,
+            )
+            print(
+                f"  Success: {len(valid_results)}/{total_attempts} ({len(valid_results)/total_attempts:.1%})",
+                flush=True,
+            )
+            print(
+                f"  Proposed: {np.mean(proposed_counts):.1f}±{np.std(proposed_counts):.1f}",
+                flush=True,
+            )
+            print(
+                f"  Accepted: {np.mean(accepted_counts):.1f}±{np.std(accepted_counts):.1f}",
+                flush=True,
+            )
+            print("", flush=True)
+
             logger.info(
                 f"  K={k} AVERAGE: "
                 f"{np.mean(throughputs):.2f}±{np.std(throughputs):.2f} "
@@ -536,6 +684,60 @@ def run_comprehensive_k_sweep(
             logger.error(
                 f"  K={k}: All {total_attempts} attempts failed ({k_failures} failures)"
             )
+            print(
+                f"\n[K-SUMMARY] K={k} Results: ALL FAILED ({k_failures} failures)",
+                flush=True,
+            )
+            print("", flush=True)
+
+    # Final diagnostics summary
+    total_runtime = time.time() - benchmark_start_time
+    total_runtime_min = total_runtime / 60.0
+
+    print("\n" + "=" * 80, flush=True)
+    print("[FINAL] Benchmark Complete - Final Diagnostics", flush=True)
+    print("=" * 80, flush=True)
+
+    if resolved_device == "cuda" and torch.cuda.is_available():
+        gpu_mem_peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
+        gpu_mem_current_mb = torch.cuda.memory_allocated() / (1024**2)
+        gpu_mem_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+
+        print(
+            f"[FINAL] GPU Memory Peak: {gpu_mem_peak_mb:.2f} MB / {gpu_mem_total_gb:.2f} GB",
+            flush=True,
+        )
+        print(f"[FINAL] GPU Memory Current: {gpu_mem_current_mb:.2f} MB", flush=True)
+        print(
+            f"[FINAL] GPU Utilization Estimate: {(gpu_mem_peak_mb / (gpu_mem_total_gb * 1024)) * 100:.1f}%",
+            flush=True,
+        )
+
+    print(
+        f"[FINAL] Total Runtime: {total_runtime_min:.2f} minutes ({total_runtime:.2f}s)",
+        flush=True,
+    )
+    print(
+        f"[FINAL] Total K Values Tested: {len([r for r in results if r.get('n_samples', 0) > 0])}",
+        flush=True,
+    )
+
+    # Calculate overall stats
+    all_valid_results = [r for r in results if r.get("n_samples", 0) > 0]
+    if all_valid_results:
+        overall_throughput = np.mean(
+            [r["tokens_per_sec_mean"] for r in all_valid_results]
+        )
+        overall_acceptance = np.mean(
+            [r["acceptance_rate_mean"] for r in all_valid_results]
+        )
+        overall_success = np.mean([r["success_rate"] for r in all_valid_results])
+
+        print(f"[FINAL] Overall Throughput: {overall_throughput:.2f} tok/s", flush=True)
+        print(f"[FINAL] Overall Acceptance: {overall_acceptance:.2%}", flush=True)
+        print(f"[FINAL] Overall Success Rate: {overall_success:.1%}", flush=True)
+
+    print("=" * 80 + "\n", flush=True)
 
     return (
         results,
@@ -786,43 +988,67 @@ def main():
     else:
         logger.info("Skipping plot generation (--no-plots specified)")
 
-    # Print summary table
-    print("\n" + "=" * 120)
-    print("COMPREHENSIVE K-SWEEP RESULTS SUMMARY")
-    print("=" * 120)
+    # Print summary table with real values
+    print("\n" + "=" * 120, flush=True)
+    print("K-SWEEP RESULTS SUMMARY", flush=True)
+    print("=" * 120, flush=True)
     print(
         f"Device: {resolved_device} | Dtype: {system_info['dtype']} | "
-        f"Models: {args.base_model} + {args.draft_model}"
+        f"Models: {args.base_model} + {args.draft_model}",
+        flush=True,
     )
-    print("=" * 120)
+    print("=" * 120, flush=True)
     print(
         f"{'K':<3} {'Samples':<8} {'Failures':<9} {'Success%':<9} "
         f"{'Latency (ms)':<20} {'Throughput (tok/s)':<20} "
-        f"{'Accept Rate':<15} {'Proposed':<12} {'Accepted':<12}"
+        f"{'Accept Rate':<15} {'Proposed':<12} {'Accepted':<12}",
+        flush=True,
     )
-    print("-" * 120)
+    print("-" * 120, flush=True)
 
     for result in results:
         if result["n_samples"] > 0:
+            # Validate values before printing
+            latency_mean = result.get("latency_ms_mean", 0.0)
+            latency_std = result.get("latency_ms_std", 0.0)
+            throughput_mean = result.get("tokens_per_sec_mean", 0.0)
+            throughput_std = result.get("tokens_per_sec_std", 0.0)
+            accept_mean = result.get("acceptance_rate_mean", 0.0)
+            accept_std = result.get("acceptance_rate_std", 0.0)
+            proposed_mean = result.get("proposed_mean", 0.0)
+            proposed_std = result.get("proposed_std", 0.0)
+            accepted_mean = result.get("accepted_mean", 0.0)
+            accepted_std = result.get("accepted_std", 0.0)
+
+            # Check for NaN/inf
+            if np.isnan(latency_mean) or np.isinf(latency_mean):
+                latency_mean = 0.0
+            if np.isnan(latency_std) or np.isinf(latency_std):
+                latency_std = 0.0
+            if np.isnan(throughput_mean) or np.isinf(throughput_mean):
+                throughput_mean = 0.0
+            if np.isnan(throughput_std) or np.isinf(throughput_std):
+                throughput_std = 0.0
+
             print(
                 f"{result['k']:<3} {result['n_samples']:<8} {result['n_failures']:<9} "
                 f"{result['success_rate']*100:.1f}%{'':<4} "
-                f"{result['latency_ms_mean']:.1f}±{result['latency_ms_std']:.1f}    "
-                f"{result['tokens_per_sec_mean']:.2f}±"
-                f"{result['tokens_per_sec_std']:.2f}        "
-                f"{result['acceptance_rate_mean']:.3f}±"
-                f"{result['acceptance_rate_std']:.3f}    "
-                f"{result['proposed_mean']:.1f}±{result['proposed_std']:.1f}    "
-                f"{result['accepted_mean']:.1f}±{result['accepted_std']:.1f}"
+                f"{latency_mean:.1f}±{latency_std:.1f}{'':<15} "
+                f"{throughput_mean:.2f}±{throughput_std:.2f}{'':<12} "
+                f"{accept_mean:.3f}±{accept_std:.3f}{'':<9} "
+                f"{proposed_mean:.1f}±{proposed_std:.1f}{'':<7} "
+                f"{accepted_mean:.1f}±{accepted_std:.1f}",
+                flush=True,
             )
         else:
             print(
                 f"{result['k']:<3} {result['n_samples']:<8} {result['n_failures']:<9} "
                 f"{result['success_rate']*100:.1f}%{'':<4} "
-                f"{'N/A':<20} {'N/A':<20} {'N/A':<15} {'N/A':<12} {'N/A':<12}"
+                f"{'N/A':<20} {'N/A':<20} {'N/A':<15} {'N/A':<12} {'N/A':<12}",
+                flush=True,
             )
 
-    print("=" * 120)
+    print("=" * 120, flush=True)
     logger.info(
         f"Comprehensive K-sweep completed. Results saved to {csv_file} and {json_file}"
     )

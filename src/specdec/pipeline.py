@@ -1236,24 +1236,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                         f"{draft_tokens.shape[1]} tokens, "
                         f"total: {len(generated_tokens)}/{max_tokens}"
                     )
-                # Phase 3D: structured per-step record (best-effort)
-                try:
-                    if getattr(self.structured_profiler, "enable_profiling", False):
-                        self.structured_profiler.record_step(
-                            step=step,
-                            draft_time_ms=draft_time_ms,
-                            verify_time_ms=verify_time_ms,
-                            acceptance_time_ms=0.0,
-                            kv_append_time_ms=self.metrics.get(
-                                "kv_append_time_ms", 0.0
-                            ),
-                            accepted_len=accepted_len,
-                            proposed_len=int(draft_tokens.shape[1]),
-                        )
-                except Exception:
-                    pass
                 else:
-                    # Fallback: generate one token with base model
+                    # No tokens accepted - fallback: generate one token with base model
                     # (if we haven't reached max_tokens)
                     remaining_tokens = max_tokens - len(generated_tokens)
                     if remaining_tokens > 0:
@@ -1271,14 +1255,31 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 [current_input, fallback_tokens], dim=1
                             )
 
-                    self.metrics["total_generation_time_ms"] += (
-                        time.time() - step_start
-                    ) * 1000
+                        self.metrics["total_generation_time_ms"] += (
+                            time.time() - step_start
+                        ) * 1000
 
-                    self.logger.info(
-                        f"Step {step}: fallback generated 1 token, "
-                        f"total: {len(generated_tokens)}/{max_tokens}"
-                    )
+                        self.logger.info(
+                            f"Step {step}: fallback generated 1 token, "
+                            f"total: {len(generated_tokens)}/{max_tokens}"
+                        )
+
+                # Phase 3D: structured per-step record (best-effort)
+                try:
+                    if getattr(self.structured_profiler, "enable_profiling", False):
+                        self.structured_profiler.record_step(
+                            step=step,
+                            draft_time_ms=draft_time_ms,
+                            verify_time_ms=verify_time_ms,
+                            acceptance_time_ms=0.0,
+                            kv_append_time_ms=self.metrics.get(
+                                "kv_append_time_ms", 0.0
+                            ),
+                            accepted_len=accepted_len,
+                            proposed_len=int(draft_tokens.shape[1]),
+                        )
+                except Exception:
+                    pass
 
                 # Check for early stopping
                 if len(generated_tokens) >= max_tokens:
@@ -1303,6 +1304,18 @@ class SpeculativePipeline(SpeculativeDecoder):
             self.metrics["total_steps"] = step
             total_time_ms = (time.time() - start_time) * 1000
             self.metrics["total_generation_time_ms"] += total_time_ms
+
+            # Validate tokens were generated
+            if not generated_tokens or len(generated_tokens) == 0:
+                self.logger.warning(
+                    f"No tokens generated after {step} steps! "
+                    f"max_tokens={max_tokens}, proposed={self.metrics['total_proposed']}, "
+                    f"accepted={self.metrics['total_accepted']}"
+                )
+                print(
+                    f"[WARNING] No tokens generated for prompt after {step} steps",
+                    flush=True,
+                )
 
             # Decode generated text
             if isinstance(generated_tokens, list):
