@@ -1607,7 +1607,10 @@ class SpeculativePipeline(SpeculativeDecoder):
         with optimization_context:
             # Vectorized speculative decoding loop
             # All prompts processed together in batched tensor operations
-            current_input_ids = batch_input_ids.clone()  # [batch_size, seq_len]
+            # Store sequences as list of 1D tensors to handle variable lengths
+            current_input_ids = [
+                batch_input_ids[i].clone() for i in range(batch_size)
+            ]  # List of [seq_len] tensors
             batch_generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
             batch_active = [
                 True
@@ -1656,9 +1659,61 @@ class SpeculativePipeline(SpeculativeDecoder):
                     break
 
                 # Create batched input for active prompts only
-                active_input_ids = current_input_ids[
-                    active_indices
-                ]  # [active_count, seq_len]
+                # Handle variable-length sequences by padding to max length
+                active_seqs = [current_input_ids[i] for i in active_indices]
+                if len(active_seqs) == 0:
+                    break
+
+                # Find max sequence length in active batch
+                original_lengths = [seq.shape[0] for seq in active_seqs]
+                max_seq_len = max(original_lengths)
+
+                # Pad all sequences to max length for batching
+                padded_seqs = []
+                pad_value = (
+                    tokenizer.pad_token_id
+                    if tokenizer is not None and tokenizer.pad_token_id is not None
+                    else 0
+                )
+                for seq in active_seqs:
+                    if seq.shape[0] < max_seq_len:
+                        # Pad with pad_token_id
+                        pad_length = max_seq_len - seq.shape[0]
+                        padding = torch.full(
+                            (pad_length,),
+                            pad_value,
+                            dtype=seq.dtype,
+                            device=seq.device,
+                        )
+                        seq_padded = torch.cat([seq, padding], dim=0)
+                        padded_seqs.append(seq_padded)
+                    else:
+                        padded_seqs.append(seq)
+
+                # Stack into batch tensor
+                active_input_ids = torch.stack(
+                    padded_seqs, dim=0
+                )  # [active_count, max_seq_len]
+
+                # Create attention mask to ignore padding tokens
+                active_attention_mask = torch.ones(
+                    (len(active_indices), max_seq_len),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                for i, orig_len in enumerate(original_lengths):
+                    if orig_len < max_seq_len:
+                        # Mask out padding tokens
+                        active_attention_mask[i, orig_len:] = 0
+
+                # Debug: print shapes for first step
+                if step == 1:
+                    print(
+                        f"[BATCH] Batched active_input_ids shape: {active_input_ids.shape} "
+                        f"(active={len(active_indices)}, max_len={max_seq_len}, "
+                        f"original_lens={original_lengths})",
+                        flush=True,
+                    )
 
                 # Step 1: Generate draft tokens in batch (on draft stream)
                 draft_start_event = None
@@ -1854,13 +1909,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                     batch_metrics["total_accepted"] += accepted_len
 
                     # Update current input for next iteration
-                    # Concatenate accepted tokens to current input
-                    accepted_tensor = torch.tensor(
+                    # Concatenate accepted tokens to current input (no padding, keep as 1D)
+                    accepted_tokens_tensor = torch.tensor(
                         accepted_tokens_list[-1], device=self.device, dtype=torch.long
-                    ).unsqueeze(0)
-                    current_input_ids[global_idx] = torch.cat(
-                        [current_input_ids[global_idx], accepted_tensor], dim=-1
+                    )  # Shape: [accepted_len]
+                    current_seq = current_input_ids[global_idx]  # Shape: [seq_len]
+                    # Concatenate along sequence dimension (both are 1D)
+                    updated_seq = torch.cat(
+                        [current_seq, accepted_tokens_tensor], dim=0
                     )
+                    # Update sequence (keep as 1D list item, no padding)
+                    current_input_ids[global_idx] = updated_seq
 
                     # Check if this prompt is done
                     eos_token_id = 50256  # Default GPT-2 EOS token
