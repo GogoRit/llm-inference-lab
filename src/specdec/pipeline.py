@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import psutil
 import torch
@@ -1642,16 +1642,30 @@ class SpeculativePipeline(SpeculativeDecoder):
         if hasattr(self.draft_lm, "clear_kv_cache"):
             self.draft_lm.clear_kv_cache()
 
-        kv_cache_enabled = (
+        # Check if KV cache append is enabled via environment variable
+        kv_cache_enabled_env = os.getenv("SPECDEC_ENABLE_KV_APPEND", "0") == "1"
+        kv_cache_supported = (
             hasattr(self.base_lm, "supports_kv_append")
             and self.base_lm.supports_kv_append()
         )
+        kv_cache_enabled = kv_cache_enabled_env and kv_cache_supported
+
+        # Initialize batched KV cache dictionaries if enabled
+        base_kv_cache: Optional[Dict[int, List[torch.Tensor]]] = None
+        draft_kv_cache: Optional[Dict[int, List[torch.Tensor]]] = None
         if kv_cache_enabled:
             print(
-                "[BATCH] Note: KV cache updates disabled in batched mode "
-                "(per-prompt tracking not yet implemented)",
+                "[BATCH] KV cache append enabled - initializing batched KV cache",
                 flush=True,
             )
+            base_kv_cache = {}  # Will be populated after first forward pass
+            draft_kv_cache = {}  # Will be populated after first forward pass
+        else:
+            if kv_cache_enabled_env and not kv_cache_supported:
+                print(
+                    "[BATCH] Warning: SPECDEC_ENABLE_KV_APPEND=1 but model doesn't support KV append",
+                    flush=True,
+                )
 
         # Reset metrics for batch
         batch_metrics = {
@@ -1851,6 +1865,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                     max(temperature / 1.5, 0.1) if temperature is not None else 0.7
                 )
 
+                # Prepare past_key_values for draft model if KV cache is enabled
+                draft_past_kv = None
+                if kv_cache_enabled and draft_kv_cache is not None:
+                    # Convert dict format to tuple format expected by model
+                    if len(draft_kv_cache) > 0:
+                        draft_past_kv = tuple(
+                            (draft_kv_cache[i][0], draft_kv_cache[i][1])
+                            for i in sorted(draft_kv_cache.keys())
+                        )
+
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
                         draft_tokens, draft_logits = self.draft_lm.generate_tokens(
@@ -1859,6 +1883,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             temperature=draft_temperature,  # Lower temperature for draft
                             do_sample=False,  # Use greedy for draft to maximize acceptance
                             stream=draft_stream,
+                            past_key_values=draft_past_kv,
                             **kwargs,
                         )
                     if draft_end_event is not None:
@@ -1869,8 +1894,69 @@ class SpeculativePipeline(SpeculativeDecoder):
                         max_new_tokens=k,
                         temperature=draft_temperature,  # Lower temperature for draft
                         do_sample=False,  # Use greedy for draft to maximize acceptance
+                        past_key_values=draft_past_kv,
                         **kwargs,
                     )
+
+                # Extract and update draft KV cache if enabled
+                if kv_cache_enabled and draft_kv_cache is not None:
+                    # Get KV cache from draft model - check both _last_generated_kv and _last_generated_kv_raw
+                    draft_new_kv = None
+                    if (
+                        hasattr(self.draft_lm, "_last_generated_kv_raw")
+                        and self.draft_lm._last_generated_kv_raw is not None
+                    ):
+                        draft_new_kv = self.draft_lm._last_generated_kv_raw
+                    elif (
+                        hasattr(self.draft_lm, "_last_generated_kv")
+                        and self.draft_lm._last_generated_kv is not None
+                    ):
+                        # Extract from KVCache wrapper if it exists
+                        if hasattr(self.draft_lm._last_generated_kv, "past_key_values"):
+                            draft_new_kv = (
+                                self.draft_lm._last_generated_kv.past_key_values
+                            )
+                        else:
+                            draft_new_kv = self.draft_lm._last_generated_kv
+
+                    if draft_new_kv is not None:
+                        # Convert to list of (key, value) tuples if needed
+                        if isinstance(draft_new_kv, tuple):
+                            kv_list = draft_new_kv
+                        else:
+                            kv_list = draft_new_kv
+
+                        if len(draft_kv_cache) == 0:
+                            # Initialize KV cache dict from model output
+                            for i, (k_new, v_new) in enumerate(kv_list):
+                                draft_kv_cache[i] = [
+                                    k_new.detach().contiguous(),
+                                    v_new.detach().contiguous(),
+                                ]
+                        else:
+                            # Append new KV cache to existing
+                            for i, (k_new, v_new) in enumerate(kv_list):
+                                if i in draft_kv_cache:
+                                    # Append new key/value tensors along sequence dimension
+                                    draft_kv_cache[i][0] = torch.cat(
+                                        [
+                                            draft_kv_cache[i][0],
+                                            k_new.detach().contiguous(),
+                                        ],
+                                        dim=-2,
+                                    )
+                                    draft_kv_cache[i][1] = torch.cat(
+                                        [
+                                            draft_kv_cache[i][1],
+                                            v_new.detach().contiguous(),
+                                        ],
+                                        dim=-2,
+                                    )
+                                else:
+                                    draft_kv_cache[i] = [
+                                        k_new.detach().contiguous(),
+                                        v_new.detach().contiguous(),
+                                    ]
 
                 # Validate draft outputs
                 if draft_tokens.numel() == 0 or draft_tokens.shape[1] == 0:
@@ -1984,6 +2070,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                         verify_time_ms = (time.time() - verify_start_wall) * 1000
                 elif verify_stream is not None and draft_stream is not None:
                     # Manual stream management if scheduler not available
+                    # Prepare past_key_values for base model if KV cache is enabled
+                    base_past_kv = None
+                    if kv_cache_enabled and base_kv_cache is not None:
+                        # Convert dict format to tuple format expected by model
+                        if len(base_kv_cache) > 0:
+                            base_past_kv = tuple(
+                                (base_kv_cache[i][0], base_kv_cache[i][1])
+                                for i in sorted(base_kv_cache.keys())
+                            )
+
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
                             verify_start_event.record(verify_stream)
@@ -1995,10 +2091,72 @@ class SpeculativePipeline(SpeculativeDecoder):
                             temperature=1.0,  # Temperature=1.0 for deterministic argmax
                             do_sample=False,  # Always use greedy for verification
                             stream=verify_stream,
+                            past_key_values=base_past_kv,
                             **kwargs,
                         )
                         if verify_end_event is not None:
                             verify_end_event.record(verify_stream)
+
+                    # Extract and update base KV cache if enabled
+                    if kv_cache_enabled and base_kv_cache is not None:
+                        # Get KV cache from base model - check both _last_generated_kv and _last_generated_kv_raw
+                        base_new_kv = None
+                        if (
+                            hasattr(self.base_lm, "_last_generated_kv_raw")
+                            and self.base_lm._last_generated_kv_raw is not None
+                        ):
+                            base_new_kv = self.base_lm._last_generated_kv_raw
+                        elif (
+                            hasattr(self.base_lm, "_last_generated_kv")
+                            and self.base_lm._last_generated_kv is not None
+                        ):
+                            # Extract from KVCache wrapper if it exists
+                            if hasattr(
+                                self.base_lm._last_generated_kv, "past_key_values"
+                            ):
+                                base_new_kv = (
+                                    self.base_lm._last_generated_kv.past_key_values
+                                )
+                            else:
+                                base_new_kv = self.base_lm._last_generated_kv
+
+                        if base_new_kv is not None:
+                            # Convert to list of (key, value) tuples if needed
+                            if isinstance(base_new_kv, tuple):
+                                kv_list = base_new_kv
+                            else:
+                                kv_list = base_new_kv
+
+                            if len(base_kv_cache) == 0:
+                                # Initialize KV cache dict
+                                for i, (k_new, v_new) in enumerate(kv_list):
+                                    base_kv_cache[i] = [
+                                        k_new.detach().contiguous(),
+                                        v_new.detach().contiguous(),
+                                    ]
+                            else:
+                                # Append new KV cache to existing
+                                for i, (k_new, v_new) in enumerate(kv_list):
+                                    if i in base_kv_cache:
+                                        base_kv_cache[i][0] = torch.cat(
+                                            [
+                                                base_kv_cache[i][0],
+                                                k_new.detach().contiguous(),
+                                            ],
+                                            dim=-2,
+                                        )
+                                        base_kv_cache[i][1] = torch.cat(
+                                            [
+                                                base_kv_cache[i][1],
+                                                v_new.detach().contiguous(),
+                                            ],
+                                            dim=-2,
+                                        )
+                                    else:
+                                        base_kv_cache[i] = [
+                                            k_new.detach().contiguous(),
+                                            v_new.detach().contiguous(),
+                                        ]
 
                     # Synchronize both streams
                     if draft_end_event is not None:
@@ -2017,14 +2175,85 @@ class SpeculativePipeline(SpeculativeDecoder):
                     # Fallback: sequential execution
                     if draft_stream is not None and draft_end_event is not None:
                         draft_end_event.synchronize()
+
+                    # Prepare past_key_values for base model if KV cache is enabled
+                    base_past_kv = None
+                    if kv_cache_enabled and base_kv_cache is not None:
+                        if len(base_kv_cache) > 0:
+                            base_past_kv = tuple(
+                                (base_kv_cache[i][0], base_kv_cache[i][1])
+                                for i in sorted(base_kv_cache.keys())
+                            )
+
                     # For verification, always use greedy (argmax) to ensure deterministic matching
                     base_tokens, base_logits = self.base_lm.generate_tokens(
                         active_input_ids,
                         max_new_tokens=k,
                         temperature=1.0,  # Temperature=1.0 for deterministic argmax
                         do_sample=False,  # Always use greedy for verification
+                        past_key_values=base_past_kv,
                         **kwargs,
                     )
+
+                    # Extract and update base KV cache if enabled
+                    if kv_cache_enabled and base_kv_cache is not None:
+                        # Get KV cache from base model - check both _last_generated_kv and _last_generated_kv_raw
+                        base_new_kv = None
+                        if (
+                            hasattr(self.base_lm, "_last_generated_kv_raw")
+                            and self.base_lm._last_generated_kv_raw is not None
+                        ):
+                            base_new_kv = self.base_lm._last_generated_kv_raw
+                        elif (
+                            hasattr(self.base_lm, "_last_generated_kv")
+                            and self.base_lm._last_generated_kv is not None
+                        ):
+                            # Extract from KVCache wrapper if it exists
+                            if hasattr(
+                                self.base_lm._last_generated_kv, "past_key_values"
+                            ):
+                                base_new_kv = (
+                                    self.base_lm._last_generated_kv.past_key_values
+                                )
+                            else:
+                                base_new_kv = self.base_lm._last_generated_kv
+
+                        if base_new_kv is not None:
+                            # Convert to list of (key, value) tuples if needed
+                            if isinstance(base_new_kv, tuple):
+                                kv_list = base_new_kv
+                            else:
+                                kv_list = base_new_kv
+
+                            if len(base_kv_cache) == 0:
+                                for i, (k_new, v_new) in enumerate(kv_list):
+                                    base_kv_cache[i] = [
+                                        k_new.detach().contiguous(),
+                                        v_new.detach().contiguous(),
+                                    ]
+                            else:
+                                for i, (k_new, v_new) in enumerate(kv_list):
+                                    if i in base_kv_cache:
+                                        base_kv_cache[i][0] = torch.cat(
+                                            [
+                                                base_kv_cache[i][0],
+                                                k_new.detach().contiguous(),
+                                            ],
+                                            dim=-2,
+                                        )
+                                        base_kv_cache[i][1] = torch.cat(
+                                            [
+                                                base_kv_cache[i][1],
+                                                v_new.detach().contiguous(),
+                                            ],
+                                            dim=-2,
+                                        )
+                                    else:
+                                        base_kv_cache[i] = [
+                                            k_new.detach().contiguous(),
+                                            v_new.detach().contiguous(),
+                                        ]
+
                     # Use wall-clock time for fallback
                     verify_time_ms = (time.time() - verify_start_wall) * 1000
 

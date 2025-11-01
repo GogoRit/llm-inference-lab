@@ -141,6 +141,7 @@ class HFWrapper(LanguageModel):
         temperature: float = 0.7,
         do_sample: bool = True,
         stream: Optional[torch.cuda.Stream] = None,
+        past_key_values=None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -161,7 +162,13 @@ class HFWrapper(LanguageModel):
             # Use async generation if stream is provided and device is CUDA
             if stream is not None and self._device == "cuda":
                 return self._generate_tokens_async(
-                    input_ids, max_new_tokens, temperature, do_sample, stream, **kwargs
+                    input_ids,
+                    max_new_tokens,
+                    temperature,
+                    do_sample,
+                    stream,
+                    past_key_values=past_key_values,
+                    **kwargs,
                 )
 
             with torch.no_grad():
@@ -232,6 +239,7 @@ class HFWrapper(LanguageModel):
         temperature: float,
         do_sample: bool,
         stream: torch.cuda.Stream,
+        past_key_values=None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -260,10 +268,30 @@ class HFWrapper(LanguageModel):
                 generated_logits = []
 
                 current_input = input_ids
+                current_past_kv = past_key_values
+                last_past_kv = None  # Track KV cache for return
 
                 for step in range(max_new_tokens):
-                    # Forward pass
-                    outputs = self._model(current_input, use_cache=False)  # type: ignore
+                    # Forward pass with past_key_values if available
+                    if current_past_kv is not None:
+                        # Only pass new tokens (not cached ones)
+                        # Assuming past_kv contains cached sequence length info
+                        outputs = self._model(  # type: ignore
+                            current_input,
+                            past_key_values=current_past_kv,
+                            use_cache=True,
+                        )
+                        # Update past_key_values for next step
+                        if outputs.past_key_values is not None:
+                            current_past_kv = outputs.past_key_values
+                            last_past_kv = current_past_kv
+                    else:
+                        outputs = self._model(current_input, use_cache=True)  # type: ignore
+                        # Initialize past_key_values on first step if KV cache enabled
+                        if outputs.past_key_values is not None:
+                            current_past_kv = outputs.past_key_values
+                            last_past_kv = current_past_kv
+
                     logits = outputs.logits  # [batch_size, seq_len, vocab_size]
 
                     # Get logits for last position
@@ -316,7 +344,11 @@ class HFWrapper(LanguageModel):
                     )  # [batch_size, 1, vocab_size]
 
                     # Append to input for next step
-                    current_input = torch.cat([current_input, next_token], dim=1)
+                    # If using KV cache, only pass new token
+                    if current_past_kv is not None:
+                        current_input = next_token  # Only new token
+                    else:
+                        current_input = torch.cat([current_input, next_token], dim=1)
 
                     # Progress print every 8 tokens
                     if step % 8 == 0 or step == max_new_tokens - 1:
@@ -341,6 +373,15 @@ class HFWrapper(LanguageModel):
                 logits = torch.cat(
                     generated_logits, dim=1
                 )  # [batch_size, max_new_tokens, vocab_size]
+
+                # Store last KV cache if available for reuse
+                if last_past_kv is not None:
+                    # Store in internal cache format (would need KVCache wrapper)
+                    # For now, store raw past_key_values
+                    if hasattr(self, "_last_generated_kv"):
+                        # Update or create cache entry
+                        # Note: This is simplified - full implementation would use KVCache wrapper
+                        self._last_generated_kv_raw = last_past_kv
 
                 return generated_ids, logits
 
