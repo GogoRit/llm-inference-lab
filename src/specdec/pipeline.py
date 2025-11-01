@@ -1086,6 +1086,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                         use_graph = False
 
                 if not use_graph:
+                    # GPU sync before verification to ensure async kernels report errors correctly
+                    if self.device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+
                     # Use scheduler or direct call
                     if self.scheduler:
                         base_tokens, base_logits, verify_info = (

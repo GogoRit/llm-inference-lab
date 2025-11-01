@@ -269,20 +269,45 @@ class HFWrapper(LanguageModel):
                     # Get logits for last position
                     next_token_logits = logits[:, -1, :]  # [batch_size, vocab_size]
 
-                    # Apply temperature
-                    if temperature != 1.0:
-                        next_token_logits = next_token_logits / temperature
-
+                    # --- BEGIN PATCH: Stability fix for softmax ---
                     # Sample or greedy
                     if do_sample:
-                        probs = torch.softmax(next_token_logits, dim=-1)
+                        # Promote to FP32 for numerical stability
+                        logits = next_token_logits.float()
+
+                        # Clamp to prevent overflow/underflow
+                        logits = torch.clamp(logits, -50.0, 50.0)
+
+                        # Apply temperature and compute softmax in FP32
+                        probs = torch.softmax(logits / temperature, dim=-1)
+
+                        # Recast to half precision only after computing probs
+                        if next_token_logits.dtype == torch.float16:
+                            probs = probs.half()
+
+                        # Safety check for NaN/Inf/negative values
+                        if (
+                            torch.isnan(probs).any()
+                            or (probs < 0).any()
+                            or torch.isinf(probs).any()
+                        ):
+                            print(
+                                "[ERROR] Invalid probs detected: NaN/Inf or negative values"
+                            )
+                            torch.cuda.synchronize()
+                            raise RuntimeError("Softmax instability on GPU")
+
                         next_token = torch.multinomial(
                             probs, num_samples=1
                         )  # [batch_size, 1]
                     else:
+                        # Greedy sampling - apply temperature if needed
+                        if temperature != 1.0:
+                            next_token_logits = next_token_logits / temperature
                         next_token = torch.argmax(
                             next_token_logits, dim=-1, keepdim=True
                         )  # [batch_size, 1]
+                    # --- END PATCH ---
 
                     # Store generated token and logits
                     generated_tokens.append(next_token)
