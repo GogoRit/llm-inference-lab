@@ -1599,6 +1599,7 @@ class SpeculativePipeline(SpeculativeDecoder):
         batch_metrics = {
             "total_proposed": 0,
             "total_accepted": 0,
+            "total_generated_tokens": 0,
             "total_steps": 0,
             "total_draft_time_ms": 0.0,
             "total_verification_time_ms": 0.0,
@@ -1616,6 +1617,9 @@ class SpeculativePipeline(SpeculativeDecoder):
             batch_active = [
                 True
             ] * batch_size  # Track which prompts are still generating
+            # Track per-prompt proposed/accepted for accurate metrics
+            per_prompt_proposed_counts = [0] * batch_size
+            per_prompt_accepted_counts = [0] * batch_size
 
             step = 0
             generation_start = time.time()
@@ -1998,6 +2002,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Step 3: Apply acceptance policy in batch
                 accepted_lengths = []
                 accepted_tokens_list = []
+                # Track per-prompt proposed/accepted for metrics (proposed is same for all in batch)
+                per_prompt_proposed = draft_tokens.shape[
+                    1
+                ]  # K tokens proposed per prompt
 
                 # Debug: log verify outputs shape
                 print(
@@ -2091,6 +2099,9 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     accepted_lengths.append(accepted_len)
                     batch_metrics["total_accepted"] += accepted_len
+                    batch_metrics[
+                        "total_generated_tokens"
+                    ] += accepted_len  # Track total generated
 
                     # Update current input for next iteration
                     # Concatenate accepted tokens to current input (no padding, keep as 1D)
@@ -2173,6 +2184,32 @@ class SpeculativePipeline(SpeculativeDecoder):
 
             total_time_ms = (time.time() - generation_start) * 1000
             batch_metrics["total_generation_time_ms"] = total_time_ms
+            batch_metrics["total_time_ms"] = (
+                total_time_ms  # Add for throughput calculation
+            )
+
+            # Calculate batch-level throughput
+            batch_metrics["tokens_per_sec"] = (
+                batch_metrics["total_generated_tokens"] / (total_time_ms / 1000.0)
+                if total_time_ms > 0
+                else 0.0
+            )
+
+            # Log batch metrics
+            self.logger.info(
+                f"[METRICS] Batch total - Tokens={batch_metrics['total_generated_tokens']} "
+                f"Time={total_time_ms:.2f}ms "
+                f"→ {batch_metrics['tokens_per_sec']:.2f} tok/s, "
+                f"Proposed={batch_metrics['total_proposed']} "
+                f"Accepted={batch_metrics['total_accepted']} "
+                f"AcceptRate={batch_metrics['total_accepted']/max(batch_metrics['total_proposed'], 1):.2%}"
+            )
+            print(
+                f"[METRICS] Batch total - Tokens={batch_metrics['total_generated_tokens']} "
+                f"Time={total_time_ms:.2f}ms "
+                f"→ {batch_metrics['tokens_per_sec']:.2f} tok/s",
+                flush=True,
+            )
 
             # Convert batched results to per-prompt dictionaries
             results = []
@@ -2191,19 +2228,18 @@ class SpeculativePipeline(SpeculativeDecoder):
                 prompt_acceptance_rate = batch_metrics["total_accepted"] / max(
                     batch_metrics["total_proposed"], 1
                 )
-                # Throughput: total tokens generated / total time (in seconds)
-                # Use batch total for accurate throughput measurement
-                batch_total_tokens = sum(
-                    len(tokens) for tokens in batch_generated_tokens
-                )
+
+                # Throughput: tokens generated for this prompt / total time
                 prompt_throughput = (
                     len(generated_tokens) / (total_time_ms / 1000.0)
                     if total_time_ms > 0
                     else 0.0
                 )
-                batch_throughput = (
-                    batch_total_tokens / (total_time_ms / 1000.0)
-                    if total_time_ms > 0
+
+                # Latency: average time per token for this prompt
+                prompt_latency_ms = (
+                    total_time_ms / len(generated_tokens)
+                    if len(generated_tokens) > 0
                     else 0.0
                 )
 
@@ -2223,15 +2259,21 @@ class SpeculativePipeline(SpeculativeDecoder):
                 results.append(
                     {
                         "prompt": prompt,
+                        "text": generated_text,  # Key expected by script
                         "generated_text": generated_text,
                         "generated_tokens": generated_tokens,
                         "num_generated": len(generated_tokens),
                         "batch_index": i,
                         "batch_size": batch_size,
+                        "latency_ms": prompt_latency_ms,  # Key expected by script
                         "total_time_ms": total_time_ms,
+                        "tokens_per_sec": prompt_throughput,  # Key expected by script
                         "throughput_tokens_per_sec": prompt_throughput,
-                        "batch_throughput_tokens_per_sec": batch_throughput,
                         "acceptance_rate": prompt_acceptance_rate,
+                        "proposed": total_proposed_per_prompt,  # Estimated per-prompt proposed
+                        "accepted": len(
+                            generated_tokens
+                        ),  # Actual tokens generated for this prompt
                         "draft_avg_ms": avg_draft_time,
                         "verify_avg_ms": avg_verify_time,
                         "batch_metrics": batch_metrics,
