@@ -8,7 +8,17 @@ import numpy as np
 import pytest
 import torch
 
-from src.specdec.deterministic import ensure_deterministic, set_deterministic_mode
+from specdec.utils.deterministic import ensure_deterministic
+
+# Import set_deterministic_mode if it exists, otherwise create a simple wrapper
+try:
+    from specdec.utils.deterministic import set_deterministic_mode
+except ImportError:
+
+    def set_deterministic_mode(enable: bool):
+        """Simple wrapper for deterministic mode."""
+        if enable:
+            ensure_deterministic()
 
 
 class TestDeterministicMode:

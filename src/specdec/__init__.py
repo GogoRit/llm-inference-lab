@@ -11,8 +11,9 @@ Key Components:
 - run_specdec: CLI entrypoint for speculative decoding
 """
 
-from .draft_model import DraftModel
-from .pipeline import SpeculativePipeline
+from .core.pipeline import SpeculativePipeline
+from .models.draft_model import DraftModel
+from .models.fake_lm import create_fake_lm
 from .verifier import Verifier
 
-__all__ = ["DraftModel", "Verifier", "SpeculativePipeline"]
+__all__ = ["DraftModel", "Verifier", "SpeculativePipeline", "create_fake_lm"]

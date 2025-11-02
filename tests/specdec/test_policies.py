@@ -5,7 +5,7 @@ Unit tests for acceptance policies.
 import pytest
 import torch
 
-from src.specdec.policies import (
+from specdec.policies.policies import (
     ConfidenceThresholdPolicy,
     LongestPrefixPolicy,
     TopKAgreementPolicy,

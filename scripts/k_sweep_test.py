@@ -16,7 +16,7 @@ SRC_DIR = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 
-from specdec.pipeline import SpeculativePipeline  # noqa: E402
+from specdec import SpeculativePipeline  # noqa: E402
 
 # Set up logging
 logging.basicConfig(

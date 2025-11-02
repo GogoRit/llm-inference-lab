@@ -5,8 +5,8 @@ Unit tests for KV cache functionality.
 import pytest
 import torch
 
+from specdec.cache.kv_types import KVCache, validate_kv_compatibility
 from src.kernels.reference import kv_append_ref, kv_append_with_mask_ref
-from src.specdec.kv_types import KVCache, validate_kv_compatibility
 
 
 class TestKVAppendRef:

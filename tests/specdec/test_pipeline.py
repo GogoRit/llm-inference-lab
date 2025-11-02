@@ -16,9 +16,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-# from specdec.draft_model import DraftModel  # noqa: E402  # Unused
-from specdec.pipeline import SpeculativePipeline  # noqa: E402
-from specdec.verifier import Verifier  # noqa: E402
+# from specdec import DraftModel  # noqa: E402  # Unused
+from specdec import SpeculativePipeline, Verifier  # noqa: E402
 
 
 class TestSpeculativePipeline:
@@ -203,7 +202,7 @@ class TestDraftModel:
     @pytest.fixture
     def draft_model(self):
         """Create a fake draft model instance for testing."""
-        from specdec.fake_lm import create_fake_lm
+        from specdec import create_fake_lm
 
         return create_fake_lm("fake-draft-distilgpt2", device="cpu")
 

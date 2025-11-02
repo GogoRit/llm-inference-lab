@@ -2,9 +2,17 @@
 Unit tests for K controllers.
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 
-from src.specdec.controllers import (
+# Add src to path for imports
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+SRC_DIR = PROJECT_ROOT / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+from specdec.policies.controllers import (
     AdaptiveKController,
     FixedKController,
     create_controller,

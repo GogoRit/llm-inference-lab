@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from kernels import get_kernel_info
-from specdec.pipeline import SpeculativePipeline
+from specdec import SpeculativePipeline
 
 
 def cmd_bench(args: argparse.Namespace) -> int:

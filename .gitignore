@@ -235,3 +235,8 @@ docker-compose.override.yml
 local/
 dev/
 debug/
+
+# Linter and formatter config files (not needed in repo)
+.flake8
+.setup.cfg
+.pylintrc

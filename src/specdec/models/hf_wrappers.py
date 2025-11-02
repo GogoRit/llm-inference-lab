@@ -12,8 +12,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .interfaces import LanguageModel
-from .kv_types import KVCache
+from ..cache.kv_types import KVCache
+from ..utils.interfaces import LanguageModel
 
 
 class HFWrapper(LanguageModel):

@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from .interfaces import LanguageModel
+from ..utils.interfaces import LanguageModel
 
 
 class FakeLM(LanguageModel):

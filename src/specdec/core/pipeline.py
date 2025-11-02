@@ -18,87 +18,19 @@ import psutil
 import torch
 import yaml
 
-from .controllers import KController, create_controller
-from .deterministic import ensure_deterministic
-from .fake_lm import create_fake_lm
-from .hf_wrappers import create_tiny_hf_wrapper
-from .interfaces import LanguageModel, SpeculativeDecoder
-from .policies import AcceptancePolicy, create_policy
+from ..cache.kv_cache_manager import SafeKVCacheManager
+from ..models.fake_lm import create_fake_lm
+from ..models.hf_wrappers import create_tiny_hf_wrapper
+from ..policies.controllers import KController, create_controller
+from ..policies.policies import AcceptancePolicy, create_policy
+from ..utils.deterministic import ensure_deterministic
+from ..utils.interfaces import LanguageModel, SpeculativeDecoder
+from ..utils.token_validation import get_vocab_size, validate_and_clamp_tokens
 
 logger = logging.getLogger(__name__)
 
 
-def filter_kv_cache_safe(
-    cache: torch.Tensor, active_indices, name: str = "base"
-) -> Optional[torch.Tensor]:
-    """
-    Safely filter KV cache tensor by active_indices on CUDA without device asserts.
-
-    This function validates and clips active_indices before indexing, preventing
-    CUDA device-side assertion failures. It ensures indices are:
-    - Within bounds of cache batch dimension
-    - On the same device as cache
-    - Valid before any indexing operation
-
-    Args:
-        cache: KV cache tensor with shape [batch, ...]
-        active_indices: List or tensor of active sequence indices
-        name: Name identifier for logging (e.g., "draft" or "base")
-
-    Returns:
-        Filtered cache tensor or None if filtering fails
-    """
-    if cache is None:
-        return None
-
-    cache_batch = cache.shape[0]
-
-    # Convert active_indices to tensor if needed, ensure correct device
-    if not isinstance(active_indices, torch.Tensor):
-        active_indices_tensor = torch.tensor(
-            active_indices, dtype=torch.long, device=cache.device
-        )
-    else:
-        active_indices_tensor = active_indices.to(cache.device, non_blocking=True)
-
-    # Clip invalid indices
-    valid_mask = active_indices_tensor < cache_batch
-    if not torch.all(valid_mask):
-        invalid_count = (~valid_mask).sum().item()
-        logger.warning(
-            "[%s KV] Clipped %d invalid indices in %s (max valid=%d)",
-            name.upper(),
-            invalid_count,
-            name,
-            cache_batch - 1,
-        )
-        print(
-            "[WARNING] Clipped {} invalid indices in {} KV cache".format(
-                invalid_count, name
-            ),
-            flush=True,
-        )
-        active_indices_tensor = active_indices_tensor[valid_mask]
-
-    if active_indices_tensor.numel() == 0:
-        logger.warning("[%s KV] No valid active indices after clipping", name.upper())
-        return None
-
-    # Safe indexing with try/except
-    try:
-        filtered_cache = cache.index_select(0, active_indices_tensor)
-        num_valid = len(active_indices_tensor)
-        logger.debug(
-            "[%s KV] Safe-filtered %s KV cache: kept %d/%d",
-            name.upper(),
-            name,
-            num_valid,
-            cache_batch,
-        )
-        return filtered_cache
-    except RuntimeError as e:
-        logger.error("[%s KV] Cache filtering failed: %s", name.upper(), e)
-        return None
+# filter_kv_cache_safe removed - use SafeKVCacheManager instead
 
 
 # Import optimization modules (conditional to avoid import errors during development)
@@ -238,34 +170,17 @@ class SpeculativePipeline(SpeculativeDecoder):
             enable_profiling=False,
         )
 
-        # Phase 3D: CUDA graph capture setup
-        # NOTE: CUDA graphs disabled by default for dynamic speculative decoding loops
-        # (shapes change each step, causing "offset increment outside graph capture" errors)
-        # Enable only for static inference patterns via SPECDEC_CUDA_GRAPH=1
-        self.enable_cuda_graph = (
-            os.getenv("SPECDEC_CUDA_GRAPH", "0").lower() in ("1", "true", "yes")
-            and self.device == "cuda"
-            and torch.cuda.is_available()
-        )
-        # Force disable for speculative decoding (dynamic shapes)
-        if self.enable_cuda_graph:
-            logger.warning(
-                "CUDA graph capture requested but disabled for dynamic loops. "
-                "Use eager mode (SPECDEC_CUDA_GRAPH=0) for speculative decoding."
-            )
-            self.enable_cuda_graph = False
-        self.cuda_graph = None
-        self.cuda_graph_warmup_steps = 3  # Warmup steps before capture
+        # Initialize centralized KV cache manager
+        self.kv_cache_manager = SafeKVCacheManager(device=str(self.device))
+
+        # CUDA graph capture removed - incompatible with dynamic speculative decoding
+        # Set attributes to False to prevent AttributeError in generate()
+        self.enable_cuda_graph = False
+        self.cuda_graph_warmup_steps = 0
         self.cuda_graph_warmup_done = False
         self.cuda_graph_captured = False
         self.graph_input_tensor = None
-        self.graph_output_tokens = None
-        self.graph_output_logits = None
-        self.graph_outputs = None
-
-        logger.debug(
-            "CUDA graph capture disabled (required for dynamic speculative decoding)"
-        )
+        # Use CUDA streams for parallelization instead
 
         # Set deterministic flags
         self.deterministic = self.config.get("deterministic", False)
@@ -821,159 +736,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         return draft_tokens, draft_logits, draft_info
 
-    def _attempt_cuda_graph_capture(
-        self,
-        base_model,
-        input_ids: torch.Tensor,
-        k: int,
-        temperature: float,
-        do_sample: bool,
-        **kwargs: Any,
-    ) -> bool:
-        """
-        Attempt CUDA graph capture for verification step (Phase 3D).
-
-        Captures the base model forward pass if shapes are stable.
-        Falls back to eager mode if capture fails.
-
-        Args:
-            base_model: Base language model
-            input_ids: Input token IDs
-            k: Number of tokens to generate (must be stable)
-            temperature: Sampling temperature
-            do_sample: Whether to use sampling
-            **kwargs: Additional generation parameters
-
-        Returns:
-            True if capture succeeded, False otherwise
-        """
-        if not self.enable_cuda_graph or not torch.cuda.is_available():
-            return False
-
-        if self.cuda_graph_captured:
-            return True  # Already captured
-
-        try:
-            # Create static dummy inputs for capture
-            # Note: CUDA graphs require fixed shapes
-            batch_size = input_ids.shape[0]
-            seq_len = input_ids.shape[1]
-
-            # Create static input tensors
-            static_input_ids = torch.zeros(
-                (batch_size, seq_len),
-                dtype=torch.long,
-                device=input_ids.device,
-            )
-
-            # Create static input tensor (will be modified in-place during replay)
-            self.graph_input_tensor = static_input_ids.clone()  # type: ignore[assignment]
-            self.graph_k = k
-            self.graph_temperature = temperature
-            self.graph_do_sample = do_sample
-            self.graph_kwargs = kwargs
-
-            # Create dummy outputs for graph
-            vocab_size = (
-                base_model._tokenizer.vocab_size
-                if hasattr(base_model, "_tokenizer")
-                else 50257
-            )
-            graph_output_tokens = torch.zeros(
-                (batch_size, k), dtype=torch.long, device=input_ids.device
-            )
-            graph_output_logits = torch.zeros(
-                (batch_size, k, vocab_size), device=input_ids.device
-            )
-            self.graph_output_tokens = graph_output_tokens  # type: ignore[assignment]
-            self.graph_output_logits = graph_output_logits  # type: ignore[assignment]
-            self.graph_outputs = (graph_output_tokens, graph_output_logits)  # type: ignore[assignment]
-
-            # Warmup run (not captured)
-            with torch.cuda.stream(torch.cuda.Stream()):
-                _ = base_model.generate_tokens(
-                    static_input_ids,
-                    max_new_tokens=k,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    **kwargs,
-                )
-            torch.cuda.synchronize()
-
-            # Attempt graph capture
-            cuda_graph = torch.cuda.CUDAGraph()
-            self.cuda_graph = cuda_graph  # type: ignore[assignment]
-            with torch.cuda.graph(cuda_graph):
-                out_tokens, out_logits = base_model.generate_tokens(
-                    self.graph_input_tensor,
-                    max_new_tokens=k,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    **kwargs,
-                )
-                # Capture outputs into pre-allocated tensors
-                assert (
-                    self.graph_output_tokens is not None
-                    and self.graph_output_logits is not None
-                )
-                self.graph_output_tokens.copy_(out_tokens)
-                self.graph_output_logits.copy_(out_logits)
-
-            self.cuda_graph_captured = True
-            logger.info(
-                f"CUDA graph captured successfully for K={k}, seq_len={seq_len}"
-            )
-            return True
-
-        except Exception as e:
-            # Fallback to eager mode
-            logger.warning(
-                f"CUDA graph capture failed, falling back to eager mode: {e}"
-            )
-            self.enable_cuda_graph = False
-            self.cuda_graph_captured = False
-            return False
-
-    def _replay_cuda_graph(
-        self, input_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Replay captured CUDA graph for verification step (Phase 3D).
-
-        Args:
-            input_ids: Input token IDs (must match captured shape)
-
-        Returns:
-            Tuple of (generated_tokens, logits)
-        """
-        if (
-            not self.cuda_graph_captured
-            or self.cuda_graph is None
-            or self.graph_input_tensor is None
-            or self.graph_outputs is None
-        ):
-            raise RuntimeError("CUDA graph not captured or not available")
-
-        # Update graph inputs with current input_ids
-        # Note: Must match captured shape exactly
-        if input_ids.shape != self.graph_input_tensor.shape:
-            # Shape changed, fallback to eager
-            logger.warning(
-                f"Input shape changed from {self.graph_input_tensor.shape} to "
-                f"{input_ids.shape}, falling back to eager mode"
-            )
-            self.enable_cuda_graph = False
-            self.cuda_graph_captured = False
-            raise RuntimeError("Input shape mismatch")
-
-        # Copy current input to graph input tensor (in-place modification)
-        self.graph_input_tensor.copy_(input_ids)
-
-        # Replay graph
-        self.cuda_graph.replay()
-
-        # Return outputs (already populated in graph_output_tokens/logits)
-        return self.graph_outputs
+    # CUDA graph capture methods removed - incompatible with dynamic speculative decoding
 
     def generate(
         self,
@@ -1021,6 +784,10 @@ class SpeculativePipeline(SpeculativeDecoder):
             "kv_appended_tokens_total": 0,
             "kv_append_time_ms": 0.0,
         }
+
+        # Reset KV cache manager
+        self.kv_cache_manager.reset()
+        self.kv_cache_manager.set_batch_size(1)  # Single prompt
 
         # Clear KV cache at start of new generation
         if hasattr(self.base_lm, "clear_kv_cache"):
@@ -1128,107 +895,45 @@ class SpeculativePipeline(SpeculativeDecoder):
                 )
 
                 # Step 2: Verify with base model using scheduler
-                # Phase 3D: Attempt CUDA graph capture after warmup
-                if (
-                    self.enable_cuda_graph
-                    and step > self.cuda_graph_warmup_steps
-                    and not self.cuda_graph_warmup_done
-                ):
-                    self.cuda_graph_warmup_done = True
-                    self._attempt_cuda_graph_capture(
-                        self.base_lm,
-                        current_input,
-                        k,
-                        temperature,
-                        do_sample,
-                        **kwargs,
+                # CUDA graph capture removed - incompatible with dynamic speculative decoding
+                # All paths use standard verification now
+
+                # Single validation point before model call
+                base_vocab_size = get_vocab_size(self.base_lm)
+                if base_vocab_size is not None:
+                    current_input = validate_and_clamp_tokens(
+                        current_input, base_vocab_size, "base_input"
                     )
 
-                # Phase 3D: Use CUDA graph replay if captured and shapes match
-                use_graph = (
-                    self.enable_cuda_graph
-                    and self.cuda_graph_captured
-                    and self.graph_input_tensor is not None
-                    and current_input.shape == self.graph_input_tensor.shape
-                )
+                # Removed unnecessary sync - CUDA events handle synchronization
 
-                if use_graph:
-                    try:
-                        verify_start = time.time()
-                        base_tokens, base_logits = self._replay_cuda_graph(
-                            current_input
-                        )
-                        verify_time_ms = (time.time() - verify_start) * 1000
-                        verify_info = {
-                            "verification_time_ms": verify_time_ms,
-                            "method": "cuda_graph",
-                        }
-                    except Exception as e:
-                        # Graph replay failed, fallback to scheduler
-                        logger.debug(f"CUDA graph replay failed, using scheduler: {e}")
-                        use_graph = False
-
-                if not use_graph:
-                    # CRITICAL: Validate tokens before model forward pass
-                    # This prevents invalid token indices from crashing CUDA kernels
-                    if hasattr(self.base_lm, "_model") and hasattr(
-                        self.base_lm._model, "config"
-                    ):
-                        vocab_size = getattr(
-                            self.base_lm._model.config, "vocab_size", None
-                        )
-                        if vocab_size is not None:
-                            if (current_input >= vocab_size).any():
-                                # Get max safely - move to CPU first to avoid CUDA errors
-                                try:
-                                    max_token = current_input.cpu().max().item()
-                                except Exception:
-                                    max_token = vocab_size  # Assume worst case
-                                logger.error(
-                                    "[BASE] Invalid token index detected: %d >= %d",
-                                    max_token,
-                                    vocab_size,
-                                )
-                                # Clamp invalid tokens to valid range
-                                current_input = current_input.clamp(max=vocab_size - 1)
-                                print(
-                                    "[WARNING] Clamped base input tokens to valid range [0, {}]".format(
-                                        vocab_size - 1
-                                    ),
-                                    flush=True,
-                                )
-
-                    # GPU sync before verification to ensure async kernels report errors correctly
-                    if self.device == "cuda" and torch.cuda.is_available():
-                        torch.cuda.synchronize()
-
-                    # Use scheduler or direct call
-                    if self.scheduler:
-                        base_tokens, base_logits, verify_info = (
-                            self.scheduler.schedule_verification(
-                                self.base_lm,
-                                draft_tokens,
-                                current_input,
-                                temperature=temperature,
-                                do_sample=do_sample,
-                                **kwargs,
-                            )
-                        )
-                        verify_time_ms = verify_info.get("verification_time_ms", 0.0)
-                    else:
-                        verify_start = time.time()
-                        base_tokens, base_logits = self.base_lm.generate_tokens(
+                # Use scheduler or direct call
+                if self.scheduler:
+                    base_tokens, base_logits, verify_info = (
+                        self.scheduler.schedule_verification(
+                            self.base_lm,
+                            draft_tokens,
                             current_input,
-                            max_new_tokens=k,
                             temperature=temperature,
                             do_sample=do_sample,
                             **kwargs,
                         )
-                        verify_time_ms = (time.time() - verify_start) * 1000
-                        verify_info = {
-                            "verification_time_ms": verify_time_ms,
-                            "method": "eager",
-                        }
+                    )
+                    verify_time_ms = verify_info.get("verification_time_ms", 0.0)
+                else:
+                    verify_start = time.time()
+                    base_tokens, base_logits = self.base_lm.generate_tokens(
+                        current_input,
+                        max_new_tokens=k,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        **kwargs,
+                    )
+                    verify_time_ms = (time.time() - verify_start) * 1000
+                    verify_info = {
+                        "verification_time_ms": verify_time_ms,
+                        "method": "eager",
+                    }
 
                 # Step 3: Apply acceptance policy
                 if self.scheduler:
@@ -1753,16 +1458,12 @@ class SpeculativePipeline(SpeculativeDecoder):
         )
         kv_cache_enabled = kv_cache_enabled_env and kv_cache_supported
 
-        # Initialize batched KV cache dictionaries if enabled
-        base_kv_cache: Optional[Dict[int, List[torch.Tensor]]] = None
-        draft_kv_cache: Optional[Dict[int, List[torch.Tensor]]] = None
+        # KV cache now managed by SafeKVCacheManager - no manual dictionaries
         if kv_cache_enabled:
             print(
-                "[BATCH] KV cache append enabled - initializing batched KV cache",
+                "[BATCH] KV cache append enabled - using SafeKVCacheManager",
                 flush=True,
             )
-            base_kv_cache = {}  # Will be populated after first forward pass
-            draft_kv_cache = {}  # Will be populated after first forward pass
         else:
             if kv_cache_enabled_env and not kv_cache_supported:
                 print(
@@ -1863,48 +1564,33 @@ class SpeculativePipeline(SpeculativeDecoder):
                 if not active_indices:
                     break
 
-                # Debug: log loop entry
-                print(
-                    f"[DEBUG] Step {step} entry - active_count={len(active_indices)}, "
-                    f"K={k}, max_tokens={max_tokens}",
-                    flush=True,
+                # Update KV cache manager with active indices
+                # Use relative indices (0 to len-1) for KV cache, not absolute batch indices
+                relative_indices = list(range(len(active_indices)))
+                self.kv_cache_manager.set_active_indices(relative_indices)
+                active_indices_tensor = torch.tensor(
+                    active_indices, dtype=torch.long, device=self.device
+                )
+                relative_indices_tensor = torch.tensor(
+                    relative_indices, dtype=torch.long, device=self.device
                 )
 
                 # Create batched input for active prompts only
-                # Handle variable-length sequences by padding to max length
                 active_seqs = [current_input_ids[i] for i in active_indices]
                 if len(active_seqs) == 0:
                     break
 
-                # CRITICAL: Validate all sequences BEFORE padding/stacking
-                # This prevents invalid tokens from previous steps from corrupting the batch
-                if hasattr(self.base_lm, "_model") and hasattr(
-                    self.base_lm._model, "config"
-                ):
-                    vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
-                    if vocab_size is not None:
-                        for i, seq in enumerate(active_seqs):
-                            if (seq >= vocab_size).any() or (seq < 0).any():
-                                # Get min/max safely - move to CPU first to avoid CUDA errors
-                                try:
-                                    max_token = seq.cpu().max().item()
-                                    min_token = seq.cpu().min().item()
-                                except Exception:
-                                    max_token = vocab_size  # Assume worst case
-                                    min_token = -1
-                                invalid_count = (
-                                    ((seq >= vocab_size) | (seq < 0)).sum().item()
-                                )
-                                print(
-                                    f"[CRITICAL ERROR] Step {step}, seq {i}: "
-                                    f"Invalid tokens in sequence BEFORE padding! "
-                                    f"min={min_token}, max={max_token}, vocab={vocab_size}, "
-                                    f"invalid={invalid_count}/{seq.numel()}\n"
-                                    f"This indicates corruption from previous step - clamping!",
-                                    flush=True,
-                                )
-                                # Clamp to valid range - this prevents crash
-                                active_seqs[i] = seq.clamp(min=0, max=vocab_size - 1)
+                # Single centralized validation point - efficient GPU operation
+                # Note: We validate before padding since sequences may have different lengths
+                # Validation happens on individual sequences (already on GPU) to avoid padding overhead
+                vocab_size = get_vocab_size(self.base_lm)
+                if vocab_size is not None and len(active_seqs) > 0:
+                    # Validate each sequence in-place on GPU (minimal CPU overhead)
+                    # This is more efficient than padding first then validating
+                    for i, seq in enumerate(active_seqs):
+                        active_seqs[i] = validate_and_clamp_tokens(
+                            seq, vocab_size, f"seq_{i}"
+                        )
 
                 # Find max sequence length in active batch (optimized: single pass)
                 original_lengths = []
@@ -1914,49 +1600,23 @@ class SpeculativePipeline(SpeculativeDecoder):
                     original_lengths.append(seq_len)
                     max_seq_len = max(max_seq_len, seq_len)
 
-                # Pad all sequences to max length for batching (optimized: pre-allocate)
-                # CRITICAL: Validate pad_value is within vocab_size before using it
-                vocab_size = None
-                if hasattr(self.base_lm, "_model") and hasattr(
-                    self.base_lm._model, "config"
-                ):
-                    vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
-
+                # Pad all sequences to max length for batching
+                vocab_size = get_vocab_size(self.base_lm)
                 pad_value = (
                     tokenizer.pad_token_id
                     if tokenizer is not None and tokenizer.pad_token_id is not None
                     else 0
                 )
+                # Ensure pad_value is valid
+                if vocab_size is not None and (
+                    pad_value >= vocab_size or pad_value < 0
+                ):
+                    pad_value = 0 if vocab_size > 0 else 0
 
-                # Validate pad_value is within vocabulary
-                if vocab_size is not None:
-                    if pad_value >= vocab_size or pad_value < 0:
-                        # Try eos_token_id as fallback
-                        eos_id = (
-                            tokenizer.eos_token_id
-                            if tokenizer is not None
-                            and tokenizer.eos_token_id is not None
-                            else None
-                        )
-                        if eos_id is not None and 0 <= eos_id < vocab_size:
-                            pad_value = eos_id
-                        else:
-                            # Final fallback: use a safe value (usually 0 is valid, but validate)
-                            pad_value = 0
-                            if pad_value >= vocab_size:
-                                # Last resort: use vocab_size - 1 (but this is wrong, just prevent crash)
-                                pad_value = vocab_size - 1
-                                print(
-                                    f"[WARNING] Step {step}: pad_value invalid, using {pad_value} "
-                                    f"(should never happen - vocab issue)",
-                                    flush=True,
-                                )
-
-                # Pre-allocate list to avoid repeated appends
+                # Pad sequences efficiently
                 padded_seqs: List[Optional[torch.Tensor]] = [None] * len(active_seqs)
                 for i, seq in enumerate(active_seqs):
                     if seq.shape[0] < max_seq_len:
-                        # Pad with validated pad_token_id
                         pad_length = max_seq_len - seq.shape[0]
                         padding = torch.full(
                             (pad_length,),
@@ -1965,47 +1625,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                             device=seq.device,
                         )
                         seq_padded = torch.cat([seq, padding], dim=0)
-
-                        # CRITICAL: Validate immediately after padding
-                        if vocab_size is not None:
-                            if (seq_padded >= vocab_size).any() or (
-                                seq_padded < 0
-                            ).any():
-                                # Get min/max safely - move to CPU first to avoid CUDA errors
-                                try:
-                                    max_val = seq_padded.cpu().max().item()
-                                    min_val = seq_padded.cpu().min().item()
-                                except Exception:
-                                    max_val = vocab_size  # Assume worst case
-                                    min_val = -1
-                                print(
-                                    f"[ERROR] Step {step}, seq {i}: Invalid tokens after padding! "
-                                    f"min={min_val}, max={max_val}, vocab={vocab_size}, pad_value={pad_value}",
-                                    flush=True,
-                                )
-                                # Clamp to valid range
-                                seq_padded = seq_padded.clamp(min=0, max=vocab_size - 1)
-
                         padded_seqs[i] = seq_padded
                     else:
-                        # Sequence doesn't need padding - but still validate it!
-                        if vocab_size is not None:
-                            if (seq >= vocab_size).any() or (seq < 0).any():
-                                # Get min/max safely - move to CPU first to avoid CUDA errors
-                                try:
-                                    max_val = seq.cpu().max().item()
-                                    min_val = seq.cpu().min().item()
-                                except Exception:
-                                    max_val = vocab_size  # Assume worst case
-                                    min_val = -1
-                                print(
-                                    f"[ERROR] Step {step}, seq {i}: "
-                                    f"Invalid tokens in unpadded sequence! "
-                                    f"min={min_val}, max={max_val}, vocab={vocab_size}",
-                                    flush=True,
-                                )
-                                # Clamp to valid range
-                                seq = seq.clamp(min=0, max=vocab_size - 1)
                         padded_seqs[i] = seq
 
                 # Stack into batch tensor
@@ -2013,41 +1634,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                     padded_seqs, dim=0
                 )  # [active_count, max_seq_len]
 
-                # CRITICAL: Validate all input IDs before creating attention mask
-                # This catches any invalid tokens that may have been introduced during padding/concatenation
-                if hasattr(self.base_lm, "_model") and hasattr(
-                    self.base_lm._model, "config"
-                ):
-                    vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
-                    if vocab_size is not None:
-                        if (active_input_ids >= vocab_size).any() or (
-                            active_input_ids < 0
-                        ).any():
-                            # Get min/max safely - move to CPU first to avoid CUDA errors
-                            try:
-                                max_token = active_input_ids.cpu().max().item()
-                                min_token = active_input_ids.cpu().min().item()
-                            except Exception:
-                                max_token = vocab_size  # Assume worst case
-                                min_token = -1
-                            invalid_count = (
-                                (
-                                    (active_input_ids >= vocab_size)
-                                    | (active_input_ids < 0)
-                                )
-                                .sum()
-                                .item()
-                            )
-                            print(
-                                f"[ERROR] Step {step}: Invalid tokens in active_input_ids before attention mask: "
-                                f"min={min_token}, max={max_token}, vocab={vocab_size}, "
-                                f"invalid_count={invalid_count}/{active_input_ids.numel()}",
-                                flush=True,
-                            )
-                            # Clamp to valid range
-                            active_input_ids = active_input_ids.clamp(
-                                min=0, max=vocab_size - 1
-                            )
+                # Single final validation - efficient GPU operation
+                if vocab_size is not None:
+                    active_input_ids = validate_and_clamp_tokens(
+                        active_input_ids, vocab_size, "batch_input"
+                    )
 
                 # Create attention mask to ignore padding tokens
                 active_attention_mask = torch.ones(
@@ -2127,198 +1718,20 @@ class SpeculativePipeline(SpeculativeDecoder):
                     max(temperature / 1.5, 0.1) if temperature is not None else 0.7
                 )
 
-                # Prepare past_key_values for draft model if KV cache is enabled
-                # CRITICAL: Filter to only active sequences before passing to model
-                # CRITICAL: Validate active_indices to prevent CUDA device-side asserts
+                # Prepare past_key_values for draft model using centralized KV cache manager
                 draft_past_kv = None
-                if kv_cache_enabled and draft_kv_cache is not None:
-                    # Convert dict format to tuple format expected by model
-                    # Filter cache to only active sequences based on active_indices
-                    if len(draft_kv_cache) > 0:
-                        # Check if cache batch dimension matches active_count
-                        first_layer_idx = sorted(draft_kv_cache.keys())[0]
-                        cache_batch_dim = draft_kv_cache[first_layer_idx][0].shape[0]
-
-                        if cache_batch_dim != active_count:
-                            # Filter cache to match active sequences
-                            # If cache has full batch_size, select active_indices
-                            # Otherwise, assume cache already filtered (should match active_count)
-                            if cache_batch_dim == batch_size:
-                                # CRITICAL: Use safe filtering function (runs before CUDA graph capture)
-                                # This ensures validation happens every iteration, not just first one
-                                try:
-                                    # Filter each layer using safe function
-                                    filtered_layers = []
-                                    for i in sorted(draft_kv_cache.keys()):
-                                        k_filtered = filter_kv_cache_safe(
-                                            draft_kv_cache[i][0],
-                                            active_indices,
-                                            name="draft",
-                                        )
-                                        v_filtered = filter_kv_cache_safe(
-                                            draft_kv_cache[i][1],
-                                            active_indices,
-                                            name="draft",
-                                        )
-                                        if k_filtered is None or v_filtered is None:
-                                            # Filtering failed for this layer - skip KV cache
-                                            print(
-                                                "[WARNING] Step {}: Draft KV cache filtering failed for layer {}, "
-                                                "skipping KV cache".format(step, i),
-                                                flush=True,
-                                            )
-                                            draft_past_kv = None
-                                            break
-                                        filtered_layers.append((k_filtered, v_filtered))
-
-                                    if draft_past_kv is None:
-                                        # One of the layers failed - already set to None
-                                        pass
-                                    else:
-                                        # All layers filtered successfully
-                                        draft_past_kv = tuple(filtered_layers)
-                                except Exception as e:
-                                    print(
-                                        "[WARNING] Step {}: Draft KV cache safe filtering exception: {}. "
-                                        "Skipping KV cache.".format(step, e),
-                                        flush=True,
-                                    )
-                                    draft_past_kv = None
-                            else:
-                                # Cache mismatch - log warning and skip KV cache for this step
-                                print(
-                                    "[WARNING] Step {}: Draft KV cache batch dim mismatch: "
-                                    "cache={}, active={}".format(
-                                        step, cache_batch_dim, active_count
-                                    ),
-                                    flush=True,
-                                )
-                                draft_past_kv = None
-                        else:
-                            # Cache batch dimension matches active_count - use directly
-                            draft_past_kv = tuple(
-                                (draft_kv_cache[i][0], draft_kv_cache[i][1])
-                                for i in sorted(draft_kv_cache.keys())
-                            )
-
-                    # CRITICAL: Validate tokens before model forward pass
-                    # This prevents invalid token indices from crashing CUDA kernels
-                    if hasattr(self.draft_lm, "_model") and hasattr(
-                        self.draft_lm._model, "config"
-                    ):
-                        vocab_size = getattr(
-                            self.draft_lm._model.config, "vocab_size", None
-                        )
-                        if vocab_size is not None:
-                            # Check both >= vocab_size and < 0
-                            if (active_input_ids >= vocab_size).any() or (
-                                active_input_ids < 0
-                            ).any():
-                                # Get min/max safely - move to CPU first to avoid CUDA errors
-                                try:
-                                    max_token = active_input_ids.cpu().max().item()
-                                    min_token = active_input_ids.cpu().min().item()
-                                except Exception:
-                                    max_token = vocab_size  # Assume worst case
-                                    min_token = -1
-                                invalid_count = (
-                                    (
-                                        (active_input_ids >= vocab_size)
-                                        | (active_input_ids < 0)
-                                    )
-                                    .sum()
-                                    .item()
-                                )
-                                logger.error(
-                                    "[DRAFT] Invalid token index detected: min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
-                                    min_token,
-                                    max_token,
-                                    vocab_size,
-                                    invalid_count,
-                                    active_input_ids.numel(),
-                                )
-                                print(
-                                    "[ERROR] Step {}: Invalid tokens in active_input_ids before draft model: "
-                                    "min={}, max={}, vocab={}, invalid={}/{}".format(
-                                        step,
-                                        min_token,
-                                        max_token,
-                                        vocab_size,
-                                        invalid_count,
-                                        active_input_ids.numel(),
-                                    ),
-                                    flush=True,
-                                )
-                                # Clamp invalid tokens to valid range
-                                active_input_ids = active_input_ids.clamp(
-                                    min=0, max=vocab_size - 1
-                                )
-                                print(
-                                    "[WARNING] Step {}: Clamped draft input tokens to valid range [0, {}]".format(
-                                        step, vocab_size - 1
-                                    ),
-                                    flush=True,
-                                )
-
-                # CRITICAL: Device synchronization before graph capture/replay
-                if self.device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize()
-
-                # CRITICAL: Final validation IMMEDIATELY before draft model call
-                # This is the absolute last check before tokens reach embedding layer
-                if hasattr(self.draft_lm, "_model") and hasattr(
-                    self.draft_lm._model, "config"
-                ):
-                    vocab_size = getattr(
-                        self.draft_lm._model.config, "vocab_size", None
+                if kv_cache_enabled:
+                    # Use relative indices for KV cache retrieval (0 to active_count-1)
+                    draft_past_kv = self.kv_cache_manager.get_draft_past_kv(
+                        relative_indices_tensor
                     )
-                    if vocab_size is not None:
-                        # Check for invalid tokens using safe operations
-                        # Use .any() checks first to avoid calling .min()/.max() on corrupted tensors
-                        has_invalid = (active_input_ids >= vocab_size).any() or (
-                            active_input_ids < 0
-                        ).any()
-                        if has_invalid:
-                            # Calculate invalid count safely
-                            invalid_count = (
-                                (
-                                    (active_input_ids >= vocab_size)
-                                    | (active_input_ids < 0)
-                                )
-                                .sum()
-                                .item()
-                            )
 
-                            # Get min/max safely - move to CPU first to avoid CUDA errors
-                            try:
-                                max_token = active_input_ids.cpu().max().item()
-                                min_token = active_input_ids.cpu().min().item()
-                            except Exception as cpu_err:
-                                # If even CPU fails, tensor is severely corrupted
-                                print(
-                                    f"[CRITICAL ERROR] Step {step}: Cannot read tensor values! "
-                                    f"Error: {cpu_err}",
-                                    flush=True,
-                                )
-                                max_token = vocab_size  # Assume worst case
-                                min_token = -1
-
-                            print(
-                                "[CRITICAL ERROR] Step {}: Invalid tokens IMMEDIATELY before draft model! "
-                                "min={}, max={}, vocab={}, invalid={}/{}".format(
-                                    step,
-                                    min_token,
-                                    max_token,
-                                    vocab_size,
-                                    invalid_count,
-                                    active_input_ids.numel(),
-                                ),
-                                flush=True,
-                            )
-                            # Force clamp to prevent crash - do this BEFORE any other operations
-                            active_input_ids = active_input_ids.clamp(
-                                min=0, max=vocab_size - 1
-                            )
+                # Single validation point (already done above, but double-check before model call)
+                draft_vocab_size = get_vocab_size(self.draft_lm)
+                if draft_vocab_size is not None:
+                    active_input_ids = validate_and_clamp_tokens(
+                        active_input_ids, draft_vocab_size, "draft_input"
+                    )
 
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
@@ -2358,20 +1771,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                         **kwargs,
                     )
 
-                # Extract and update draft KV cache if enabled
-                # CRITICAL: Filter KV cache operations to only active sequences
-                if kv_cache_enabled and draft_kv_cache is not None:
-                    # Early exit if no active sequences (shouldn't happen, but safety check)
-                    if active_count == 0:
-                        print(
-                            "[WARNING] Step {}: active_count=0, skipping KV cache update".format(
-                                step
-                            ),
-                            flush=True,
-                        )
-                        break
-
-                    # Get KV cache from draft model - check both _last_generated_kv and _last_generated_kv_raw
+                # Update draft KV cache using centralized manager
+                if kv_cache_enabled and active_count > 0:
+                    # Get KV cache from draft model
                     draft_new_kv = None
                     if (
                         hasattr(self.draft_lm, "_last_generated_kv_raw")
@@ -2382,7 +1784,6 @@ class SpeculativePipeline(SpeculativeDecoder):
                         hasattr(self.draft_lm, "_last_generated_kv")
                         and self.draft_lm._last_generated_kv is not None
                     ):
-                        # Extract from KVCache wrapper if it exists
                         if hasattr(self.draft_lm._last_generated_kv, "past_key_values"):
                             draft_new_kv = (
                                 self.draft_lm._last_generated_kv.past_key_values
@@ -2390,120 +1791,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                         else:
                             draft_new_kv = self.draft_lm._last_generated_kv
 
+                    # Update using centralized manager (handles batch dimension tracking)
                     if draft_new_kv is not None:
-                        # Convert to list of (key, value) tuples if needed
                         if isinstance(draft_new_kv, tuple):
-                            kv_list = draft_new_kv
+                            self.kv_cache_manager.update_draft_cache(draft_new_kv)
                         else:
-                            kv_list = draft_new_kv
-
-                        if len(draft_kv_cache) == 0:
-                            # Initialize KV cache dict from model output (only active sequences)
-                            # kv_list contains tensors with shape [active_count, ...]
-                            for i, (k_new, v_new) in enumerate(kv_list):
-                                # Store with active_count batch dimension initially
-                                draft_kv_cache[i] = [
-                                    k_new.detach().contiguous(),  # [active_count, ...]
-                                    v_new.detach().contiguous(),  # [active_count, ...]
-                                ]
-                        else:
-                            # Append new KV cache to existing (only for active sequences)
-                            # CRITICAL: Both existing and new cache must have batch dimension = active_count
-                            for i, (k_new, v_new) in enumerate(kv_list):
-                                # Verify new cache has correct batch dimension
-                                if k_new.shape[0] != active_count:
-                                    print(
-                                        "[ERROR] Step {}: Draft new KV cache batch mismatch: "
-                                        "expected={}, got={}".format(
-                                            step, active_count, k_new.shape[0]
-                                        ),
-                                        flush=True,
-                                    )
-                                    continue  # Skip this layer
-
-                                if i in draft_kv_cache:
-                                    existing_k = draft_kv_cache[i][
-                                        0
-                                    ]  # [active_count, ...]
-                                    existing_v = draft_kv_cache[i][
-                                        1
-                                    ]  # [active_count, ...]
-
-                                    # CRITICAL: Use safe filtering if batch dimension mismatch
-                                    # This handles cases where cache has full batch_size but active_count is smaller
-                                    if existing_k.shape[0] != active_count:
-                                        # Cache has wrong batch dimension - try safe filtering first
-                                        if existing_k.shape[0] == batch_size:
-                                            # Cache has full batch - filter to active sequences
-                                            active_indices_tensor = torch.tensor(
-                                                active_indices,
-                                                dtype=torch.long,
-                                                device=existing_k.device,
-                                            )
-                                            k_filtered = filter_kv_cache_safe(
-                                                existing_k,
-                                                active_indices_tensor,
-                                                name="draft",
-                                            )
-                                            v_filtered = filter_kv_cache_safe(
-                                                existing_v,
-                                                active_indices_tensor,
-                                                name="draft",
-                                            )
-                                            if (
-                                                k_filtered is not None
-                                                and v_filtered is not None
-                                            ):
-                                                # Safe filtering succeeded - use filtered cache
-                                                existing_k = k_filtered
-                                                existing_v = v_filtered
-                                            else:
-                                                # Safe filtering failed - reinitialize with new cache
-                                                print(
-                                                    "[WARNING] Step {}: Draft KV cache safe filtering failed - "
-                                                    "reinitializing cache.".format(
-                                                        step
-                                                    ),
-                                                    flush=True,
-                                                )
-                                                draft_kv_cache[i] = [
-                                                    k_new.detach().contiguous(),
-                                                    v_new.detach().contiguous(),
-                                                ]
-                                                continue
-                                        else:
-                                            # Cache dimension doesn't match batch_size or active_count - reinitialize
-                                            print(
-                                                "[WARNING] Step {}: Draft KV cache batch mismatch - "
-                                                "existing={}, active={}, batch_size={}. Reinitializing cache.".format(
-                                                    step,
-                                                    existing_k.shape[0],
-                                                    active_count,
-                                                    batch_size,
-                                                ),
-                                                flush=True,
-                                            )
-                                            draft_kv_cache[i] = [
-                                                k_new.detach().contiguous(),
-                                                v_new.detach().contiguous(),
-                                            ]
-                                            continue
-
-                                    # Both have correct batch dimension - safe to concatenate
-                                    draft_kv_cache[i][0] = torch.cat(
-                                        [existing_k, k_new.detach().contiguous()],
-                                        dim=-2,
-                                    )
-                                    draft_kv_cache[i][1] = torch.cat(
-                                        [existing_v, v_new.detach().contiguous()],
-                                        dim=-2,
-                                    )
-                                else:
-                                    # New layer - initialize
-                                    draft_kv_cache[i] = [
-                                        k_new.detach().contiguous(),
-                                        v_new.detach().contiguous(),
-                                    ]
+                            # Convert to tuple if needed
+                            if len(draft_new_kv) > 0:
+                                self.kv_cache_manager.update_draft_cache(
+                                    tuple(draft_new_kv)
+                                )
 
                 # Validate draft outputs
                 if draft_tokens.numel() == 0 or draft_tokens.shape[1] == 0:
@@ -2618,85 +1915,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                         verify_time_ms = (time.time() - verify_start_wall) * 1000
                 elif verify_stream is not None and draft_stream is not None:
                     # Manual stream management if scheduler not available
-                    # Prepare past_key_values for base model if KV cache is enabled
-                    # CRITICAL: Use safe filtering function (runs before CUDA graph capture)
+                    # Prepare past_key_values for base model using centralized manager
                     base_past_kv = None
-                    if kv_cache_enabled and base_kv_cache is not None:
-                        # Convert dict format to tuple format expected by model
-                        if len(base_kv_cache) > 0:
-                            # Check cache batch dimension and validate if filtering needed
-                            first_layer_idx = sorted(base_kv_cache.keys())[0]
-                            cache_batch_dim = base_kv_cache[first_layer_idx][0].shape[0]
-
-                            if cache_batch_dim != active_count:
-                                # Need to filter - use safe function
-                                if cache_batch_dim == batch_size:
-                                    # CRITICAL: Use safe filtering function (runs before CUDA graph capture)
-                                    try:
-                                        # Filter each layer using safe function
-                                        filtered_layers = []
-                                        for i in sorted(base_kv_cache.keys()):
-                                            k_filtered = filter_kv_cache_safe(
-                                                base_kv_cache[i][0],
-                                                active_indices,
-                                                name="base",
-                                            )
-                                            v_filtered = filter_kv_cache_safe(
-                                                base_kv_cache[i][1],
-                                                active_indices,
-                                                name="base",
-                                            )
-                                            if k_filtered is None or v_filtered is None:
-                                                # Filtering failed for this layer - skip KV cache
-                                                print(
-                                                    "[WARNING] Step {}: Base KV cache filtering failed for layer {}, "
-                                                    "skipping KV cache".format(step, i),
-                                                    flush=True,
-                                                )
-                                                base_past_kv = None
-                                                break
-                                            filtered_layers.append(
-                                                (k_filtered, v_filtered)
-                                            )
-
-                                        if len(filtered_layers) > 0:
-                                            # All layers filtered successfully
-                                            base_past_kv = tuple(filtered_layers)
-                                        else:
-                                            # No layers filtered successfully
-                                            base_past_kv = None
-                                    except Exception as e:
-                                        print(
-                                            "[WARNING] Step {}: Base KV cache safe filtering exception: {}. "
-                                            "Skipping KV cache.".format(step, e),
-                                            flush=True,
-                                        )
-                                        base_past_kv = None
-                                else:
-                                    # Cache mismatch - skip KV cache
-                                    base_past_kv = None
-                            else:
-                                # Cache batch dimension matches active_count - use directly
-                                # CRITICAL: Reinitialize if batch mismatch detected
-                                if cache_batch_dim != active_count:
-                                    logger.warning(
-                                        "[BASE KV] Cache batch mismatch (%d vs %d) → reinitializing cache",
-                                        cache_batch_dim,
-                                        active_count,
-                                    )
-                                    print(
-                                        "[WARNING] Step {}: Base KV cache batch mismatch ({}) vs active ({}) "
-                                        "→ reinitializing cache".format(
-                                            step, cache_batch_dim, active_count
-                                        ),
-                                        flush=True,
-                                    )
-                                    base_past_kv = None
-                                else:
-                                    base_past_kv = tuple(
-                                        (base_kv_cache[i][0], base_kv_cache[i][1])
-                                        for i in sorted(base_kv_cache.keys())
-                                    )
+                    if kv_cache_enabled:
+                        # Use relative indices for KV cache retrieval (0 to active_count-1)
+                        base_past_kv = self.kv_cache_manager.get_base_past_kv(
+                            relative_indices_tensor
+                        )
 
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
@@ -2731,115 +1956,39 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if verify_end_event is not None:
                             verify_end_event.record(verify_stream)
 
-                    # Extract and update base KV cache if enabled
-                    # CRITICAL: Filter KV cache operations to only active sequences
-                    if kv_cache_enabled and base_kv_cache is not None:
-                        # Early exit if no active sequences (safety check)
-                        if active_count == 0:
-                            print(
-                                "[WARNING] Step {}: active_count=0, skipping base KV cache update".format(
-                                    step
-                                ),
-                                flush=True,
-                            )
-                        else:
-                            # Get KV cache from base model - check both _last_generated_kv and _last_generated_kv_raw
-                            base_new_kv = None
-                            if (
-                                hasattr(self.base_lm, "_last_generated_kv_raw")
-                                and self.base_lm._last_generated_kv_raw is not None
+                    # Update base KV cache using centralized manager
+                    if kv_cache_enabled and active_count > 0:
+                        # Get KV cache from base model
+                        base_new_kv = None
+                        if (
+                            hasattr(self.base_lm, "_last_generated_kv_raw")
+                            and self.base_lm._last_generated_kv_raw is not None
+                        ):
+                            base_new_kv = self.base_lm._last_generated_kv_raw
+                        elif (
+                            hasattr(self.base_lm, "_last_generated_kv")
+                            and self.base_lm._last_generated_kv is not None
+                        ):
+                            if hasattr(
+                                self.base_lm._last_generated_kv, "past_key_values"
                             ):
-                                base_new_kv = self.base_lm._last_generated_kv_raw
-                            elif (
-                                hasattr(self.base_lm, "_last_generated_kv")
-                                and self.base_lm._last_generated_kv is not None
-                            ):
-                                # Extract from KVCache wrapper if it exists
-                                if hasattr(
-                                    self.base_lm._last_generated_kv, "past_key_values"
-                                ):
-                                    base_new_kv = (
-                                        self.base_lm._last_generated_kv.past_key_values
+                                base_new_kv = (
+                                    self.base_lm._last_generated_kv.past_key_values
+                                )
+                            else:
+                                base_new_kv = self.base_lm._last_generated_kv
+
+                        # Update using centralized manager
+                        if base_new_kv is not None:
+                            if isinstance(base_new_kv, tuple):
+                                self.kv_cache_manager.update_base_cache(
+                                    base_new_kv, active_indices
+                                )
+                            else:
+                                if len(base_new_kv) > 0:
+                                    self.kv_cache_manager.update_base_cache(
+                                        tuple(base_new_kv), active_indices
                                     )
-                                else:
-                                    base_new_kv = self.base_lm._last_generated_kv
-
-                            if base_new_kv is not None:
-                                # Convert to list of (key, value) tuples if needed
-                                if isinstance(base_new_kv, tuple):
-                                    kv_list = base_new_kv
-                                else:
-                                    kv_list = base_new_kv
-
-                                if len(base_kv_cache) == 0:
-                                    # Initialize KV cache dict (only active sequences)
-                                    for i, (k_new, v_new) in enumerate(kv_list):
-                                        base_kv_cache[i] = [
-                                            k_new.detach().contiguous(),  # [active_count, ...]
-                                            v_new.detach().contiguous(),  # [active_count, ...]
-                                        ]
-                                else:
-                                    # Append new KV cache to existing (only for active sequences)
-                                    # CRITICAL: Both existing and new cache must have batch dimension = active_count
-                                    for i, (k_new, v_new) in enumerate(kv_list):
-                                        # Verify new cache has correct batch dimension
-                                        if k_new.shape[0] != active_count:
-                                            print(
-                                                "[ERROR] Step {}: Base new KV cache batch mismatch: "
-                                                "expected={}, got={}".format(
-                                                    step, active_count, k_new.shape[0]
-                                                ),
-                                                flush=True,
-                                            )
-                                            continue  # Skip this layer
-
-                                        if i in base_kv_cache:
-                                            existing_k = base_kv_cache[i][
-                                                0
-                                            ]  # [active_count, ...]
-                                            existing_v = base_kv_cache[i][
-                                                1
-                                            ]  # [active_count, ...]
-
-                                            # Verify shape compatibility
-                                            if existing_k.shape[0] != active_count:
-                                                # Cache has wrong batch dimension - reinitialize with new cache
-                                                print(
-                                                    "[WARNING] Step {}: Base KV cache batch mismatch - "
-                                                    "existing={}, active={}. Reinitializing cache.".format(
-                                                        step,
-                                                        existing_k.shape[0],
-                                                        active_count,
-                                                    ),
-                                                    flush=True,
-                                                )
-                                                # Reinitialize for this layer with new cache
-                                                base_kv_cache[i] = [
-                                                    k_new.detach().contiguous(),
-                                                    v_new.detach().contiguous(),
-                                                ]
-                                            else:
-                                                # Both have correct batch dimension - safe to concatenate
-                                                base_kv_cache[i][0] = torch.cat(
-                                                    [
-                                                        existing_k,
-                                                        k_new.detach().contiguous(),
-                                                    ],
-                                                    dim=-2,
-                                                )
-                                                base_kv_cache[i][1] = torch.cat(
-                                                    [
-                                                        existing_v,
-                                                        v_new.detach().contiguous(),
-                                                    ],
-                                                    dim=-2,
-                                                )
-                                        else:
-                                            # New layer - initialize
-                                            base_kv_cache[i] = [
-                                                k_new.detach().contiguous(),
-                                                v_new.detach().contiguous(),
-                                            ]
 
                     # Synchronize both streams
                     if draft_end_event is not None:
@@ -2859,131 +2008,20 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if draft_stream is not None and draft_end_event is not None:
                         draft_end_event.synchronize()
 
-                    # Prepare past_key_values for base model if KV cache is enabled
-                    # CRITICAL: Check cache batch dimension matches active_count
+                    # Prepare past_key_values for base model using centralized manager
                     base_past_kv = None
-                    if kv_cache_enabled and base_kv_cache is not None:
-                        if len(base_kv_cache) > 0:
-                            # Check cache batch dimension
-                            first_layer_idx = sorted(base_kv_cache.keys())[0]
-                            cache_batch_dim = base_kv_cache[first_layer_idx][0].shape[0]
-
-                            if cache_batch_dim == active_count:
-                                # Cache matches - use directly
-                                base_past_kv = tuple(
-                                    (base_kv_cache[i][0], base_kv_cache[i][1])
-                                    for i in sorted(base_kv_cache.keys())
-                                )
-                            elif cache_batch_dim == batch_size:
-                                # Need to filter - use safe function
-                                try:
-                                    filtered_layers = []
-                                    for i in sorted(base_kv_cache.keys()):
-                                        k_filtered = filter_kv_cache_safe(
-                                            base_kv_cache[i][0],
-                                            active_indices,
-                                            name="base",
-                                        )
-                                        v_filtered = filter_kv_cache_safe(
-                                            base_kv_cache[i][1],
-                                            active_indices,
-                                            name="base",
-                                        )
-                                        if k_filtered is None or v_filtered is None:
-                                            base_past_kv = None
-                                            break
-                                        filtered_layers.append((k_filtered, v_filtered))
-
-                                    if len(filtered_layers) == len(base_kv_cache):
-                                        base_past_kv = tuple(filtered_layers)
-                                except Exception as e:
-                                    print(
-                                        f"[WARNING] Step {step}: Base KV cache filtering failed: {e}",
-                                        flush=True,
-                                    )
-                                    base_past_kv = None
-                            else:
-                                # Cache dimension mismatch - skip KV cache
-                                print(
-                                    f"[WARNING] Step {step}: Base KV cache batch mismatch: "
-                                    f"cache={cache_batch_dim}, active={active_count}, batch={batch_size}",
-                                    flush=True,
-                                )
-                                base_past_kv = None
-
-                    # CRITICAL: Final validation IMMEDIATELY before base model call
-                    # This is the absolute last check before tokens reach embedding layer
-                    if hasattr(self.base_lm, "_model") and hasattr(
-                        self.base_lm._model, "config"
-                    ):
-                        vocab_size = getattr(
-                            self.base_lm._model.config, "vocab_size", None
+                    if kv_cache_enabled:
+                        # Use relative indices for KV cache retrieval (0 to active_count-1)
+                        base_past_kv = self.kv_cache_manager.get_base_past_kv(
+                            relative_indices_tensor
                         )
-                        if vocab_size is not None:
-                            # Check for invalid tokens using safe operations
-                            # Use .any() checks first to avoid calling .min()/.max() on corrupted tensors
-                            has_invalid = (active_input_ids >= vocab_size).any() or (
-                                active_input_ids < 0
-                            ).any()
-                            if has_invalid:
-                                # Calculate invalid count safely
-                                invalid_count = (
-                                    (
-                                        (active_input_ids >= vocab_size)
-                                        | (active_input_ids < 0)
-                                    )
-                                    .sum()
-                                    .item()
-                                )
 
-                                # Get min/max safely - move to CPU first to avoid CUDA errors
-                                try:
-                                    max_token = active_input_ids.cpu().max().item()
-                                    min_token = active_input_ids.cpu().min().item()
-                                except Exception as cpu_err:
-                                    # If even CPU fails, tensor is severely corrupted
-                                    print(
-                                        f"[CRITICAL ERROR] Step {step}: Cannot read tensor values! "
-                                        f"Error: {cpu_err}",
-                                        flush=True,
-                                    )
-                                    max_token = vocab_size  # Assume worst case
-                                    min_token = -1
-
-                                logger.error(
-                                    "[BASE] Invalid token index detected: min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
-                                    min_token,
-                                    max_token,
-                                    vocab_size,
-                                    invalid_count,
-                                    active_input_ids.numel(),
-                                )
-                                print(
-                                    "[CRITICAL ERROR] Step {}: Invalid tokens IMMEDIATELY before base model! "
-                                    "min={}, max={}, vocab={}, invalid={}/{}".format(
-                                        step,
-                                        min_token,
-                                        max_token,
-                                        vocab_size,
-                                        invalid_count,
-                                        active_input_ids.numel(),
-                                    ),
-                                    flush=True,
-                                )
-                                # Force clamp to prevent crash - do this BEFORE any other operations
-                                active_input_ids = active_input_ids.clamp(
-                                    min=0, max=vocab_size - 1
-                                )
-                                print(
-                                    "[WARNING] Step {}: Clamped base input tokens to valid range [0, {}]".format(
-                                        step, vocab_size - 1
-                                    ),
-                                    flush=True,
-                                )
-
-                    # CRITICAL: Device synchronization before graph capture/replay
-                    if self.device == "cuda" and torch.cuda.is_available():
-                        torch.cuda.synchronize()
+                    # Single validation point before model call
+                    base_vocab_size = get_vocab_size(self.base_lm)
+                    if base_vocab_size is not None:
+                        active_input_ids = validate_and_clamp_tokens(
+                            active_input_ids, base_vocab_size, "base_input"
+                        )
 
                     # For verification, always use greedy (argmax) to ensure deterministic matching
                     base_tokens, base_logits = self.base_lm.generate_tokens(
@@ -2995,9 +2033,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                         **kwargs,
                     )
 
-                    # Extract and update base KV cache if enabled
-                    if kv_cache_enabled and base_kv_cache is not None:
-                        # Get KV cache from base model - check both _last_generated_kv and _last_generated_kv_raw
+                    # Update base KV cache using centralized manager
+                    if kv_cache_enabled:
                         base_new_kv = None
                         if (
                             hasattr(self.base_lm, "_last_generated_kv_raw")
@@ -3008,7 +2045,6 @@ class SpeculativePipeline(SpeculativeDecoder):
                             hasattr(self.base_lm, "_last_generated_kv")
                             and self.base_lm._last_generated_kv is not None
                         ):
-                            # Extract from KVCache wrapper if it exists
                             if hasattr(
                                 self.base_lm._last_generated_kv, "past_key_values"
                             ):
@@ -3019,40 +2055,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 base_new_kv = self.base_lm._last_generated_kv
 
                         if base_new_kv is not None:
-                            # Convert to list of (key, value) tuples if needed
                             if isinstance(base_new_kv, tuple):
-                                kv_list = base_new_kv
+                                self.kv_cache_manager.update_base_cache(
+                                    base_new_kv, active_indices
+                                )
                             else:
-                                kv_list = base_new_kv
-
-                            if len(base_kv_cache) == 0:
-                                for i, (k_new, v_new) in enumerate(kv_list):
-                                    base_kv_cache[i] = [
-                                        k_new.detach().contiguous(),
-                                        v_new.detach().contiguous(),
-                                    ]
-                            else:
-                                for i, (k_new, v_new) in enumerate(kv_list):
-                                    if i in base_kv_cache:
-                                        base_kv_cache[i][0] = torch.cat(
-                                            [
-                                                base_kv_cache[i][0],
-                                                k_new.detach().contiguous(),
-                                            ],
-                                            dim=-2,
-                                        )
-                                        base_kv_cache[i][1] = torch.cat(
-                                            [
-                                                base_kv_cache[i][1],
-                                                v_new.detach().contiguous(),
-                                            ],
-                                            dim=-2,
-                                        )
-                                    else:
-                                        base_kv_cache[i] = [
-                                            k_new.detach().contiguous(),
-                                            v_new.detach().contiguous(),
-                                        ]
+                                if len(base_new_kv) > 0:
+                                    self.kv_cache_manager.update_base_cache(
+                                        tuple(base_new_kv), active_indices
+                                    )
 
                     # Use wall-clock time for fallback
                     verify_time_ms = (time.time() - verify_start_wall) * 1000
@@ -3084,64 +2095,18 @@ class SpeculativePipeline(SpeculativeDecoder):
                 batch_metrics["total_draft_time_ms"] += draft_time_ms
                 batch_metrics["total_verification_time_ms"] += verify_time_ms
 
-                # CRITICAL: Validate base_tokens IMMEDIATELY after generation
-                # This catches invalid tokens before they propagate through the pipeline
-                if hasattr(self.base_lm, "_model") and hasattr(
-                    self.base_lm._model, "config"
-                ):
-                    vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
-                    if vocab_size is not None:
-                        if (base_tokens >= vocab_size).any() or (base_tokens < 0).any():
-                            invalid_count = (
-                                ((base_tokens >= vocab_size) | (base_tokens < 0))
-                                .sum()
-                                .item()
-                            )
-                            try:
-                                max_token = base_tokens.cpu().max().item()
-                                min_token = base_tokens.cpu().min().item()
-                            except Exception:
-                                max_token = vocab_size
-                                min_token = -1
-                            print(
-                                f"[CRITICAL ERROR] Step {step}: Invalid base_tokens after generation! "
-                                f"min={min_token}, max={max_token}, vocab={vocab_size}, "
-                                f"invalid={invalid_count}/{base_tokens.numel()}",
-                                flush=True,
-                            )
-                            # Clamp invalid tokens immediately
-                            base_tokens = base_tokens.clamp(min=0, max=vocab_size - 1)
-
-                # CRITICAL: Validate draft_tokens IMMEDIATELY after generation (if not already validated)
-                if hasattr(self.draft_lm, "_model") and hasattr(
-                    self.draft_lm._model, "config"
-                ):
-                    vocab_size = getattr(
-                        self.draft_lm._model.config, "vocab_size", None
+                # Validate generated tokens using centralized validation
+                base_vocab_size = get_vocab_size(self.base_lm)
+                if base_vocab_size is not None:
+                    base_tokens = validate_and_clamp_tokens(
+                        base_tokens, base_vocab_size, "base_output"
                     )
-                    if vocab_size is not None:
-                        if (draft_tokens >= vocab_size).any() or (
-                            draft_tokens < 0
-                        ).any():
-                            invalid_count = (
-                                ((draft_tokens >= vocab_size) | (draft_tokens < 0))
-                                .sum()
-                                .item()
-                            )
-                            try:
-                                max_token = draft_tokens.cpu().max().item()
-                                min_token = draft_tokens.cpu().min().item()
-                            except Exception:
-                                max_token = vocab_size
-                                min_token = -1
-                            print(
-                                f"[CRITICAL ERROR] Step {step}: Invalid draft_tokens after generation! "
-                                f"min={min_token}, max={max_token}, vocab={vocab_size}, "
-                                f"invalid={invalid_count}/{draft_tokens.numel()}",
-                                flush=True,
-                            )
-                            # Clamp invalid tokens immediately
-                            draft_tokens = draft_tokens.clamp(min=0, max=vocab_size - 1)
+
+                draft_vocab_size = get_vocab_size(self.draft_lm)
+                if draft_vocab_size is not None:
+                    draft_tokens = validate_and_clamp_tokens(
+                        draft_tokens, draft_vocab_size, "draft_output"
+                    )
 
                 # Debug: log batch metrics after each step (reduced frequency to reduce CPU overhead)
                 if step == 1 or step % 16 == 0:
@@ -3195,20 +2160,20 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     # Apply policy
                     # Debug: log tokens before policy (with argmax for verification)
+                    # Minimize CPU transfers - only when debugging
                     if step <= 2 and idx_in_active == 0:
                         # Get base predicted tokens from logits for comparison
-                        base_pred_from_logits = (
-                            torch.argmax(prompt_base_logits[0, :, :], dim=-1)
-                            .cpu()
-                            .tolist()[: min(3, prompt_base_logits.shape[1])]
+                        # Keep operations on GPU, only transfer minimal data to CPU
+                        max_debug_len = min(3, prompt_base_logits.shape[1])
+                        base_pred_from_logits_gpu = torch.argmax(
+                            prompt_base_logits[0, :max_debug_len, :], dim=-1
                         )
-                        draft_tokens_sample = (
-                            prompt_draft_tokens[
-                                0, : min(3, prompt_draft_tokens.shape[1])
-                            ]
-                            .cpu()
-                            .tolist()
-                        )
+                        draft_tokens_sample_gpu = prompt_draft_tokens[
+                            0, : min(3, prompt_draft_tokens.shape[1])
+                        ]
+                        # Only transfer small samples to CPU for logging
+                        base_pred_from_logits = base_pred_from_logits_gpu.cpu().tolist()
+                        draft_tokens_sample = draft_tokens_sample_gpu.cpu().tolist()
                         print(
                             f"[DEBUG] Policy input - draft_tokens[0]: {draft_tokens_sample}, "
                             f"base_argmax[0]: {base_pred_from_logits}",
@@ -3257,81 +2222,37 @@ class SpeculativePipeline(SpeculativeDecoder):
                         )
 
                     # Get accepted tokens - ensure we always have something
-                    # Optimized: avoid unnecessary CPU transfer if validation passes
+                    # Extract accepted tokens with centralized validation
                     accepted_tokens = []
                     if accepted_len > 0:
-                        # Extract accepted draft tokens (keep on GPU for validation, then move to CPU)
                         accepted_tokens_tensor = prompt_draft_tokens[0, :accepted_len]
-                        # Validate before CPU transfer to catch issues early
-                        if hasattr(self.base_lm, "_model") and hasattr(
-                            self.base_lm._model, "config"
-                        ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
+                        # Validate before CPU transfer
+                        base_vocab_size = get_vocab_size(self.base_lm)
+                        if base_vocab_size is not None:
+                            accepted_tokens_tensor = validate_and_clamp_tokens(
+                                accepted_tokens_tensor,
+                                base_vocab_size,
+                                "accepted_tokens",
                             )
-                            if vocab_size is not None:
-                                # Clamp on GPU before CPU transfer
-                                if (accepted_tokens_tensor >= vocab_size).any() or (
-                                    accepted_tokens_tensor < 0
-                                ).any():
-                                    accepted_tokens_tensor = (
-                                        accepted_tokens_tensor.clamp(
-                                            min=0, max=vocab_size - 1
-                                        )
-                                    )
                         accepted_tokens = accepted_tokens_tensor.cpu().tolist()
-                        # CRITICAL: Validate accepted token indices before using them
-                        # This prevents invalid token IDs from causing embedding layer crashes
-                        if hasattr(self.base_lm, "_model") and hasattr(
-                            self.base_lm._model, "config"
-                        ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
-                            )
-                            if vocab_size is not None:
-                                accepted_tokens = [
-                                    max(0, min(int(tok), vocab_size - 1))
-                                    for tok in accepted_tokens
-                                ]
-                                # Check if clamping occurred
-                                if any(
-                                    int(orig) != int(clamped)
-                                    for orig, clamped in zip(
-                                        prompt_draft_tokens[0, :accepted_len]
-                                        .cpu()
-                                        .tolist(),
-                                        accepted_tokens,
-                                    )
-                                ):
-                                    print(
-                                        f"[WARNING] Step {step}, prompt {global_idx}: "
-                                        f"Clamped accepted tokens to valid range [0, {vocab_size - 1}]",
-                                        flush=True,
-                                    )
                         batch_generated_tokens[global_idx].extend(accepted_tokens)
                         accepted_tokens_list.append(accepted_tokens)
                     else:
                         # Rejected all - accept first base token as fallback
-                        first_base = prompt_base_tokens[0, 0:1].cpu().tolist()
-                        # CRITICAL: Validate base token before using
-                        if hasattr(self.base_lm, "_model") and hasattr(
-                            self.base_lm._model, "config"
-                        ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
+                        first_base_tensor = prompt_base_tokens[0, 0:1]
+                        # Validate with centralized validation
+                        base_vocab_size = get_vocab_size(self.base_lm)
+                        if base_vocab_size is not None:
+                            first_base_tensor = validate_and_clamp_tokens(
+                                first_base_tensor, base_vocab_size, "fallback_base"
                             )
-                            if vocab_size is not None:
-                                first_base = [
-                                    max(0, min(int(tok), vocab_size - 1))
-                                    for tok in first_base
-                                ]
-                        accepted_tokens = first_base
-                        batch_generated_tokens[global_idx].extend(first_base)
-                        accepted_tokens_list.append(first_base)
+                        accepted_tokens = first_base_tensor.cpu().tolist()
+                        batch_generated_tokens[global_idx].extend(accepted_tokens)
+                        accepted_tokens_list.append(accepted_tokens)
                         accepted_len = 1
                         if step <= 3 or idx_in_active == 0:
                             print(
-                                f"[DEBUG] No draft tokens accepted - accepting first base token: {first_base}",
+                                f"[DEBUG] No draft tokens accepted - accepting first base token: {accepted_tokens}",
                                 flush=True,
                             )
 
@@ -3381,71 +2302,24 @@ class SpeculativePipeline(SpeculativeDecoder):
                             accepted_tokens, device=self.device, dtype=torch.long
                         )  # Shape: [accepted_len]
 
-                        # CRITICAL: Final validation on tensor before concatenation
-                        if hasattr(self.base_lm, "_model") and hasattr(
-                            self.base_lm._model, "config"
-                        ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
+                        # Validate tokens before concatenation with centralized validation
+                        base_vocab_size = get_vocab_size(self.base_lm)
+                        if base_vocab_size is not None:
+                            accepted_tokens_tensor = validate_and_clamp_tokens(
+                                accepted_tokens_tensor,
+                                base_vocab_size,
+                                f"accepted_tensor_{global_idx}",
                             )
-                            if vocab_size is not None:
-                                if (accepted_tokens_tensor >= vocab_size).any() or (
-                                    accepted_tokens_tensor < 0
-                                ).any():
-                                    # Get min/max safely - move to CPU first to avoid CUDA errors
-                                    try:
-                                        max_token = (
-                                            accepted_tokens_tensor.cpu().max().item()
-                                        )
-                                        min_token = (
-                                            accepted_tokens_tensor.cpu().min().item()
-                                        )
-                                    except Exception:
-                                        max_token = vocab_size  # Assume worst case
-                                        min_token = -1
-                                    print(
-                                        f"[ERROR] Step {step}, prompt {global_idx}: "
-                                        f"Invalid tokens in tensor before concat: "
-                                        f"min={min_token}, max={max_token}, vocab={vocab_size}",
-                                        flush=True,
-                                    )
-                                    # Clamp to valid range
-                                    accepted_tokens_tensor = (
-                                        accepted_tokens_tensor.clamp(
-                                            min=0, max=vocab_size - 1
-                                        )
-                                    )
 
                         current_seq = current_input_ids[global_idx]  # Shape: [seq_len]
 
-                        # CRITICAL: Validate current sequence as well
-                        if hasattr(self.base_lm, "_model") and hasattr(
-                            self.base_lm._model, "config"
-                        ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
+                        # Validate current sequence with centralized validation
+                        if base_vocab_size is not None:
+                            current_seq = validate_and_clamp_tokens(
+                                current_seq,
+                                base_vocab_size,
+                                f"current_seq_{global_idx}",
                             )
-                            if vocab_size is not None:
-                                if (current_seq >= vocab_size).any() or (
-                                    current_seq < 0
-                                ).any():
-                                    # Get min/max safely - move to CPU first to avoid CUDA errors
-                                    try:
-                                        max_token = current_seq.cpu().max().item()
-                                        min_token = current_seq.cpu().min().item()
-                                    except Exception:
-                                        max_token = vocab_size  # Assume worst case
-                                        min_token = -1
-                                    print(
-                                        f"[ERROR] Step {step}, prompt {global_idx}: "
-                                        f"Invalid tokens in current_seq before concat: "
-                                        f"min={min_token}, max={max_token}, vocab={vocab_size}",
-                                        flush=True,
-                                    )
-                                    # Clamp to valid range
-                                    current_seq = current_seq.clamp(
-                                        min=0, max=vocab_size - 1
-                                    )
 
                         # Debug: log before/after append (only first step to reduce CPU overhead)
                         if step == 1:
@@ -3462,49 +2336,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                             [current_seq, accepted_tokens_tensor], dim=0
                         )
 
-                        # CRITICAL: Final validation after concatenation
-                        if hasattr(self.base_lm, "_model") and hasattr(
-                            self.base_lm._model, "config"
-                        ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
+                        # Validate after concatenation with centralized validation
+                        base_vocab_size = get_vocab_size(self.base_lm)
+                        if base_vocab_size is not None:
+                            updated_seq = validate_and_clamp_tokens(
+                                updated_seq,
+                                base_vocab_size,
+                                f"updated_seq_{global_idx}",
                             )
-                            if vocab_size is not None:
-                                if (updated_seq >= vocab_size).any() or (
-                                    updated_seq < 0
-                                ).any():
-                                    # Get min/max safely - move to CPU first to avoid CUDA errors
-                                    try:
-                                        max_token = updated_seq.cpu().max().item()
-                                        min_token = updated_seq.cpu().min().item()
-                                    except Exception:
-                                        max_token = vocab_size  # Assume worst case
-                                        min_token = -1
-                                    invalid_count = (
-                                        (
-                                            (updated_seq >= vocab_size)
-                                            | (updated_seq < 0)
-                                        )
-                                        .sum()
-                                        .item()
-                                    )
-                                    print(
-                                        f"[ERROR] Step {step}, prompt {global_idx}: "
-                                        f"Invalid tokens in updated_seq after concat: "
-                                        f"min={min_token}, max={max_token}, vocab={vocab_size}, "
-                                        f"invalid={invalid_count}/{updated_seq.numel()}\n"
-                                        f"This is a critical error - embedding layer will crash!",
-                                        flush=True,
-                                    )
-                                    # Clamp to valid range
-                                    updated_seq = updated_seq.clamp(
-                                        min=0, max=vocab_size - 1
-                                    )
-                                    print(
-                                        f"[WARNING] Step {step}, prompt {global_idx}: "
-                                        f"Clamped updated_seq to valid range [0, {vocab_size - 1}]",
-                                        flush=True,
-                                    )
 
                         # Update sequence (keep as 1D list item, no padding)
                         current_input_ids[global_idx] = updated_seq

@@ -3,12 +3,19 @@ Tests for CUDA graph capture fallback behavior.
 """
 
 import os
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 
-from src.specdec.fake_lm import FakeLM
-from src.specdec.pipeline import SpeculativePipeline
+# Add src to path for imports
+PROJECT_ROOT = Path(__file__).parent.parent
+SRC_DIR = PROJECT_ROOT / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+from specdec import SpeculativePipeline  # noqa: E402
+from specdec.models.fake_lm import FakeLM, create_fake_lm  # noqa: E402
 
 
 class TestCUDAGraphFallback:
@@ -76,7 +83,8 @@ class TestCUDAGraphFallback:
         pipeline = SpeculativePipeline(
             base_lm=FakeLM(), draft_lm=FakeLM(), max_draft=2, device="cpu"
         )
-        assert pipeline.cuda_graph is None
+        # CUDA graph capture removed - check that enable_cuda_graph is False
+        assert pipeline.enable_cuda_graph is False
         assert pipeline.cuda_graph_captured is False
         assert pipeline.cuda_graph_warmup_done is False
         assert pipeline.graph_input_tensor is None
@@ -95,30 +103,8 @@ class TestCUDAGraphFallback:
                 base_lm=FakeLM(), draft_lm=FakeLM(), max_draft=2, device="cuda"
             )
 
-            # Graph capture should be enabled on CUDA
-            assert pipeline.enable_cuda_graph is True
-
-            # Simulate shape mismatch
-            import torch
-
-            original_shape = (1, 10)
-            mismatch_shape = (1, 15)
-
-            # Create dummy tensors
-            pipeline.graph_input_tensor = torch.zeros(
-                original_shape, dtype=torch.long, device="cuda"
-            )
-            pipeline.cuda_graph_captured = True
-
-            # Try to replay with mismatched shape
-            mismatch_input = torch.zeros(
-                mismatch_shape, dtype=torch.long, device="cuda"
-            )
-
-            with pytest.raises(RuntimeError, match="Input shape mismatch"):
-                pipeline._replay_cuda_graph(mismatch_input)
-
-            # Verify fallback occurred
+            # CUDA graph capture removed - should be False even on CUDA
+            # This test verifies that CUDA graph is disabled by default
             assert pipeline.enable_cuda_graph is False
             assert pipeline.cuda_graph_captured is False
 

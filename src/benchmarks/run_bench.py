@@ -34,7 +34,7 @@ sys.path.insert(0, str(SRC_DIR))
 from benchmarks.quality_eval import create_evaluator  # noqa: E402
 from server.local_baseline import LocalBaselineRunner  # noqa: E402
 from server.ping_vllm import VLLMPingClient  # noqa: E402
-from specdec.pipeline import SpeculativePipeline  # noqa: E402
+from specdec import SpeculativePipeline  # noqa: E402
 
 
 class BenchmarkRunner:

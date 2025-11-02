@@ -17,8 +17,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from specdec.fake_lm import create_fake_lm  # noqa: E402
-from specdec.pipeline import SpeculativePipeline  # noqa: E402
+from specdec import SpeculativePipeline, create_fake_lm  # noqa: E402
 
 
 class TestSpeculativePipelineFake:

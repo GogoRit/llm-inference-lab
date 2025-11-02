@@ -7,9 +7,9 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from src.specdec.eagle import EagleDraftor
-from src.specdec.medusa import MedusaDraftor
-from src.specdec.pipeline import SpeculativePipeline
+from specdec import SpeculativePipeline
+from specdec.modes.eagle import EagleDraftor
+from specdec.modes.medusa import MedusaDraftor
 
 
 class TestDraftModeCLI:
@@ -19,7 +19,7 @@ class TestDraftModeCLI:
         """Test that vanilla mode is the default."""
         import sys
 
-        from src.specdec.run_specdec import parse_args
+        from specdec.run_specdec import parse_args
 
         # Mock sys.argv to avoid issues with argparse
         with patch.object(sys, "argv", ["run_specdec.py", "--prompt", "test"]):
@@ -30,7 +30,7 @@ class TestDraftModeCLI:
         """Test medusa mode flag parsing."""
         import sys
 
-        from src.specdec.run_specdec import parse_args
+        from specdec.run_specdec import parse_args
 
         with patch.object(
             sys,
@@ -44,7 +44,7 @@ class TestDraftModeCLI:
         """Test eagle mode flag parsing."""
         import sys
 
-        from src.specdec.run_specdec import parse_args
+        from specdec.run_specdec import parse_args
 
         with patch.object(
             sys, "argv", ["run_specdec.py", "--prompt", "test", "--draft-mode", "eagle"]
@@ -56,7 +56,7 @@ class TestDraftModeCLI:
         """Test that invalid draft mode raises error."""
         import sys
 
-        from src.specdec.run_specdec import parse_args
+        from specdec.run_specdec import parse_args
 
         with patch.object(
             sys,
