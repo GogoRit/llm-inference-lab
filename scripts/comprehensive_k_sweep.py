@@ -34,8 +34,20 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
+    # Suppress CuBLAS deterministic warnings by setting workspace config
+    # This is required for deterministic algorithms with CUDA >= 10.2
+    if "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
     # Enable deterministic algorithms with warnings only
     torch.use_deterministic_algorithms(True, warn_only=True)
+
+    # Set CUDA arch list to avoid compilation warnings
+    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+        # Auto-detect from visible CUDA devices
+        device_capability = torch.cuda.get_device_capability(0)
+        compute_capability = f"{device_capability[0]}{device_capability[1]}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = compute_capability
 
     # Reset dynamo and disable dynamic shape capture (fixes graph capture issues)
     try:
