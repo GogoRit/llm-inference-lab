@@ -1171,8 +1171,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                 if not use_graph:
                     # CRITICAL: Validate tokens before model forward pass
                     # This prevents invalid token indices from crashing CUDA kernels
-                    if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
-                        vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
+                    if hasattr(self.base_lm, "_model") and hasattr(
+                        self.base_lm._model, "config"
+                    ):
+                        vocab_size = getattr(
+                            self.base_lm._model.config, "vocab_size", None
+                        )
                         if vocab_size is not None:
                             if (current_input >= vocab_size).any():
                                 max_token = current_input.max().item()
@@ -1189,7 +1193,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     ),
                                     flush=True,
                                 )
-                    
+
                     # GPU sync before verification to ensure async kernels report errors correctly
                     if self.device == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -2197,7 +2201,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                                                 active_indices_tensor,
                                                 name="draft",
                                             )
-                                            if k_filtered is not None and v_filtered is not None:
+                                            if (
+                                                k_filtered is not None
+                                                and v_filtered is not None
+                                            ):
                                                 # Safe filtering succeeded - use filtered cache
                                                 existing_k = k_filtered
                                                 existing_v = v_filtered
@@ -2205,7 +2212,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                                                 # Safe filtering failed - reinitialize with new cache
                                                 print(
                                                     "[WARNING] Step {}: Draft KV cache safe filtering failed - "
-                                                    "reinitializing cache.".format(step),
+                                                    "reinitializing cache.".format(
+                                                        step
+                                                    ),
                                                     flush=True,
                                                 )
                                                 draft_kv_cache[i] = [
@@ -2218,7 +2227,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                                             print(
                                                 "[WARNING] Step {}: Draft KV cache batch mismatch - "
                                                 "existing={}, active={}, batch_size={}. Reinitializing cache.".format(
-                                                    step, existing_k.shape[0], active_count, batch_size
+                                                    step,
+                                                    existing_k.shape[0],
+                                                    active_count,
+                                                    batch_size,
                                                 ),
                                                 flush=True,
                                             )
@@ -2592,8 +2604,12 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     # CRITICAL: Validate tokens before model forward pass
                     # This prevents invalid token indices from crashing CUDA kernels
-                    if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
-                        vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
+                    if hasattr(self.base_lm, "_model") and hasattr(
+                        self.base_lm._model, "config"
+                    ):
+                        vocab_size = getattr(
+                            self.base_lm._model.config, "vocab_size", None
+                        )
                         if vocab_size is not None:
                             if (active_input_ids >= vocab_size).any():
                                 max_token = active_input_ids.max().item()
@@ -2603,18 +2619,20 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     vocab_size,
                                 )
                                 # Clamp invalid tokens to valid range
-                                active_input_ids = active_input_ids.clamp(max=vocab_size - 1)
+                                active_input_ids = active_input_ids.clamp(
+                                    max=vocab_size - 1
+                                )
                                 print(
                                     "[WARNING] Step {}: Clamped base input tokens to valid range [0, {}]".format(
                                         step, vocab_size - 1
                                     ),
                                     flush=True,
                                 )
-                    
+
                     # CRITICAL: Device synchronization before graph capture/replay
                     if self.device == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    
+
                     # For verification, always use greedy (argmax) to ensure deterministic matching
                     base_tokens, base_logits = self.base_lm.generate_tokens(
                         active_input_ids,
@@ -2832,11 +2850,51 @@ class SpeculativePipeline(SpeculativeDecoder):
                         accepted_tokens = (
                             prompt_draft_tokens[0, :accepted_len].cpu().tolist()
                         )
+                        # CRITICAL: Validate accepted token indices before using them
+                        # This prevents invalid token IDs from causing embedding layer crashes
+                        if hasattr(self.base_lm, "_model") and hasattr(
+                            self.base_lm._model, "config"
+                        ):
+                            vocab_size = getattr(
+                                self.base_lm._model.config, "vocab_size", None
+                            )
+                            if vocab_size is not None:
+                                accepted_tokens = [
+                                    max(0, min(int(tok), vocab_size - 1))
+                                    for tok in accepted_tokens
+                                ]
+                                # Check if clamping occurred
+                                if any(
+                                    int(orig) != int(clamped)
+                                    for orig, clamped in zip(
+                                        prompt_draft_tokens[0, :accepted_len]
+                                        .cpu()
+                                        .tolist(),
+                                        accepted_tokens,
+                                    )
+                                ):
+                                    print(
+                                        f"[WARNING] Step {step}, prompt {global_idx}: "
+                                        f"Clamped accepted tokens to valid range [0, {vocab_size - 1}]",
+                                        flush=True,
+                                    )
                         batch_generated_tokens[global_idx].extend(accepted_tokens)
                         accepted_tokens_list.append(accepted_tokens)
                     else:
                         # Rejected all - accept first base token as fallback
                         first_base = prompt_base_tokens[0, 0:1].cpu().tolist()
+                        # CRITICAL: Validate base token before using
+                        if hasattr(self.base_lm, "_model") and hasattr(
+                            self.base_lm._model, "config"
+                        ):
+                            vocab_size = getattr(
+                                self.base_lm._model.config, "vocab_size", None
+                            )
+                            if vocab_size is not None:
+                                first_base = [
+                                    max(0, min(int(tok), vocab_size - 1))
+                                    for tok in first_base
+                                ]
                         accepted_tokens = first_base
                         batch_generated_tokens[global_idx].extend(first_base)
                         accepted_tokens_list.append(first_base)

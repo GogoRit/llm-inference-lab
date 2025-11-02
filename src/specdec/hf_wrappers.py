@@ -332,10 +332,34 @@ class HFWrapper(LanguageModel):
                         # Greedy sampling - apply temperature if needed
                         if temperature != 1.0:
                             next_token_logits = next_token_logits / temperature
-                        next_token = torch.argmax(
-                            next_token_logits, dim=-1, keepdim=True
-                        )  # [batch_size, 1]
+                    next_token = torch.argmax(
+                        next_token_logits, dim=-1, keepdim=True
+                    )  # [batch_size, 1]
                     # --- END PATCH ---
+
+                    # CRITICAL: Validate generated token indices before storing
+                    # This prevents invalid token IDs from causing embedding layer crashes
+                    if hasattr(self._model, "config"):
+                        vocab_size = getattr(self._model.config, "vocab_size", None)
+                        if vocab_size is not None:
+                            if (next_token >= vocab_size).any() or (
+                                next_token < 0
+                            ).any():
+                                max_token = next_token.max().item()
+                                min_token = next_token.min().item()
+                                self.logger.error(
+                                    "[HF-WRAPPER] Invalid token index generated: "
+                                    "min=%d, max=%d, vocab_size=%d",
+                                    min_token,
+                                    max_token,
+                                    vocab_size,
+                                )
+                                # Clamp invalid tokens to valid range
+                                next_token = next_token.clamp(min=0, max=vocab_size - 1)
+                                print(
+                                    f"[WARNING] Clamped generated tokens to valid range [0, {vocab_size - 1}]",
+                                    flush=True,
+                                )
 
                     # Store generated token and logits
                     generated_tokens.append(next_token)
@@ -445,6 +469,21 @@ class HFWrapper(LanguageModel):
         else:
             next_token = next_token_logits.argmax(dim=-1, keepdim=True)
 
+        # CRITICAL: Validate generated token indices
+        if hasattr(self._model, "config"):
+            vocab_size = getattr(self._model.config, "vocab_size", None)
+            if vocab_size is not None:
+                if (next_token >= vocab_size).any() or (next_token < 0).any():
+                    max_token = next_token.max().item()
+                    min_token = next_token.min().item()
+                    # Clamp invalid tokens to valid range
+                    next_token = next_token.clamp(min=0, max=vocab_size - 1)
+                    print(
+                        f"[WARNING] Clamped first generated token to valid range [0, {vocab_size - 1}] "
+                        f"(min={min_token}, max={max_token})",
+                        flush=True,
+                    )
+
         generated_tokens.append(next_token)
 
         # Generate remaining tokens
@@ -465,6 +504,21 @@ class HFWrapper(LanguageModel):
                 next_token = torch.multinomial(probs, num_samples=1)
             else:
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+
+            # CRITICAL: Validate generated token indices
+            if hasattr(self._model, "config"):
+                vocab_size = getattr(self._model.config, "vocab_size", None)
+                if vocab_size is not None:
+                    if (next_token >= vocab_size).any() or (next_token < 0).any():
+                        max_token = next_token.max().item()
+                        min_token = next_token.min().item()
+                        # Clamp invalid tokens to valid range
+                        next_token = next_token.clamp(min=0, max=vocab_size - 1)
+                        print(
+                            f"[WARNING] Clamped generated token to valid range [0, {vocab_size - 1}] "
+                            f"(min={min_token}, max={max_token})",
+                            flush=True,
+                        )
 
             generated_tokens.append(next_token)
 
