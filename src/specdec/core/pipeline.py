@@ -1604,12 +1604,40 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Use detach().clone() to break computation graph and prevent shared memory issues
                 # This ensures tensors are completely independent before entering CUDA streams
                 # Best practice: Prepare all tensors synchronously BEFORE async operations
+                # CRITICAL: Synchronize before extracting to ensure all previous updates are complete
+                if self.device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
                 active_seqs = [
                     current_input_ids[i].detach().clone().contiguous()
                     for i in active_indices
                 ]
                 if len(active_seqs) == 0:
                     break
+
+                # CRITICAL: Validate immediately after extraction to catch corruption early
+                # This helps identify if corruption occurred during previous iteration
+                draft_vocab_size_check = get_vocab_size(self.draft_lm)
+                if draft_vocab_size_check is not None:
+                    for i, seq in enumerate(active_seqs):
+                        # Quick validation check - if corrupted, this will catch it
+                        try:
+                            min_val = torch.min(seq).item()
+                            max_val = torch.max(seq).item()
+                            if min_val < 0 or max_val >= draft_vocab_size_check:
+                                raise RuntimeError(
+                                    f"CRITICAL: Corrupted sequence detected at step {step}, "
+                                    f"prompt {active_indices[i]}: "
+                                    f"Min={min_val}, Max={max_val}, Vocab_size={draft_vocab_size_check}"
+                                )
+                        except RuntimeError:
+                            raise
+                        except Exception as e:
+                            # If we can't read the tensor, it's corrupted
+                            raise RuntimeError(
+                                f"CRITICAL: Cannot read sequence tensor at step {step}, "
+                                f"prompt {active_indices[i]}: {e}"
+                            ) from e
 
                 # CRITICAL: Validate sequences with DRAFT vocab size since we're passing to draft model
                 # This is the root cause fix - draft model may have different vocab size than base
@@ -2025,6 +2053,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if verify_end_event is not None:
                         verify_end_event.synchronize()
 
+                    # CRITICAL: Synchronize ALL CUDA operations (including default stream)
+                    # This ensures all tensor operations are complete before we access results
+                    # Prevents corruption when updating current_input_ids
+                    torch.cuda.synchronize()
+
                     # Calculate verify time using CUDA events if available
                     if verify_start_event is not None and verify_end_event is not None:
                         verify_time_ms = verify_start_event.elapsed_time(
@@ -2116,6 +2149,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if verify_end_event is not None:
                         verify_end_event.synchronize()
 
+                    # CRITICAL: Synchronize ALL CUDA operations (including default stream)
+                    # This ensures all tensor operations are complete before we access results
+                    # Prevents corruption when updating current_input_ids
+                    torch.cuda.synchronize()
+
                     # Calculate verify time using CUDA events if available
                     if verify_start_event is not None and verify_end_event is not None:
                         verify_time_ms = verify_start_event.elapsed_time(
@@ -2127,6 +2165,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                     # Fallback: sequential execution
                     if draft_stream is not None and draft_end_event is not None:
                         draft_end_event.synchronize()
+
+                    # CRITICAL: Synchronize ALL CUDA operations before base model call
+                    # Ensures draft operations are fully complete
+                    torch.cuda.synchronize()
 
                     # Prepare past_key_values for base model using centralized manager
                     base_past_kv = None
@@ -2470,9 +2512,12 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                         # CRITICAL: Clone before storing to ensure independence
                         # This prevents corruption if tensor is still being used elsewhere
+                        # Same pattern as KV cache updates: detach().contiguous() for safety
                         updated_seq = updated_seq.detach().clone().contiguous()
 
                         # Update sequence (keep as 1D list item, no padding)
+                        # Note: We synchronize ONCE after all updates (at end of loop)
+                        # to match KV cache pattern: batch updates, then sync
                         current_input_ids[global_idx] = updated_seq
                     else:
                         # No tokens accepted - log warning but continue with next base token
