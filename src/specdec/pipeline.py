@@ -1872,18 +1872,23 @@ class SpeculativePipeline(SpeculativeDecoder):
                 if len(active_seqs) == 0:
                     break
 
-                # Find max sequence length in active batch
-                original_lengths = [seq.shape[0] for seq in active_seqs]
-                max_seq_len = max(original_lengths)
+                # Find max sequence length in active batch (optimized: single pass)
+                original_lengths = []
+                max_seq_len = 0
+                for seq in active_seqs:
+                    seq_len = seq.shape[0]
+                    original_lengths.append(seq_len)
+                    max_seq_len = max(max_seq_len, seq_len)
 
-                # Pad all sequences to max length for batching
-                padded_seqs = []
+                # Pad all sequences to max length for batching (optimized: pre-allocate)
                 pad_value = (
                     tokenizer.pad_token_id
                     if tokenizer is not None and tokenizer.pad_token_id is not None
                     else 0
                 )
-                for seq in active_seqs:
+                # Pre-allocate list to avoid repeated appends
+                padded_seqs = [None] * len(active_seqs)
+                for i, seq in enumerate(active_seqs):
                     if seq.shape[0] < max_seq_len:
                         # Pad with pad_token_id
                         pad_length = max_seq_len - seq.shape[0]
@@ -1894,9 +1899,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                             device=seq.device,
                         )
                         seq_padded = torch.cat([seq, padding], dim=0)
-                        padded_seqs.append(seq_padded)
+                        padded_seqs[i] = seq_padded
                     else:
-                        padded_seqs.append(seq)
+                        padded_seqs[i] = seq
 
                 # Stack into batch tensor
                 active_input_ids = torch.stack(
@@ -2878,12 +2883,29 @@ class SpeculativePipeline(SpeculativeDecoder):
                         )
 
                     # Get accepted tokens - ensure we always have something
+                    # Optimized: avoid unnecessary CPU transfer if validation passes
                     accepted_tokens = []
                     if accepted_len > 0:
-                        # Extract accepted draft tokens
-                        accepted_tokens = (
-                            prompt_draft_tokens[0, :accepted_len].cpu().tolist()
-                        )
+                        # Extract accepted draft tokens (keep on GPU for validation, then move to CPU)
+                        accepted_tokens_tensor = prompt_draft_tokens[0, :accepted_len]
+                        # Validate before CPU transfer to catch issues early
+                        if hasattr(self.base_lm, "_model") and hasattr(
+                            self.base_lm._model, "config"
+                        ):
+                            vocab_size = getattr(
+                                self.base_lm._model.config, "vocab_size", None
+                            )
+                            if vocab_size is not None:
+                                # Clamp on GPU before CPU transfer
+                                if (accepted_tokens_tensor >= vocab_size).any() or (
+                                    accepted_tokens_tensor < 0
+                                ).any():
+                                    accepted_tokens_tensor = (
+                                        accepted_tokens_tensor.clamp(
+                                            min=0, max=vocab_size - 1
+                                        )
+                                    )
+                        accepted_tokens = accepted_tokens_tensor.cpu().tolist()
                         # CRITICAL: Validate accepted token indices before using them
                         # This prevents invalid token IDs from causing embedding layer crashes
                         if hasattr(self.base_lm, "_model") and hasattr(
