@@ -1884,6 +1884,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Prepare past_key_values for draft model if KV cache is enabled
                 # CRITICAL: Filter to only active sequences before passing to model
+                # CRITICAL: Validate active_indices to prevent CUDA device-side asserts
                 draft_past_kv = None
                 if kv_cache_enabled and draft_kv_cache is not None:
                     # Convert dict format to tuple format expected by model
@@ -1892,22 +1893,85 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # Check if cache batch dimension matches active_count
                         first_layer_idx = sorted(draft_kv_cache.keys())[0]
                         cache_batch_dim = draft_kv_cache[first_layer_idx][0].shape[0]
+                        cache_device = draft_kv_cache[first_layer_idx][0].device
 
                         if cache_batch_dim != active_count:
                             # Filter cache to match active sequences
                             # If cache has full batch_size, select active_indices
                             # Otherwise, assume cache already filtered (should match active_count)
                             if cache_batch_dim == batch_size:
-                                # Cache has full batch - filter to active_indices
-                                draft_past_kv = tuple(
-                                    (
-                                        draft_kv_cache[i][0][
-                                            active_indices
-                                        ],  # Select active sequences
-                                        draft_kv_cache[i][1][active_indices],
+                                # CRITICAL: Validate and clip active_indices before indexing
+                                # Convert active_indices to tensor if needed, ensure correct device
+                                if isinstance(active_indices, list):
+                                    active_indices_tensor = torch.tensor(
+                                        active_indices,
+                                        dtype=torch.long,
+                                        device=cache_device,
                                     )
-                                    for i in sorted(draft_kv_cache.keys())
-                                )
+                                else:
+                                    active_indices_tensor = active_indices.to(
+                                        cache_device, non_blocking=True
+                                    )
+
+                                # Validate indices are within bounds
+                                valid_mask = active_indices_tensor < cache_batch_dim
+                                if not valid_mask.all():
+                                    # Clip invalid indices
+                                    invalid_count = (~valid_mask).sum().item()
+                                    print(
+                                        "[WARNING] Step {}: Clipping {} invalid draft KV cache indices "
+                                        "(cache_size={}, max_index={})".format(
+                                            step,
+                                            invalid_count,
+                                            cache_batch_dim,
+                                            (
+                                                active_indices_tensor.max().item()
+                                                if len(active_indices_tensor) > 0
+                                                else -1
+                                            ),
+                                        ),
+                                        flush=True,
+                                    )
+                                    active_indices_tensor = active_indices_tensor[
+                                        valid_mask
+                                    ]
+
+                                if len(active_indices_tensor) == 0:
+                                    print(
+                                        "[WARNING] Step {}: No valid active_indices after filtering, "
+                                        "skipping draft KV cache".format(step),
+                                        flush=True,
+                                    )
+                                    draft_past_kv = None
+                                else:
+                                    # Filter cache using validated indices
+                                    print(
+                                        "[DEBUG] Safe-filtered draft active_indices: {} / {}".format(
+                                            len(active_indices_tensor), cache_batch_dim
+                                        ),
+                                        flush=True,
+                                    )
+                                    try:
+                                        draft_past_kv = tuple(
+                                            (
+                                                draft_kv_cache[i][0].index_select(
+                                                    0, active_indices_tensor
+                                                ),
+                                                draft_kv_cache[i][1].index_select(
+                                                    0, active_indices_tensor
+                                                ),
+                                            )
+                                            for i in sorted(draft_kv_cache.keys())
+                                        )
+                                    except RuntimeError as e:
+                                        print(
+                                            "[WARNING] Step {}: Draft KV cache indexing failed: {}. "
+                                            "Skipping KV cache for this step.".format(
+                                                step, e
+                                            ),
+                                            flush=True,
+                                        )
+                                        draft_past_kv = None
                             else:
                                 # Cache mismatch - log warning and skip KV cache for this step
                                 print(
