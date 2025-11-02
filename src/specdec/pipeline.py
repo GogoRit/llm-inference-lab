@@ -66,10 +66,17 @@ def filter_kv_cache_safe(
     if not torch.all(valid_mask):
         invalid_count = (~valid_mask).sum().item()
         logger.warning(
-            "[%s KV] Clipping %d invalid indices (max valid=%d)",
+            "[%s KV] Clipped %d invalid indices in %s (max valid=%d)",
             name.upper(),
             invalid_count,
+            name,
             cache_batch - 1,
+        )
+        print(
+            "[WARNING] Clipped {} invalid indices in {} KV cache".format(
+                invalid_count, name
+            ),
+            flush=True,
         )
         active_indices_tensor = active_indices_tensor[valid_mask]
 
@@ -80,10 +87,12 @@ def filter_kv_cache_safe(
     # Safe indexing with try/except
     try:
         filtered_cache = cache.index_select(0, active_indices_tensor)
+        num_valid = len(active_indices_tensor)
         logger.debug(
-            "[%s KV] Filtered %d/%d entries",
+            "[%s KV] Safe-filtered %s KV cache: kept %d/%d",
             name.upper(),
-            len(active_indices_tensor),
+            name,
+            num_valid,
             cache_batch,
         )
         return filtered_cache
@@ -1160,6 +1169,27 @@ class SpeculativePipeline(SpeculativeDecoder):
                         use_graph = False
 
                 if not use_graph:
+                    # CRITICAL: Validate tokens before model forward pass
+                    # This prevents invalid token indices from crashing CUDA kernels
+                    if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
+                        vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
+                        if vocab_size is not None:
+                            if (current_input >= vocab_size).any():
+                                max_token = current_input.max().item()
+                                logger.error(
+                                    "[BASE] Invalid token index detected: %d >= %d",
+                                    max_token,
+                                    vocab_size,
+                                )
+                                # Clamp invalid tokens to valid range
+                                current_input = current_input.clamp(max=vocab_size - 1)
+                                print(
+                                    "[WARNING] Clamped base input tokens to valid range [0, {}]".format(
+                                        vocab_size - 1
+                                    ),
+                                    flush=True,
+                                )
+                    
                     # GPU sync before verification to ensure async kernels report errors correctly
                     if self.device == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -2021,6 +2051,37 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 for i in sorted(draft_kv_cache.keys())
                             )
 
+                # CRITICAL: Validate tokens before model forward pass
+                # This prevents invalid token indices from crashing CUDA kernels
+                if hasattr(self.draft_lm, "_model") and hasattr(
+                    self.draft_lm._model, "config"
+                ):
+                    vocab_size = getattr(
+                        self.draft_lm._model.config, "vocab_size", None
+                    )
+                    if vocab_size is not None:
+                        if (active_input_ids >= vocab_size).any():
+                            max_token = active_input_ids.max().item()
+                            logger.error(
+                                "[DRAFT] Invalid token index detected: %d >= %d",
+                                max_token,
+                                vocab_size,
+                            )
+                            # Clamp invalid tokens to valid range
+                            active_input_ids = active_input_ids.clamp(
+                                max=vocab_size - 1
+                            )
+                            print(
+                                "[WARNING] Step {}: Clamped draft input tokens to valid range [0, {}]".format(
+                                    step, vocab_size - 1
+                                ),
+                                flush=True,
+                            )
+
+                # CRITICAL: Device synchronization before graph capture/replay
+                if self.device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
                         draft_tokens, draft_logits = self.draft_lm.generate_tokens(
@@ -2115,31 +2176,67 @@ class SpeculativePipeline(SpeculativeDecoder):
                                         1
                                     ]  # [active_count, ...]
 
-                                    # Verify shape compatibility
+                                    # CRITICAL: Use safe filtering if batch dimension mismatch
+                                    # This handles cases where cache has full batch_size but active_count is smaller
                                     if existing_k.shape[0] != active_count:
-                                        # Cache has wrong batch dimension - reinitialize with new cache
-                                        print(
-                                            "[WARNING] Step {}: Draft KV cache batch mismatch - "
-                                            "existing={}, active={}. Reinitializing cache.".format(
-                                                step, existing_k.shape[0], active_count
-                                            ),
-                                            flush=True,
-                                        )
-                                        # Reinitialize for this layer with new cache
-                                        draft_kv_cache[i] = [
-                                            k_new.detach().contiguous(),
-                                            v_new.detach().contiguous(),
-                                        ]
-                                    else:
-                                        # Both have correct batch dimension - safe to concatenate
-                                        draft_kv_cache[i][0] = torch.cat(
-                                            [existing_k, k_new.detach().contiguous()],
-                                            dim=-2,
-                                        )
-                                        draft_kv_cache[i][1] = torch.cat(
-                                            [existing_v, v_new.detach().contiguous()],
-                                            dim=-2,
-                                        )
+                                        # Cache has wrong batch dimension - try safe filtering first
+                                        if existing_k.shape[0] == batch_size:
+                                            # Cache has full batch - filter to active sequences
+                                            active_indices_tensor = torch.tensor(
+                                                active_indices,
+                                                dtype=torch.long,
+                                                device=existing_k.device,
+                                            )
+                                            k_filtered = filter_kv_cache_safe(
+                                                existing_k,
+                                                active_indices_tensor,
+                                                name="draft",
+                                            )
+                                            v_filtered = filter_kv_cache_safe(
+                                                existing_v,
+                                                active_indices_tensor,
+                                                name="draft",
+                                            )
+                                            if k_filtered is not None and v_filtered is not None:
+                                                # Safe filtering succeeded - use filtered cache
+                                                existing_k = k_filtered
+                                                existing_v = v_filtered
+                                            else:
+                                                # Safe filtering failed - reinitialize with new cache
+                                                print(
+                                                    "[WARNING] Step {}: Draft KV cache safe filtering failed - "
+                                                    "reinitializing cache.".format(step),
+                                                    flush=True,
+                                                )
+                                                draft_kv_cache[i] = [
+                                                    k_new.detach().contiguous(),
+                                                    v_new.detach().contiguous(),
+                                                ]
+                                                continue
+                                        else:
+                                            # Cache dimension doesn't match batch_size or active_count - reinitialize
+                                            print(
+                                                "[WARNING] Step {}: Draft KV cache batch mismatch - "
+                                                "existing={}, active={}, batch_size={}. Reinitializing cache.".format(
+                                                    step, existing_k.shape[0], active_count, batch_size
+                                                ),
+                                                flush=True,
+                                            )
+                                            draft_kv_cache[i] = [
+                                                k_new.detach().contiguous(),
+                                                v_new.detach().contiguous(),
+                                            ]
+                                            continue
+
+                                    # Both have correct batch dimension - safe to concatenate
+                                    draft_kv_cache[i][0] = torch.cat(
+                                        [existing_k, k_new.detach().contiguous()],
+                                        dim=-2,
+                                    )
+                                    draft_kv_cache[i][1] = torch.cat(
+                                        [existing_v, v_new.detach().contiguous()],
+                                        dim=-2,
+                                    )
                                 else:
                                     # New layer - initialize
                                     draft_kv_cache[i] = [
@@ -2318,10 +2415,26 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     base_past_kv = None
                             else:
                                 # Cache batch dimension matches active_count - use directly
-                                base_past_kv = tuple(
-                                    (base_kv_cache[i][0], base_kv_cache[i][1])
-                                    for i in sorted(base_kv_cache.keys())
-                                )
+                                # CRITICAL: Reinitialize if batch mismatch detected
+                                if cache_batch_dim != active_count:
+                                    logger.warning(
+                                        "[BASE KV] Cache batch mismatch (%d vs %d) → reinitializing cache",
+                                        cache_batch_dim,
+                                        active_count,
+                                    )
+                                    print(
+                                        "[WARNING] Step {}: Base KV cache batch mismatch ({}) vs active ({}) "
+                                        "→ reinitializing cache".format(
+                                            step, cache_batch_dim, active_count
+                                        ),
+                                        flush=True,
+                                    )
+                                    base_past_kv = None
+                                else:
+                                    base_past_kv = tuple(
+                                        (base_kv_cache[i][0], base_kv_cache[i][1])
+                                        for i in sorted(base_kv_cache.keys())
+                                    )
 
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
@@ -2477,6 +2590,31 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 for i in sorted(base_kv_cache.keys())
                             )
 
+                    # CRITICAL: Validate tokens before model forward pass
+                    # This prevents invalid token indices from crashing CUDA kernels
+                    if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
+                        vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
+                        if vocab_size is not None:
+                            if (active_input_ids >= vocab_size).any():
+                                max_token = active_input_ids.max().item()
+                                logger.error(
+                                    "[BASE] Invalid token index detected: %d >= %d",
+                                    max_token,
+                                    vocab_size,
+                                )
+                                # Clamp invalid tokens to valid range
+                                active_input_ids = active_input_ids.clamp(max=vocab_size - 1)
+                                print(
+                                    "[WARNING] Step {}: Clamped base input tokens to valid range [0, {}]".format(
+                                        step, vocab_size - 1
+                                    ),
+                                    flush=True,
+                                )
+                    
+                    # CRITICAL: Device synchronization before graph capture/replay
+                    if self.device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
                     # For verification, always use greedy (argmax) to ensure deterministic matching
                     base_tokens, base_logits = self.base_lm.generate_tokens(
                         active_input_ids,
