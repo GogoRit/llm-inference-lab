@@ -165,13 +165,18 @@ class HFWrapper(LanguageModel):
                 vocab_size = getattr(self._model.config, "vocab_size", None)
                 if vocab_size is not None:
                     if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                        max_token = input_ids.max().item()
-                        min_token = input_ids.min().item()
+                        # Get min/max safely - move to CPU first to avoid CUDA errors
+                        try:
+                            max_token = input_ids.cpu().max().item()
+                            min_token = input_ids.cpu().min().item()
+                        except Exception:
+                            max_token = vocab_size  # Assume worst case
+                            min_token = -1
                         invalid_count = (
                             ((input_ids >= vocab_size) | (input_ids < 0)).sum().item()
                         )
                         self.logger.error(
-                            "[HF-WRAPPER] Invalid token indices detected in generate_tokens: "
+                            "[HF-WRAPPER] Invalid token indices detected: "
                             "min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
                             min_token,
                             max_token,
@@ -210,11 +215,17 @@ class HFWrapper(LanguageModel):
                     vocab_size = getattr(self._model.config, "vocab_size", None)
                     if vocab_size is not None:
                         if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                            max_token = input_ids.max().item()
-                            min_token = input_ids.min().item()
+                            # Get min/max safely - move to CPU first to avoid CUDA errors
+                            try:
+                                max_token = input_ids.cpu().max().item()
+                                min_token = input_ids.cpu().min().item()
+                            except Exception:
+                                max_token = vocab_size  # Assume worst case
+                                min_token = -1
                             print(
                                 f"[ERROR] Invalid tokens after device transfer: "
-                                f"min={min_token}, max={max_token}, vocab={vocab_size}",
+                                f"min={min_token}, max={max_token}, "
+                                f"vocab={vocab_size}",
                                 flush=True,
                             )
                             # Clamp invalid tokens to valid range
@@ -232,11 +243,17 @@ class HFWrapper(LanguageModel):
                     vocab_size = getattr(self._model.config, "vocab_size", None)
                     if vocab_size is not None:
                         if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                            max_token = input_ids.max().item()
-                            min_token = input_ids.min().item()
+                            # Get min/max safely - move to CPU first to avoid CUDA errors
+                            try:
+                                max_token = input_ids.cpu().max().item()
+                                min_token = input_ids.cpu().min().item()
+                            except Exception:
+                                max_token = vocab_size  # Assume worst case
+                                min_token = -1
                             print(
                                 f"[ERROR] Invalid tokens before model.generate(): "
-                                f"min={min_token}, max={max_token}, vocab={vocab_size}",
+                                f"min={min_token}, max={max_token}, "
+                                f"vocab={vocab_size}",
                                 flush=True,
                             )
                             # Clamp invalid tokens
@@ -322,8 +339,13 @@ class HFWrapper(LanguageModel):
             vocab_size = getattr(self._model.config, "vocab_size", None)
             if vocab_size is not None:
                 if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                    max_token = input_ids.max().item()
-                    min_token = input_ids.min().item()
+                    # Get min/max safely - move to CPU first to avoid CUDA errors
+                    try:
+                        max_token = input_ids.cpu().max().item()
+                        min_token = input_ids.cpu().min().item()
+                    except Exception:
+                        max_token = vocab_size  # Assume worst case
+                        min_token = -1
                     invalid_count = (
                         ((input_ids >= vocab_size) | (input_ids < 0)).sum().item()
                     )
@@ -338,8 +360,9 @@ class HFWrapper(LanguageModel):
                     )
                     print(
                         f"[ERROR] Invalid tokens in _generate_tokens_async: "
-                        f"min={min_token}, max={max_token}, vocab={vocab_size}, "
-                        f"invalid={invalid_count}/{input_ids.numel()}",
+                        f"min={min_token}, max={max_token}, "
+                        f"vocab={vocab_size}, invalid={invalid_count}/"
+                        f"{input_ids.numel()}",
                         flush=True,
                     )
                     # Clamp invalid tokens to valid range
@@ -356,8 +379,13 @@ class HFWrapper(LanguageModel):
                     vocab_size = getattr(self._model.config, "vocab_size", None)
                     if vocab_size is not None:
                         if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                            max_token = input_ids.max().item()
-                            min_token = input_ids.min().item()
+                            # Get min/max safely - move to CPU first to avoid CUDA errors
+                            try:
+                                max_token = input_ids.cpu().max().item()
+                                min_token = input_ids.cpu().min().item()
+                            except Exception:
+                                max_token = vocab_size  # Assume worst case
+                                min_token = -1
                             print(
                                 f"[ERROR] Invalid tokens after device transfer in async: "
                                 f"min={min_token}, max={max_token}, vocab={vocab_size}",
@@ -387,8 +415,13 @@ class HFWrapper(LanguageModel):
                             if (current_input >= vocab_size).any() or (
                                 current_input < 0
                             ).any():
-                                max_token = current_input.max().item()
-                                min_token = current_input.min().item()
+                                # Get min/max safely - move to CPU first to avoid CUDA errors
+                                try:
+                                    max_token = current_input.cpu().max().item()
+                                    min_token = current_input.cpu().min().item()
+                                except Exception:
+                                    max_token = vocab_size  # Assume worst case
+                                    min_token = -1
                                 invalid_count = (
                                     (
                                         (current_input >= vocab_size)
@@ -416,11 +449,12 @@ class HFWrapper(LanguageModel):
                         if hasattr(self._model, "config"):
                             vocab_size = getattr(self._model.config, "vocab_size", None)
                             if vocab_size is not None:
-                                if (current_input >= vocab_size).any() or (
+                                # Check for invalid tokens using safe operations
+                                has_invalid = (current_input >= vocab_size).any() or (
                                     current_input < 0
-                                ).any():
-                                    max_token = current_input.max().item()
-                                    min_token = current_input.min().item()
+                                ).any()
+                                if has_invalid:
+                                    # Calculate invalid count safely
                                     invalid_count = (
                                         (
                                             (current_input >= vocab_size)
@@ -429,6 +463,21 @@ class HFWrapper(LanguageModel):
                                         .sum()
                                         .item()
                                     )
+
+                                    # Get min/max safely - move to CPU first to avoid CUDA errors
+                                    try:
+                                        max_token = current_input.cpu().max().item()
+                                        min_token = current_input.cpu().min().item()
+                                    except Exception as cpu_err:
+                                        # If even CPU fails, tensor is severely corrupted
+                                        print(
+                                            f"[CRITICAL ERROR] Async loop step {step}: Cannot read tensor values! "
+                                            f"Error: {cpu_err}",
+                                            flush=True,
+                                        )
+                                        max_token = vocab_size  # Assume worst case
+                                        min_token = -1
+
                                     print(
                                         f"[CRITICAL ERROR] Async loop step {step}: Invalid tokens RIGHT before model forward! "
                                         f"min={min_token}, max={max_token}, vocab={vocab_size}, "
@@ -436,7 +485,7 @@ class HFWrapper(LanguageModel):
                                         f"current_input.shape={current_input.shape}, dtype={current_input.dtype}",
                                         flush=True,
                                     )
-                                    # Force clamp - this should NEVER happen but prevent crash
+                                    # Force clamp BEFORE any other operations
                                     current_input = current_input.clamp(
                                         min=0, max=vocab_size - 1
                                     )
@@ -461,11 +510,12 @@ class HFWrapper(LanguageModel):
                         if hasattr(self._model, "config"):
                             vocab_size = getattr(self._model.config, "vocab_size", None)
                             if vocab_size is not None:
-                                if (current_input >= vocab_size).any() or (
+                                # Check for invalid tokens using safe operations
+                                has_invalid = (current_input >= vocab_size).any() or (
                                     current_input < 0
-                                ).any():
-                                    max_token = current_input.max().item()
-                                    min_token = current_input.min().item()
+                                ).any()
+                                if has_invalid:
+                                    # Calculate invalid count safely
                                     invalid_count = (
                                         (
                                             (current_input >= vocab_size)
@@ -474,13 +524,28 @@ class HFWrapper(LanguageModel):
                                         .sum()
                                         .item()
                                     )
+
+                                    # Get min/max safely - move to CPU first to avoid CUDA errors
+                                    try:
+                                        max_token = current_input.cpu().max().item()
+                                        min_token = current_input.cpu().min().item()
+                                    except Exception as cpu_err:
+                                        # If even CPU fails, tensor is severely corrupted
+                                        print(
+                                            f"[CRITICAL ERROR] Async loop step {step} (no past_kv): Cannot read tensor values! "
+                                            f"Error: {cpu_err}",
+                                            flush=True,
+                                        )
+                                        max_token = vocab_size  # Assume worst case
+                                        min_token = -1
+
                                     print(
                                         f"[CRITICAL ERROR] Async loop step {step} (no past_kv): Invalid tokens RIGHT before model forward! "
                                         f"min={min_token}, max={max_token}, vocab={vocab_size}, "
                                         f"invalid={invalid_count}/{current_input.numel()}",
                                         flush=True,
                                     )
-                                    # Force clamp
+                                    # Force clamp BEFORE any other operations
                                     current_input = current_input.clamp(
                                         min=0, max=vocab_size - 1
                                     )
@@ -549,8 +614,13 @@ class HFWrapper(LanguageModel):
                             if (next_token >= vocab_size).any() or (
                                 next_token < 0
                             ).any():
-                                max_token = next_token.max().item()
-                                min_token = next_token.min().item()
+                                # Get min/max safely - move to CPU first to avoid CUDA errors
+                                try:
+                                    max_token = next_token.cpu().max().item()
+                                    min_token = next_token.cpu().min().item()
+                                except Exception:
+                                    max_token = vocab_size  # Assume worst case
+                                    min_token = -1
                                 self.logger.error(
                                     "[HF-WRAPPER] Invalid token index generated: "
                                     "min=%d, max=%d, vocab_size=%d",
@@ -651,8 +721,13 @@ class HFWrapper(LanguageModel):
             vocab_size = getattr(self._model.config, "vocab_size", None)
             if vocab_size is not None:
                 if (new_input_ids >= vocab_size).any() or (new_input_ids < 0).any():
-                    max_token = new_input_ids.max().item()
-                    min_token = new_input_ids.min().item()
+                    # Get min/max safely - move to CPU first to avoid CUDA errors
+                    try:
+                        max_token = new_input_ids.cpu().max().item()
+                        min_token = new_input_ids.cpu().min().item()
+                    except Exception:
+                        max_token = vocab_size  # Assume worst case
+                        min_token = -1
                     print(
                         f"[ERROR] Invalid tokens in _generate_with_kv_cache: "
                         f"min={min_token}, max={max_token}, vocab={vocab_size}",
@@ -693,8 +768,13 @@ class HFWrapper(LanguageModel):
             vocab_size = getattr(self._model.config, "vocab_size", None)
             if vocab_size is not None:
                 if (next_token >= vocab_size).any() or (next_token < 0).any():
-                    max_token = next_token.max().item()
-                    min_token = next_token.min().item()
+                    # Get min/max safely - move to CPU first to avoid CUDA errors
+                    try:
+                        max_token = next_token.cpu().max().item()
+                        min_token = next_token.cpu().min().item()
+                    except Exception:
+                        max_token = vocab_size  # Assume worst case
+                        min_token = -1
                     # Clamp invalid tokens to valid range
                     next_token = next_token.clamp(min=0, max=vocab_size - 1)
                     print(
@@ -712,8 +792,13 @@ class HFWrapper(LanguageModel):
                 vocab_size = getattr(self._model.config, "vocab_size", None)
                 if vocab_size is not None:
                     if (next_token >= vocab_size).any() or (next_token < 0).any():
-                        max_token = next_token.max().item()
-                        min_token = next_token.min().item()
+                        # Get min/max safely - move to CPU first to avoid CUDA errors
+                        try:
+                            max_token = next_token.cpu().max().item()
+                            min_token = next_token.cpu().min().item()
+                        except Exception:
+                            max_token = vocab_size  # Assume worst case
+                            min_token = -1
                         print(
                             f"[ERROR] Invalid next_token in _generate_with_kv_cache loop: "
                             f"min={min_token}, max={max_token}, vocab={vocab_size}",
@@ -744,8 +829,13 @@ class HFWrapper(LanguageModel):
                 vocab_size = getattr(self._model.config, "vocab_size", None)
                 if vocab_size is not None:
                     if (next_token >= vocab_size).any() or (next_token < 0).any():
-                        max_token = next_token.max().item()
-                        min_token = next_token.min().item()
+                        # Get min/max safely - move to CPU first to avoid CUDA errors
+                        try:
+                            max_token = next_token.cpu().max().item()
+                            min_token = next_token.cpu().min().item()
+                        except Exception:
+                            max_token = vocab_size  # Assume worst case
+                            min_token = -1
                         # Clamp invalid tokens to valid range
                         next_token = next_token.clamp(min=0, max=vocab_size - 1)
                         print(

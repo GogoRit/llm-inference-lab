@@ -1179,7 +1179,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                         )
                         if vocab_size is not None:
                             if (current_input >= vocab_size).any():
-                                max_token = current_input.max().item()
+                                # Get max safely - move to CPU first to avoid CUDA errors
+                                try:
+                                    max_token = current_input.cpu().max().item()
+                                except Exception:
+                                    max_token = vocab_size  # Assume worst case
                                 logger.error(
                                     "[BASE] Invalid token index detected: %d >= %d",
                                     max_token,
@@ -1919,7 +1923,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 )
 
                 # Pre-allocate list to avoid repeated appends
-                padded_seqs = [None] * len(active_seqs)
+                padded_seqs: List[Optional[torch.Tensor]] = [None] * len(active_seqs)
                 for i, seq in enumerate(active_seqs):
                     if seq.shape[0] < max_seq_len:
                         # Pad with validated pad_token_id
@@ -1937,8 +1941,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                             if (seq_padded >= vocab_size).any() or (
                                 seq_padded < 0
                             ).any():
-                                max_val = seq_padded.max().item()
-                                min_val = seq_padded.min().item()
+                                # Get min/max safely - move to CPU first to avoid CUDA errors
+                                try:
+                                    max_val = seq_padded.cpu().max().item()
+                                    min_val = seq_padded.cpu().min().item()
+                                except Exception:
+                                    max_val = vocab_size  # Assume worst case
+                                    min_val = -1
                                 print(
                                     f"[ERROR] Step {step}, seq {i}: Invalid tokens after padding! "
                                     f"min={min_val}, max={max_val}, vocab={vocab_size}, pad_value={pad_value}",
@@ -1966,8 +1975,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if (active_input_ids >= vocab_size).any() or (
                             active_input_ids < 0
                         ).any():
-                            max_token = active_input_ids.max().item()
-                            min_token = active_input_ids.min().item()
+                            # Get min/max safely - move to CPU first to avoid CUDA errors
+                            try:
+                                max_token = active_input_ids.cpu().max().item()
+                                min_token = active_input_ids.cpu().min().item()
+                            except Exception:
+                                max_token = vocab_size  # Assume worst case
+                                min_token = -1
                             invalid_count = (
                                 (
                                     (active_input_ids >= vocab_size)
@@ -2152,8 +2166,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                             if (active_input_ids >= vocab_size).any() or (
                                 active_input_ids < 0
                             ).any():
-                                max_token = active_input_ids.max().item()
-                                min_token = active_input_ids.min().item()
+                                # Get min/max safely - move to CPU first to avoid CUDA errors
+                                try:
+                                    max_token = active_input_ids.cpu().max().item()
+                                    min_token = active_input_ids.cpu().min().item()
+                                except Exception:
+                                    max_token = vocab_size  # Assume worst case
+                                    min_token = -1
                                 invalid_count = (
                                     (
                                         (active_input_ids >= vocab_size)
@@ -2206,11 +2225,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                         self.draft_lm._model.config, "vocab_size", None
                     )
                     if vocab_size is not None:
-                        if (active_input_ids >= vocab_size).any() or (
+                        # Check for invalid tokens using safe operations
+                        # Use .any() checks first to avoid calling .min()/.max() on corrupted tensors
+                        has_invalid = (active_input_ids >= vocab_size).any() or (
                             active_input_ids < 0
-                        ).any():
-                            max_token = active_input_ids.max().item()
-                            min_token = active_input_ids.min().item()
+                        ).any()
+                        if has_invalid:
+                            # Calculate invalid count safely
                             invalid_count = (
                                 (
                                     (active_input_ids >= vocab_size)
@@ -2219,6 +2240,21 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 .sum()
                                 .item()
                             )
+
+                            # Get min/max safely - move to CPU first to avoid CUDA errors
+                            try:
+                                max_token = active_input_ids.cpu().max().item()
+                                min_token = active_input_ids.cpu().min().item()
+                            except Exception as cpu_err:
+                                # If even CPU fails, tensor is severely corrupted
+                                print(
+                                    f"[CRITICAL ERROR] Step {step}: Cannot read tensor values! "
+                                    f"Error: {cpu_err}",
+                                    flush=True,
+                                )
+                                max_token = vocab_size  # Assume worst case
+                                min_token = -1
+
                             print(
                                 "[CRITICAL ERROR] Step {}: Invalid tokens IMMEDIATELY before draft model! "
                                 "min={}, max={}, vocab={}, invalid={}/{}".format(
@@ -2231,7 +2267,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 ),
                                 flush=True,
                             )
-                            # Force clamp to prevent crash
+                            # Force clamp to prevent crash - do this BEFORE any other operations
                             active_input_ids = active_input_ids.clamp(
                                 min=0, max=vocab_size - 1
                             )
@@ -2256,7 +2292,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 print(
                                     f"[CRITICAL ERROR] Step {step}: CUDA embedding error in draft model!\n"
                                     f"active_input_ids.shape={active_input_ids.shape}\n"
-                                    f"active_input_ids.min()={active_input_ids.min().item()}, max()={active_input_ids.max().item()}\n"
+                                    f"active_input_ids (min/max unavailable - tensor corrupted)\n"
                                     f"vocab_size={getattr(self.draft_lm._model.config, 'vocab_size', 'unknown') if hasattr(self.draft_lm, '_model') else 'unknown'}\n"
                                     f"Error: {e}",
                                     flush=True,
@@ -2637,7 +2673,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 print(
                                     f"[CRITICAL ERROR] Step {step}: CUDA embedding error in base model (scheduler path)!\n"
                                     f"active_input_ids.shape={active_input_ids.shape}\n"
-                                    f"active_input_ids.min()={active_input_ids.min().item()}, max()={active_input_ids.max().item()}\n"
+                                    f"active_input_ids (min/max unavailable - tensor corrupted)\n"
                                     f"vocab_size={getattr(self.base_lm._model.config, 'vocab_size', 'unknown') if hasattr(self.base_lm, '_model') else 'unknown'}\n"
                                     f"base_past_kv is None={base_past_kv is None}\n"
                                     f"Error: {e}",
@@ -2836,12 +2872,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                             self.base_lm._model.config, "vocab_size", None
                         )
                         if vocab_size is not None:
-                            # Check both >= vocab_size and < 0
-                            if (active_input_ids >= vocab_size).any() or (
+                            # Check for invalid tokens using safe operations
+                            # Use .any() checks first to avoid calling .min()/.max() on corrupted tensors
+                            has_invalid = (active_input_ids >= vocab_size).any() or (
                                 active_input_ids < 0
-                            ).any():
-                                max_token = active_input_ids.max().item()
-                                min_token = active_input_ids.min().item()
+                            ).any()
+                            if has_invalid:
+                                # Calculate invalid count safely
                                 invalid_count = (
                                     (
                                         (active_input_ids >= vocab_size)
@@ -2850,6 +2887,21 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     .sum()
                                     .item()
                                 )
+
+                                # Get min/max safely - move to CPU first to avoid CUDA errors
+                                try:
+                                    max_token = active_input_ids.cpu().max().item()
+                                    min_token = active_input_ids.cpu().min().item()
+                                except Exception as cpu_err:
+                                    # If even CPU fails, tensor is severely corrupted
+                                    print(
+                                        f"[CRITICAL ERROR] Step {step}: Cannot read tensor values! "
+                                        f"Error: {cpu_err}",
+                                        flush=True,
+                                    )
+                                    max_token = vocab_size  # Assume worst case
+                                    min_token = -1
+
                                 logger.error(
                                     "[BASE] Invalid token index detected: min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
                                     min_token,
@@ -2870,7 +2922,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     ),
                                     flush=True,
                                 )
-                                # Clamp invalid tokens to valid range
+                                # Force clamp to prevent crash - do this BEFORE any other operations
                                 active_input_ids = active_input_ids.clamp(
                                     min=0, max=vocab_size - 1
                                 )
@@ -3233,8 +3285,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 if (accepted_tokens_tensor >= vocab_size).any() or (
                                     accepted_tokens_tensor < 0
                                 ).any():
-                                    max_token = accepted_tokens_tensor.max().item()
-                                    min_token = accepted_tokens_tensor.min().item()
+                                    # Get min/max safely - move to CPU first to avoid CUDA errors
+                                    try:
+                                        max_token = (
+                                            accepted_tokens_tensor.cpu().max().item()
+                                        )
+                                        min_token = (
+                                            accepted_tokens_tensor.cpu().min().item()
+                                        )
+                                    except Exception:
+                                        max_token = vocab_size  # Assume worst case
+                                        min_token = -1
                                     print(
                                         f"[ERROR] Step {step}, prompt {global_idx}: "
                                         f"Invalid tokens in tensor before concat: "
@@ -3261,8 +3322,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 if (current_seq >= vocab_size).any() or (
                                     current_seq < 0
                                 ).any():
-                                    max_token = current_seq.max().item()
-                                    min_token = current_seq.min().item()
+                                    # Get min/max safely - move to CPU first to avoid CUDA errors
+                                    try:
+                                        max_token = current_seq.cpu().max().item()
+                                        min_token = current_seq.cpu().min().item()
+                                    except Exception:
+                                        max_token = vocab_size  # Assume worst case
+                                        min_token = -1
                                     print(
                                         f"[ERROR] Step {step}, prompt {global_idx}: "
                                         f"Invalid tokens in current_seq before concat: "
@@ -3300,8 +3366,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 if (updated_seq >= vocab_size).any() or (
                                     updated_seq < 0
                                 ).any():
-                                    max_token = updated_seq.max().item()
-                                    min_token = updated_seq.min().item()
+                                    # Get min/max safely - move to CPU first to avoid CUDA errors
+                                    try:
+                                        max_token = updated_seq.cpu().max().item()
+                                        min_token = updated_seq.cpu().min().item()
+                                    except Exception:
+                                        max_token = vocab_size  # Assume worst case
+                                        min_token = -1
                                     invalid_count = (
                                         (
                                             (updated_seq >= vocab_size)
