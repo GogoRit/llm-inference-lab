@@ -55,9 +55,7 @@ def filter_kv_cache_safe(
 
     # Convert active_indices to tensor if needed, ensure correct device
     if not isinstance(active_indices, torch.Tensor):
-        active_indices_tensor = torch.tensor(
-            active_indices, dtype=torch.long, device=cache.device
-        )
+        active_indices_tensor = torch.tensor(active_indices, dtype=torch.long, device=cache.device)
     else:
         active_indices_tensor = active_indices.to(cache.device, non_blocking=True)
 
@@ -73,9 +71,7 @@ def filter_kv_cache_safe(
             cache_batch - 1,
         )
         print(
-            "[WARNING] Clipped {} invalid indices in {} KV cache".format(
-                invalid_count, name
-            ),
+            "[WARNING] Clipped {} invalid indices in {} KV cache".format(invalid_count, name),
             flush=True,
         )
         active_indices_tensor = active_indices_tensor[valid_mask]
@@ -263,9 +259,7 @@ class SpeculativePipeline(SpeculativeDecoder):
         self.graph_output_logits = None
         self.graph_outputs = None
 
-        logger.debug(
-            "CUDA graph capture disabled (required for dynamic speculative decoding)"
-        )
+        logger.debug("CUDA graph capture disabled (required for dynamic speculative decoding)")
 
         # Set deterministic flags
         self.deterministic = self.config.get("deterministic", False)
@@ -521,12 +515,10 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         if not compatible:
             self.logger.warning(
-                f"Tokenizer incompatibility detected: "
-                f"base={base_info}, draft={draft_info}"
+                f"Tokenizer incompatibility detected: " f"base={base_info}, draft={draft_info}"
             )
             self.logger.warning(
-                "Different tokenizer families detected. This may reduce "
-                "acceptance rates."
+                "Different tokenizer families detected. This may reduce " "acceptance rates."
             )
 
     def _generate_medusa_tokens(
@@ -611,12 +603,8 @@ class SpeculativePipeline(SpeculativeDecoder):
             )
 
             # Get last hidden state
-            last_hidden_state = outputs.hidden_states[
-                -1
-            ]  # [batch_size, seq_len, hidden_size]
-            current_hidden = last_hidden_state[
-                :, -1:, :
-            ]  # [batch_size, 1, hidden_size]
+            last_hidden_state = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
+            current_hidden = last_hidden_state[:, -1:, :]  # [batch_size, 1, hidden_size]
 
             # Create multiple prediction heads (simplified Medusa)
             num_heads = self.config.get("medusa", {}).get("num_heads", 2)
@@ -652,9 +640,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         head_logits = head_logits / temperature
 
                     probs = torch.softmax(head_logits, dim=-1)
-                    next_token = torch.multinomial(
-                        probs.squeeze(1), 1
-                    )  # [batch_size, 1]
+                    next_token = torch.multinomial(probs.squeeze(1), 1)  # [batch_size, 1]
                     step_tokens.append(next_token)
 
                 if not step_tokens:
@@ -672,20 +658,12 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         # Concatenate generated tokens
         if generated_tokens:
-            draft_tokens = torch.cat(
-                generated_tokens, dim=1
-            )  # [batch_size, num_generated]
-            draft_logits = torch.cat(
-                all_logits, dim=1
-            )  # [batch_size, num_generated, vocab_size]
+            draft_tokens = torch.cat(generated_tokens, dim=1)  # [batch_size, num_generated]
+            draft_logits = torch.cat(all_logits, dim=1)  # [batch_size, num_generated, vocab_size]
         else:
             batch_size = input_ids.shape[0]
-            draft_tokens = torch.empty(
-                batch_size, 0, dtype=torch.long, device=input_ids.device
-            )
-            draft_logits = torch.empty(
-                batch_size, 0, vocab_size, device=input_ids.device
-            )
+            draft_tokens = torch.empty(batch_size, 0, dtype=torch.long, device=input_ids.device)
+            draft_logits = torch.empty(batch_size, 0, vocab_size, device=input_ids.device)
 
         draft_info = {
             "mode": "medusa_hf",
@@ -725,18 +703,12 @@ class SpeculativePipeline(SpeculativeDecoder):
             )
 
             # Get last hidden state
-            last_hidden_state = outputs.hidden_states[
-                -1
-            ]  # [batch_size, seq_len, hidden_size]
-            current_hidden = last_hidden_state[
-                :, -1:, :
-            ]  # [batch_size, 1, hidden_size]
+            last_hidden_state = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
+            current_hidden = last_hidden_state[:, -1:, :]  # [batch_size, 1, hidden_size]
 
             # Initialize state tracking
             if not hasattr(self, "_eagle_last_hidden_states"):
-                self._eagle_last_hidden_states = (
-                    current_hidden  # [batch_size, 1, hidden_size]
-                )
+                self._eagle_last_hidden_states = current_hidden  # [batch_size, 1, hidden_size]
             else:
                 # Update with new hidden state
                 self._eagle_last_hidden_states = torch.cat(
@@ -756,9 +728,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                     h_t_minus_1 = self._eagle_last_hidden_states[
                         :, -2, :
                     ]  # [batch_size, hidden_size]
-                    h_t = self._eagle_last_hidden_states[
-                        :, -1, :
-                    ]  # [batch_size, hidden_size]
+                    h_t = self._eagle_last_hidden_states[:, -1, :]  # [batch_size, hidden_size]
 
                     # EAGLE extrapolation: h_next = h_t + alpha * (h_t - h_t_minus_1)
                     h_next = h_t + alpha * (h_t - h_t_minus_1)
@@ -771,14 +741,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                 next_logits = lm_head(h_next)  # [batch_size, vocab_size]
 
                 # Sample next token
-                next_token = torch.argmax(
-                    next_logits, dim=-1, keepdim=True
-                )  # [batch_size, 1]
+                next_token = torch.argmax(next_logits, dim=-1, keepdim=True)  # [batch_size, 1]
 
                 generated_tokens.append(next_token)
-                all_logits.append(
-                    next_logits.unsqueeze(1)
-                )  # [batch_size, 1, vocab_size]
+                all_logits.append(next_logits.unsqueeze(1))  # [batch_size, 1, vocab_size]
 
                 # Update state for next iteration
                 h_next_expanded = h_next.unsqueeze(1)  # [batch_size, 1, hidden_size]
@@ -788,29 +754,19 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Keep only last 2 states for next extrapolation
                 if self._eagle_last_hidden_states.shape[1] > 2:
-                    self._eagle_last_hidden_states = self._eagle_last_hidden_states[
-                        :, -2:, :
-                    ]
+                    self._eagle_last_hidden_states = self._eagle_last_hidden_states[:, -2:, :]
 
         generation_time_ms = (time.time() - start_time) * 1000
 
         # Concatenate generated tokens
         if generated_tokens:
-            draft_tokens = torch.cat(
-                generated_tokens, dim=1
-            )  # [batch_size, num_generated]
-            draft_logits = torch.cat(
-                all_logits, dim=1
-            )  # [batch_size, num_generated, vocab_size]
+            draft_tokens = torch.cat(generated_tokens, dim=1)  # [batch_size, num_generated]
+            draft_logits = torch.cat(all_logits, dim=1)  # [batch_size, num_generated, vocab_size]
         else:
             batch_size = input_ids.shape[0]
             vocab_size = tokenizer.vocab_size
-            draft_tokens = torch.empty(
-                batch_size, 0, dtype=torch.long, device=input_ids.device
-            )
-            draft_logits = torch.empty(
-                batch_size, 0, vocab_size, device=input_ids.device
-            )
+            draft_tokens = torch.empty(batch_size, 0, dtype=torch.long, device=input_ids.device)
+            draft_logits = torch.empty(batch_size, 0, vocab_size, device=input_ids.device)
 
         draft_info = {
             "mode": "eagle_hf",
@@ -875,16 +831,12 @@ class SpeculativePipeline(SpeculativeDecoder):
 
             # Create dummy outputs for graph
             vocab_size = (
-                base_model._tokenizer.vocab_size
-                if hasattr(base_model, "_tokenizer")
-                else 50257
+                base_model._tokenizer.vocab_size if hasattr(base_model, "_tokenizer") else 50257
             )
             graph_output_tokens = torch.zeros(
                 (batch_size, k), dtype=torch.long, device=input_ids.device
             )
-            graph_output_logits = torch.zeros(
-                (batch_size, k, vocab_size), device=input_ids.device
-            )
+            graph_output_logits = torch.zeros((batch_size, k, vocab_size), device=input_ids.device)
             self.graph_output_tokens = graph_output_tokens  # type: ignore[assignment]
             self.graph_output_logits = graph_output_logits  # type: ignore[assignment]
             self.graph_outputs = (graph_output_tokens, graph_output_logits)  # type: ignore[assignment]
@@ -912,31 +864,22 @@ class SpeculativePipeline(SpeculativeDecoder):
                     **kwargs,
                 )
                 # Capture outputs into pre-allocated tensors
-                assert (
-                    self.graph_output_tokens is not None
-                    and self.graph_output_logits is not None
-                )
+                assert self.graph_output_tokens is not None and self.graph_output_logits is not None
                 self.graph_output_tokens.copy_(out_tokens)
                 self.graph_output_logits.copy_(out_logits)
 
             self.cuda_graph_captured = True
-            logger.info(
-                f"CUDA graph captured successfully for K={k}, seq_len={seq_len}"
-            )
+            logger.info(f"CUDA graph captured successfully for K={k}, seq_len={seq_len}")
             return True
 
         except Exception as e:
             # Fallback to eager mode
-            logger.warning(
-                f"CUDA graph capture failed, falling back to eager mode: {e}"
-            )
+            logger.warning(f"CUDA graph capture failed, falling back to eager mode: {e}")
             self.enable_cuda_graph = False
             self.cuda_graph_captured = False
             return False
 
-    def _replay_cuda_graph(
-        self, input_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _replay_cuda_graph(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Replay captured CUDA graph for verification step (Phase 3D).
 
@@ -1031,14 +974,10 @@ class SpeculativePipeline(SpeculativeDecoder):
         try:
             # Use optimization context if available, otherwise use AMP context
             if self.optimization_manager:
-                optimization_context = (
-                    self.optimization_manager.get_optimization_context()
-                )
+                optimization_context = self.optimization_manager.get_optimization_context()
             else:
                 optimization_context = (
-                    amp_context(self.device, self.dtype)
-                    if self.amp_enabled
-                    else torch.no_grad()
+                    amp_context(self.device, self.dtype) if self.amp_enabled else torch.no_grad()
                 )
 
             with optimization_context:
@@ -1062,9 +1001,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 f"max_tokens={max_tokens}"
             )
 
-            while (
-                len(generated_tokens) < max_tokens and step < max_tokens * 2
-            ):  # Safety limit
+            while len(generated_tokens) < max_tokens and step < max_tokens * 2:  # Safety limit
                 self.logger.debug(
                     f"Loop condition: len(generated_tokens)={len(generated_tokens)} "
                     f"< max_tokens={max_tokens} and step={step} "
@@ -1078,8 +1015,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                     "step": step,
                     "generated_tokens": len(generated_tokens),
                     "acceptance_rate": (
-                        self.metrics["total_accepted"]
-                        / max(self.metrics["total_proposed"], 1)
+                        self.metrics["total_accepted"] / max(self.metrics["total_proposed"], 1)
                     ),
                 }
                 self.logger.debug(f"Context: {context}")
@@ -1106,17 +1042,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                     )
                 elif draft_mode == "medusa":
                     # Use Medusa draftor
-                    draft_tokens, draft_logits, draft_info = (
-                        self._generate_medusa_tokens(
-                            current_input, k, temperature, do_sample, **kwargs
-                        )
+                    draft_tokens, draft_logits, draft_info = self._generate_medusa_tokens(
+                        current_input, k, temperature, do_sample, **kwargs
                     )
                 elif draft_mode == "eagle":
                     # Use EAGLE draftor
-                    draft_tokens, draft_logits, draft_info = (
-                        self._generate_eagle_tokens(
-                            current_input, k, temperature, do_sample, **kwargs
-                        )
+                    draft_tokens, draft_logits, draft_info = self._generate_eagle_tokens(
+                        current_input, k, temperature, do_sample, **kwargs
                     )
                 else:
                     raise ValueError(f"Unknown draft mode: {draft_mode}")
@@ -1155,9 +1087,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 if use_graph:
                     try:
                         verify_start = time.time()
-                        base_tokens, base_logits = self._replay_cuda_graph(
-                            current_input
-                        )
+                        base_tokens, base_logits = self._replay_cuda_graph(current_input)
                         verify_time_ms = (time.time() - verify_start) * 1000
                         verify_info = {
                             "verification_time_ms": verify_time_ms,
@@ -1171,12 +1101,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                 if not use_graph:
                     # CRITICAL: Validate tokens before model forward pass
                     # This prevents invalid token indices from crashing CUDA kernels
-                    if hasattr(self.base_lm, "_model") and hasattr(
-                        self.base_lm._model, "config"
-                    ):
-                        vocab_size = getattr(
-                            self.base_lm._model.config, "vocab_size", None
-                        )
+                    if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
+                        vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                         if vocab_size is not None:
                             if (current_input >= vocab_size).any():
                                 # Get max safely - move to CPU first to avoid CUDA errors
@@ -1289,24 +1215,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                             # Get the base model's last generated KV cache
                             if hasattr(self.base_lm, "get_last_generated_kv"):
                                 base_kv = self.base_lm.get_last_generated_kv()
-                                if (
-                                    base_kv is not None
-                                    and accepted_len <= base_kv.seq_len
-                                ):
+                                if base_kv is not None and accepted_len <= base_kv.seq_len:
                                     # Slice to accepted length
                                     accepted_kv = base_kv.slice_prefix(accepted_len)
                                     # Append to base model's cache
                                     self.base_lm.append_kv_cache(accepted_kv)
                                     # Update metrics
-                                    self.metrics[
-                                        "kv_appended_tokens_total"
-                                    ] += accepted_len
-                                    kv_append_time_ms = (
-                                        time.time() - kv_append_start
-                                    ) * 1000
-                                    self.metrics[
-                                        "kv_append_time_ms"
-                                    ] += kv_append_time_ms
+                                    self.metrics["kv_appended_tokens_total"] += accepted_len
+                                    kv_append_time_ms = (time.time() - kv_append_start) * 1000
+                                    self.metrics["kv_append_time_ms"] += kv_append_time_ms
                                     # Phase 3D: structured profiling hook for KV append
                                     try:
                                         if getattr(
@@ -1334,15 +1251,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                         remaining_tokens = max_tokens - len(generated_tokens)
                         if remaining_tokens > 0:
                             # Only accept up to the remaining limit
-                            tokens_to_accept = min(
-                                accepted_tokens.shape[1], remaining_tokens
-                            )
-                            accepted_tokens_limited = accepted_tokens[
-                                :, :tokens_to_accept
-                            ]
-                            generated_tokens.extend(
-                                accepted_tokens_limited[0].cpu().tolist()
-                            )
+                            tokens_to_accept = min(accepted_tokens.shape[1], remaining_tokens)
+                            accepted_tokens_limited = accepted_tokens[:, :tokens_to_accept]
+                            generated_tokens.extend(accepted_tokens_limited[0].cpu().tolist())
                             current_input = torch.cat(
                                 [current_input, accepted_tokens_limited], dim=1
                             )
@@ -1367,9 +1278,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                         if fallback_tokens.numel() > 0:
                             generated_tokens.extend(fallback_tokens[0].cpu().tolist())
-                            current_input = torch.cat(
-                                [current_input, fallback_tokens], dim=1
-                            )
+                            current_input = torch.cat([current_input, fallback_tokens], dim=1)
 
                         self.metrics["total_generation_time_ms"] += (
                             time.time() - step_start
@@ -1388,9 +1297,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             draft_time_ms=draft_time_ms,
                             verify_time_ms=verify_time_ms,
                             acceptance_time_ms=0.0,
-                            kv_append_time_ms=self.metrics.get(
-                                "kv_append_time_ms", 0.0
-                            ),
+                            kv_append_time_ms=self.metrics.get("kv_append_time_ms", 0.0),
                             accepted_len=accepted_len,
                             proposed_len=int(draft_tokens.shape[1]),
                         )
@@ -1399,17 +1306,12 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Check for early stopping
                 if len(generated_tokens) >= max_tokens:
-                    self.logger.debug(
-                        f"Early stopping: {len(generated_tokens)} >= {max_tokens}"
-                    )
+                    self.logger.debug(f"Early stopping: {len(generated_tokens)} >= {max_tokens}")
                     break
 
                 # Check for EOS token
                 base_info = self.base_lm.get_tokenizer_info()
-                if (
-                    generated_tokens
-                    and generated_tokens[-1] == base_info["eos_token_id"]
-                ):
+                if generated_tokens and generated_tokens[-1] == base_info["eos_token_id"]:
                     self.logger.info("EOS token generated, stopping")
                     break
 
@@ -1446,9 +1348,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 else 0.0
             )
             tokens_per_sec = (
-                len(generated_tokens) / (total_time_ms / 1000)
-                if total_time_ms > 0
-                else 0.0
+                len(generated_tokens) / (total_time_ms / 1000) if total_time_ms > 0 else 0.0
             )
 
             # Get memory usage
@@ -1459,12 +1359,8 @@ class SpeculativePipeline(SpeculativeDecoder):
             cuda_mem_allocated = 0.0
             cuda_mem_peak = 0.0
             if self.device == "cuda" and torch.cuda.is_available():
-                cuda_mem_allocated = float(
-                    torch.cuda.memory_allocated() / 1024 / 1024
-                )  # MB
-                cuda_mem_peak = float(
-                    torch.cuda.max_memory_allocated() / 1024 / 1024
-                )  # MB
+                cuda_mem_allocated = float(torch.cuda.memory_allocated() / 1024 / 1024)  # MB
+                cuda_mem_peak = float(torch.cuda.max_memory_allocated() / 1024 / 1024)  # MB
 
             # Get actual dtype from optimization manager if available
             actual_dtype = str(self.dtype).replace("torch.", "")
@@ -1525,9 +1421,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
             # Add optimization info if available
             if self.optimization_manager:
-                result["optimization"] = (
-                    self.optimization_manager.get_optimization_report()
-                )
+                result["optimization"] = self.optimization_manager.get_optimization_report()
 
             self.logger.info(
                 f"Speculative decoding completed: {len(generated_tokens)} tokens "
@@ -1603,14 +1497,10 @@ class SpeculativePipeline(SpeculativeDecoder):
             self._batch_init_printed = True
 
         # Tokenize all prompts together with padding
-        tokenizer = (
-            self.base_lm._tokenizer if hasattr(self.base_lm, "_tokenizer") else None
-        )
+        tokenizer = self.base_lm._tokenizer if hasattr(self.base_lm, "_tokenizer") else None
         if tokenizer is None:
             # Fallback: process sequentially if no tokenizer access
-            self.logger.warning(
-                "No tokenizer access, falling back to sequential processing"
-            )
+            self.logger.warning("No tokenizer access, falling back to sequential processing")
             print(
                 "[BATCH] Warning: No tokenizer access, falling back to sequential",
                 flush=True,
@@ -1621,10 +1511,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             ]
 
         # Tokenizer alignment check - ensure both models use same tokenizer
-        if (
-            hasattr(self.draft_lm, "_tokenizer")
-            and self.draft_lm._tokenizer is not None
-        ):
+        if hasattr(self.draft_lm, "_tokenizer") and self.draft_lm._tokenizer is not None:
             draft_tokenizer = self.draft_lm._tokenizer
             if tokenizer is not None:
                 # Check vocab size alignment
@@ -1646,22 +1533,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                             test_text = "The quick brown fox"
                             test_text_extended = "The quick brown fox jumps"
                             try:
-                                tokens_base = tokenizer(test_text, return_tensors="pt")[
-                                    "input_ids"
-                                ]
+                                tokens_base = tokenizer(test_text, return_tensors="pt")["input_ids"]
                                 tokens_extended = tokenizer(
                                     test_text_extended, return_tensors="pt"
                                 )["input_ids"]
                                 # Compare overlapping prefix
-                                min_len = min(
-                                    tokens_base.shape[1], tokens_extended.shape[1]
-                                )
+                                min_len = min(tokens_base.shape[1], tokens_extended.shape[1])
                                 if min_len > 0:
                                     overlap = (
-                                        (
-                                            tokens_base[0, :min_len]
-                                            == tokens_extended[0, :min_len]
-                                        )
+                                        (tokens_base[0, :min_len] == tokens_extended[0, :min_len])
                                         .float()
                                         .mean()
                                         .item()
@@ -1690,9 +1570,7 @@ class SpeculativePipeline(SpeculativeDecoder):
         # Use pinned memory for faster CPU->GPU transfer (if CUDA)
         if self.device == "cuda" and torch.cuda.is_available():
             # Allocate tensor with pinned memory for faster transfer
-            batch_input_ids = (
-                encoded["input_ids"].pin_memory().to(self.device, non_blocking=True)
-            )
+            batch_input_ids = encoded["input_ids"].pin_memory().to(self.device, non_blocking=True)
         else:
             batch_input_ids = encoded["input_ids"].to(self.device)
         print(
@@ -1730,9 +1608,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             optimization_context = self.optimization_manager.get_optimization_context()
         else:
             optimization_context = (
-                amp_context(self.device, self.dtype)
-                if self.amp_enabled
-                else torch.no_grad()
+                amp_context(self.device, self.dtype) if self.amp_enabled else torch.no_grad()
             )
 
         # Clear KV caches for batch
@@ -1748,8 +1624,7 @@ class SpeculativePipeline(SpeculativeDecoder):
         # Check if KV cache append is enabled via environment variable
         kv_cache_enabled_env = os.getenv("SPECDEC_ENABLE_KV_APPEND", "0") == "1"
         kv_cache_supported = (
-            hasattr(self.base_lm, "supports_kv_append")
-            and self.base_lm.supports_kv_append()
+            hasattr(self.base_lm, "supports_kv_append") and self.base_lm.supports_kv_append()
         )
         kv_cache_enabled = kv_cache_enabled_env and kv_cache_supported
 
@@ -1789,9 +1664,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 batch_input_ids[i].clone() for i in range(batch_size)
             ]  # List of [seq_len] tensors
             batch_generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
-            batch_active = [
-                True
-            ] * batch_size  # Track which prompts are still generating
+            batch_active = [True] * batch_size  # Track which prompts are still generating
             # Track per-prompt proposed/accepted for accurate metrics
             per_prompt_proposed_counts = [0] * batch_size
             per_prompt_accepted_counts = [0] * batch_size
@@ -1830,9 +1703,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 if active_count == 0:
                     print(
-                        "[INFO] Step {}: All sequences finished, exiting loop".format(
-                            step
-                        ),
+                        "[INFO] Step {}: All sequences finished, exiting loop".format(step),
                         flush=True,
                     )
                     break  # All prompts finished
@@ -1840,12 +1711,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Get K from controller (same K for all active prompts)
                 context = {
                     "step": step,
-                    "generated_tokens": max(
-                        len(tokens) for tokens in batch_generated_tokens
-                    ),
+                    "generated_tokens": max(len(tokens) for tokens in batch_generated_tokens),
                     "acceptance_rate": (
-                        batch_metrics["total_accepted"]
-                        / max(batch_metrics["total_proposed"], 1)
+                        batch_metrics["total_accepted"] / max(batch_metrics["total_proposed"], 1)
                     ),
                 }
                 k = self.controller.get_k(step, context)
@@ -1876,6 +1744,32 @@ class SpeculativePipeline(SpeculativeDecoder):
                 if len(active_seqs) == 0:
                     break
 
+                # CRITICAL: Validate all sequences BEFORE padding/stacking
+                # This prevents invalid tokens from previous steps from corrupting the batch
+                if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
+                    vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
+                    if vocab_size is not None:
+                        for i, seq in enumerate(active_seqs):
+                            if (seq >= vocab_size).any() or (seq < 0).any():
+                                # Get min/max safely - move to CPU first to avoid CUDA errors
+                                try:
+                                    max_token = seq.cpu().max().item()
+                                    min_token = seq.cpu().min().item()
+                                except Exception:
+                                    max_token = vocab_size  # Assume worst case
+                                    min_token = -1
+                                invalid_count = ((seq >= vocab_size) | (seq < 0)).sum().item()
+                                print(
+                                    f"[CRITICAL ERROR] Step {step}, seq {i}: "
+                                    f"Invalid tokens in sequence BEFORE padding! "
+                                    f"min={min_token}, max={max_token}, vocab={vocab_size}, "
+                                    f"invalid={invalid_count}/{seq.numel()}\n"
+                                    f"This indicates corruption from previous step - clamping!",
+                                    flush=True,
+                                )
+                                # Clamp to valid range - this prevents crash
+                                active_seqs[i] = seq.clamp(min=0, max=vocab_size - 1)
+
                 # Find max sequence length in active batch (optimized: single pass)
                 original_lengths = []
                 max_seq_len = 0
@@ -1887,9 +1781,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Pad all sequences to max length for batching (optimized: pre-allocate)
                 # CRITICAL: Validate pad_value is within vocab_size before using it
                 vocab_size = None
-                if hasattr(self.base_lm, "_model") and hasattr(
-                    self.base_lm._model, "config"
-                ):
+                if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
                     vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
 
                 pad_value = (
@@ -1904,8 +1796,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # Try eos_token_id as fallback
                         eos_id = (
                             tokenizer.eos_token_id
-                            if tokenizer is not None
-                            and tokenizer.eos_token_id is not None
+                            if tokenizer is not None and tokenizer.eos_token_id is not None
                             else None
                         )
                         if eos_id is not None and 0 <= eos_id < vocab_size:
@@ -1938,9 +1829,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                         # CRITICAL: Validate immediately after padding
                         if vocab_size is not None:
-                            if (seq_padded >= vocab_size).any() or (
-                                seq_padded < 0
-                            ).any():
+                            if (seq_padded >= vocab_size).any() or (seq_padded < 0).any():
                                 # Get min/max safely - move to CPU first to avoid CUDA errors
                                 try:
                                     max_val = seq_padded.cpu().max().item()
@@ -1958,23 +1847,35 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                         padded_seqs[i] = seq_padded
                     else:
+                        # Sequence doesn't need padding - but still validate it!
+                        if vocab_size is not None:
+                            if (seq >= vocab_size).any() or (seq < 0).any():
+                                # Get min/max safely - move to CPU first to avoid CUDA errors
+                                try:
+                                    max_val = seq.cpu().max().item()
+                                    min_val = seq.cpu().min().item()
+                                except Exception:
+                                    max_val = vocab_size  # Assume worst case
+                                    min_val = -1
+                                print(
+                                    f"[ERROR] Step {step}, seq {i}: "
+                                    f"Invalid tokens in unpadded sequence! "
+                                    f"min={min_val}, max={max_val}, vocab={vocab_size}",
+                                    flush=True,
+                                )
+                                # Clamp to valid range
+                                seq = seq.clamp(min=0, max=vocab_size - 1)
                         padded_seqs[i] = seq
 
                 # Stack into batch tensor
-                active_input_ids = torch.stack(
-                    padded_seqs, dim=0
-                )  # [active_count, max_seq_len]
+                active_input_ids = torch.stack(padded_seqs, dim=0)  # [active_count, max_seq_len]
 
                 # CRITICAL: Validate all input IDs before creating attention mask
                 # This catches any invalid tokens that may have been introduced during padding/concatenation
-                if hasattr(self.base_lm, "_model") and hasattr(
-                    self.base_lm._model, "config"
-                ):
+                if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
                     vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                     if vocab_size is not None:
-                        if (active_input_ids >= vocab_size).any() or (
-                            active_input_ids < 0
-                        ).any():
+                        if (active_input_ids >= vocab_size).any() or (active_input_ids < 0).any():
                             # Get min/max safely - move to CPU first to avoid CUDA errors
                             try:
                                 max_token = active_input_ids.cpu().max().item()
@@ -1983,10 +1884,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 max_token = vocab_size  # Assume worst case
                                 min_token = -1
                             invalid_count = (
-                                (
-                                    (active_input_ids >= vocab_size)
-                                    | (active_input_ids < 0)
-                                )
+                                ((active_input_ids >= vocab_size) | (active_input_ids < 0))
                                 .sum()
                                 .item()
                             )
@@ -1997,9 +1895,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 flush=True,
                             )
                             # Clamp to valid range
-                            active_input_ids = active_input_ids.clamp(
-                                min=0, max=vocab_size - 1
-                            )
+                            active_input_ids = active_input_ids.clamp(min=0, max=vocab_size - 1)
 
                 # Create attention mask to ignore padding tokens
                 active_attention_mask = torch.ones(
@@ -2027,9 +1923,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if tokenizer is not None and active_input_ids.shape[0] > 0:
                         first_prompt_tokens = active_input_ids[0]
                         # Remove padding before decoding
-                        first_prompt_non_pad = first_prompt_tokens[
-                            first_prompt_tokens != pad_value
-                        ]
+                        first_prompt_non_pad = first_prompt_tokens[first_prompt_tokens != pad_value]
                         if len(first_prompt_non_pad) > 0:
                             try:
                                 decoded_text = tokenizer.decode(first_prompt_non_pad)
@@ -2053,11 +1947,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Step 1: Generate draft tokens in batch (on draft stream)
                 draft_start_event = None
                 draft_end_event = None
-                if (
-                    self.device == "cuda"
-                    and torch.cuda.is_available()
-                    and draft_stream is not None
-                ):
+                if self.device == "cuda" and torch.cuda.is_available() and draft_stream is not None:
                     draft_start_event = torch.cuda.Event(enable_timing=True)
                     draft_end_event = torch.cuda.Event(enable_timing=True)
                     draft_start_event.record(draft_stream)
@@ -2075,9 +1965,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Apply temperature stabilization for draft model
                 # Use lower effective temperature to improve acceptance rate
-                draft_temperature = (
-                    max(temperature / 1.5, 0.1) if temperature is not None else 0.7
-                )
+                draft_temperature = max(temperature / 1.5, 0.1) if temperature is not None else 0.7
 
                 # Prepare past_key_values for draft model if KV cache is enabled
                 # CRITICAL: Filter to only active sequences before passing to model
@@ -2155,12 +2043,8 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     # CRITICAL: Validate tokens before model forward pass
                     # This prevents invalid token indices from crashing CUDA kernels
-                    if hasattr(self.draft_lm, "_model") and hasattr(
-                        self.draft_lm._model, "config"
-                    ):
-                        vocab_size = getattr(
-                            self.draft_lm._model.config, "vocab_size", None
-                        )
+                    if hasattr(self.draft_lm, "_model") and hasattr(self.draft_lm._model, "config"):
+                        vocab_size = getattr(self.draft_lm._model.config, "vocab_size", None)
                         if vocab_size is not None:
                             # Check both >= vocab_size and < 0
                             if (active_input_ids >= vocab_size).any() or (
@@ -2174,10 +2058,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     max_token = vocab_size  # Assume worst case
                                     min_token = -1
                                 invalid_count = (
-                                    (
-                                        (active_input_ids >= vocab_size)
-                                        | (active_input_ids < 0)
-                                    )
+                                    ((active_input_ids >= vocab_size) | (active_input_ids < 0))
                                     .sum()
                                     .item()
                                 )
@@ -2202,9 +2083,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     flush=True,
                                 )
                                 # Clamp invalid tokens to valid range
-                                active_input_ids = active_input_ids.clamp(
-                                    min=0, max=vocab_size - 1
-                                )
+                                active_input_ids = active_input_ids.clamp(min=0, max=vocab_size - 1)
                                 print(
                                     "[WARNING] Step {}: Clamped draft input tokens to valid range [0, {}]".format(
                                         step, vocab_size - 1
@@ -2218,12 +2097,8 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # CRITICAL: Final validation IMMEDIATELY before draft model call
                 # This is the absolute last check before tokens reach embedding layer
-                if hasattr(self.draft_lm, "_model") and hasattr(
-                    self.draft_lm._model, "config"
-                ):
-                    vocab_size = getattr(
-                        self.draft_lm._model.config, "vocab_size", None
-                    )
+                if hasattr(self.draft_lm, "_model") and hasattr(self.draft_lm._model, "config"):
+                    vocab_size = getattr(self.draft_lm._model.config, "vocab_size", None)
                     if vocab_size is not None:
                         # Check for invalid tokens using safe operations
                         # Use .any() checks first to avoid calling .min()/.max() on corrupted tensors
@@ -2233,10 +2108,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if has_invalid:
                             # Calculate invalid count safely
                             invalid_count = (
-                                (
-                                    (active_input_ids >= vocab_size)
-                                    | (active_input_ids < 0)
-                                )
+                                ((active_input_ids >= vocab_size) | (active_input_ids < 0))
                                 .sum()
                                 .item()
                             )
@@ -2268,9 +2140,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 flush=True,
                             )
                             # Force clamp to prevent crash - do this BEFORE any other operations
-                            active_input_ids = active_input_ids.clamp(
-                                min=0, max=vocab_size - 1
-                            )
+                            active_input_ids = active_input_ids.clamp(min=0, max=vocab_size - 1)
 
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
@@ -2286,9 +2156,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             )
                         except RuntimeError as e:
                             # Catch CUDA errors and provide better diagnostics
-                            if "indexSelectLargeIndex" in str(
-                                e
-                            ) or "device-side assert" in str(e):
+                            if "indexSelectLargeIndex" in str(e) or "device-side assert" in str(e):
                                 print(
                                     f"[CRITICAL ERROR] Step {step}: CUDA embedding error in draft model!\n"
                                     f"active_input_ids.shape={active_input_ids.shape}\n"
@@ -2336,9 +2204,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                     ):
                         # Extract from KVCache wrapper if it exists
                         if hasattr(self.draft_lm._last_generated_kv, "past_key_values"):
-                            draft_new_kv = (
-                                self.draft_lm._last_generated_kv.past_key_values
-                            )
+                            draft_new_kv = self.draft_lm._last_generated_kv.past_key_values
                         else:
                             draft_new_kv = self.draft_lm._last_generated_kv
 
@@ -2374,12 +2240,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     continue  # Skip this layer
 
                                 if i in draft_kv_cache:
-                                    existing_k = draft_kv_cache[i][
-                                        0
-                                    ]  # [active_count, ...]
-                                    existing_v = draft_kv_cache[i][
-                                        1
-                                    ]  # [active_count, ...]
+                                    existing_k = draft_kv_cache[i][0]  # [active_count, ...]
+                                    existing_v = draft_kv_cache[i][1]  # [active_count, ...]
 
                                     # CRITICAL: Use safe filtering if batch dimension mismatch
                                     # This handles cases where cache has full batch_size but active_count is smaller
@@ -2402,10 +2264,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                                 active_indices_tensor,
                                                 name="draft",
                                             )
-                                            if (
-                                                k_filtered is not None
-                                                and v_filtered is not None
-                                            ):
+                                            if k_filtered is not None and v_filtered is not None:
                                                 # Safe filtering succeeded - use filtered cache
                                                 existing_k = k_filtered
                                                 existing_v = v_filtered
@@ -2413,9 +2272,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                                 # Safe filtering failed - reinitialize with new cache
                                                 print(
                                                     "[WARNING] Step {}: Draft KV cache safe filtering failed - "
-                                                    "reinitializing cache.".format(
-                                                        step
-                                                    ),
+                                                    "reinitializing cache.".format(step),
                                                     flush=True,
                                                 )
                                                 draft_kv_cache[i] = [
@@ -2563,9 +2420,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     # Calculate verify time using CUDA events if available
                     if verify_start_event is not None and verify_end_event is not None:
-                        verify_time_ms = verify_start_event.elapsed_time(
-                            verify_end_event
-                        )
+                        verify_time_ms = verify_start_event.elapsed_time(verify_end_event)
                     else:
                         verify_time_ms = (time.time() - verify_start_wall) * 1000
                 elif verify_stream is not None and draft_stream is not None:
@@ -2607,9 +2462,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                                 )
                                                 base_past_kv = None
                                                 break
-                                            filtered_layers.append(
-                                                (k_filtered, v_filtered)
-                                            )
+                                            filtered_layers.append((k_filtered, v_filtered))
 
                                         if len(filtered_layers) > 0:
                                             # All layers filtered successfully
@@ -2667,9 +2520,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             )
                         except RuntimeError as e:
                             # Catch CUDA errors and provide better diagnostics
-                            if "indexSelectLargeIndex" in str(
-                                e
-                            ) or "device-side assert" in str(e):
+                            if "indexSelectLargeIndex" in str(e) or "device-side assert" in str(e):
                                 print(
                                     f"[CRITICAL ERROR] Step {step}: CUDA embedding error in base model (scheduler path)!\n"
                                     f"active_input_ids.shape={active_input_ids.shape}\n"
@@ -2707,12 +2558,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 and self.base_lm._last_generated_kv is not None
                             ):
                                 # Extract from KVCache wrapper if it exists
-                                if hasattr(
-                                    self.base_lm._last_generated_kv, "past_key_values"
-                                ):
-                                    base_new_kv = (
-                                        self.base_lm._last_generated_kv.past_key_values
-                                    )
+                                if hasattr(self.base_lm._last_generated_kv, "past_key_values"):
+                                    base_new_kv = self.base_lm._last_generated_kv.past_key_values
                                 else:
                                     base_new_kv = self.base_lm._last_generated_kv
 
@@ -2746,12 +2593,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                                             continue  # Skip this layer
 
                                         if i in base_kv_cache:
-                                            existing_k = base_kv_cache[i][
-                                                0
-                                            ]  # [active_count, ...]
-                                            existing_v = base_kv_cache[i][
-                                                1
-                                            ]  # [active_count, ...]
+                                            existing_k = base_kv_cache[i][0]  # [active_count, ...]
+                                            existing_v = base_kv_cache[i][1]  # [active_count, ...]
 
                                             # Verify shape compatibility
                                             if existing_k.shape[0] != active_count:
@@ -2801,9 +2644,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     # Calculate verify time using CUDA events if available
                     if verify_start_event is not None and verify_end_event is not None:
-                        verify_time_ms = verify_start_event.elapsed_time(
-                            verify_end_event
-                        )
+                        verify_time_ms = verify_start_event.elapsed_time(verify_end_event)
                     else:
                         verify_time_ms = (time.time() - verify_start_wall) * 1000
                 else:
@@ -2865,12 +2706,8 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     # CRITICAL: Final validation IMMEDIATELY before base model call
                     # This is the absolute last check before tokens reach embedding layer
-                    if hasattr(self.base_lm, "_model") and hasattr(
-                        self.base_lm._model, "config"
-                    ):
-                        vocab_size = getattr(
-                            self.base_lm._model.config, "vocab_size", None
-                        )
+                    if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
+                        vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                         if vocab_size is not None:
                             # Check for invalid tokens using safe operations
                             # Use .any() checks first to avoid calling .min()/.max() on corrupted tensors
@@ -2880,10 +2717,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             if has_invalid:
                                 # Calculate invalid count safely
                                 invalid_count = (
-                                    (
-                                        (active_input_ids >= vocab_size)
-                                        | (active_input_ids < 0)
-                                    )
+                                    ((active_input_ids >= vocab_size) | (active_input_ids < 0))
                                     .sum()
                                     .item()
                                 )
@@ -2923,9 +2757,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     flush=True,
                                 )
                                 # Force clamp to prevent crash - do this BEFORE any other operations
-                                active_input_ids = active_input_ids.clamp(
-                                    min=0, max=vocab_size - 1
-                                )
+                                active_input_ids = active_input_ids.clamp(min=0, max=vocab_size - 1)
                                 print(
                                     "[WARNING] Step {}: Clamped base input tokens to valid range [0, {}]".format(
                                         step, vocab_size - 1
@@ -2961,12 +2793,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                             and self.base_lm._last_generated_kv is not None
                         ):
                             # Extract from KVCache wrapper if it exists
-                            if hasattr(
-                                self.base_lm._last_generated_kv, "past_key_values"
-                            ):
-                                base_new_kv = (
-                                    self.base_lm._last_generated_kv.past_key_values
-                                )
+                            if hasattr(self.base_lm._last_generated_kv, "past_key_values"):
+                                base_new_kv = self.base_lm._last_generated_kv.past_key_values
                             else:
                                 base_new_kv = self.base_lm._last_generated_kv
 
@@ -3030,11 +2858,56 @@ class SpeculativePipeline(SpeculativeDecoder):
                             flush=True,
                         )
 
-                batch_metrics["total_proposed"] += (
-                    draft_tokens.shape[0] * draft_tokens.shape[1]
-                )
+                batch_metrics["total_proposed"] += draft_tokens.shape[0] * draft_tokens.shape[1]
                 batch_metrics["total_draft_time_ms"] += draft_time_ms
                 batch_metrics["total_verification_time_ms"] += verify_time_ms
+
+                # CRITICAL: Validate base_tokens IMMEDIATELY after generation
+                # This catches invalid tokens before they propagate through the pipeline
+                if hasattr(self.base_lm, "_model") and hasattr(self.base_lm._model, "config"):
+                    vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
+                    if vocab_size is not None:
+                        if (base_tokens >= vocab_size).any() or (base_tokens < 0).any():
+                            invalid_count = (
+                                ((base_tokens >= vocab_size) | (base_tokens < 0)).sum().item()
+                            )
+                            try:
+                                max_token = base_tokens.cpu().max().item()
+                                min_token = base_tokens.cpu().min().item()
+                            except Exception:
+                                max_token = vocab_size
+                                min_token = -1
+                            print(
+                                f"[CRITICAL ERROR] Step {step}: Invalid base_tokens after generation! "
+                                f"min={min_token}, max={max_token}, vocab={vocab_size}, "
+                                f"invalid={invalid_count}/{base_tokens.numel()}",
+                                flush=True,
+                            )
+                            # Clamp invalid tokens immediately
+                            base_tokens = base_tokens.clamp(min=0, max=vocab_size - 1)
+
+                # CRITICAL: Validate draft_tokens IMMEDIATELY after generation (if not already validated)
+                if hasattr(self.draft_lm, "_model") and hasattr(self.draft_lm._model, "config"):
+                    vocab_size = getattr(self.draft_lm._model.config, "vocab_size", None)
+                    if vocab_size is not None:
+                        if (draft_tokens >= vocab_size).any() or (draft_tokens < 0).any():
+                            invalid_count = (
+                                ((draft_tokens >= vocab_size) | (draft_tokens < 0)).sum().item()
+                            )
+                            try:
+                                max_token = draft_tokens.cpu().max().item()
+                                min_token = draft_tokens.cpu().min().item()
+                            except Exception:
+                                max_token = vocab_size
+                                min_token = -1
+                            print(
+                                f"[CRITICAL ERROR] Step {step}: Invalid draft_tokens after generation! "
+                                f"min={min_token}, max={max_token}, vocab={vocab_size}, "
+                                f"invalid={invalid_count}/{draft_tokens.numel()}",
+                                flush=True,
+                            )
+                            # Clamp invalid tokens immediately
+                            draft_tokens = draft_tokens.clamp(min=0, max=vocab_size - 1)
 
                 # Debug: log batch metrics after each step (reduced frequency to reduce CPU overhead)
                 if step == 1 or step % 16 == 0:
@@ -3077,13 +2950,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Process each active prompt's acceptance
                 for idx_in_active, global_idx in enumerate(active_indices):
                     # Extract tokens/logits for this prompt
-                    prompt_draft_tokens = draft_tokens[
-                        idx_in_active : idx_in_active + 1
-                    ]
+                    prompt_draft_tokens = draft_tokens[idx_in_active : idx_in_active + 1]
                     prompt_base_tokens = base_tokens[idx_in_active : idx_in_active + 1]
-                    prompt_draft_logits = draft_logits[
-                        idx_in_active : idx_in_active + 1
-                    ]
+                    prompt_draft_logits = draft_logits[idx_in_active : idx_in_active + 1]
                     prompt_base_logits = base_logits[idx_in_active : idx_in_active + 1]
 
                     # Apply policy
@@ -3096,9 +2965,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             .tolist()[: min(3, prompt_base_logits.shape[1])]
                         )
                         draft_tokens_sample = (
-                            prompt_draft_tokens[
-                                0, : min(3, prompt_draft_tokens.shape[1])
-                            ]
+                            prompt_draft_tokens[0, : min(3, prompt_draft_tokens.shape[1])]
                             .cpu()
                             .tolist()
                         )
@@ -3109,10 +2976,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         )
 
                         # Calculate overlap ratio for debug
-                        if (
-                            len(draft_tokens_sample) > 0
-                            and len(base_pred_from_logits) > 0
-                        ):
+                        if len(draft_tokens_sample) > 0 and len(base_pred_from_logits) > 0:
                             matches = sum(
                                 1
                                 for i in range(
@@ -3159,18 +3023,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if hasattr(self.base_lm, "_model") and hasattr(
                             self.base_lm._model, "config"
                         ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
-                            )
+                            vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                             if vocab_size is not None:
                                 # Clamp on GPU before CPU transfer
                                 if (accepted_tokens_tensor >= vocab_size).any() or (
                                     accepted_tokens_tensor < 0
                                 ).any():
-                                    accepted_tokens_tensor = (
-                                        accepted_tokens_tensor.clamp(
-                                            min=0, max=vocab_size - 1
-                                        )
+                                    accepted_tokens_tensor = accepted_tokens_tensor.clamp(
+                                        min=0, max=vocab_size - 1
                                     )
                         accepted_tokens = accepted_tokens_tensor.cpu().tolist()
                         # CRITICAL: Validate accepted token indices before using them
@@ -3178,21 +3038,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if hasattr(self.base_lm, "_model") and hasattr(
                             self.base_lm._model, "config"
                         ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
-                            )
+                            vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                             if vocab_size is not None:
                                 accepted_tokens = [
-                                    max(0, min(int(tok), vocab_size - 1))
-                                    for tok in accepted_tokens
+                                    max(0, min(int(tok), vocab_size - 1)) for tok in accepted_tokens
                                 ]
                                 # Check if clamping occurred
                                 if any(
                                     int(orig) != int(clamped)
                                     for orig, clamped in zip(
-                                        prompt_draft_tokens[0, :accepted_len]
-                                        .cpu()
-                                        .tolist(),
+                                        prompt_draft_tokens[0, :accepted_len].cpu().tolist(),
                                         accepted_tokens,
                                     )
                                 ):
@@ -3210,13 +3065,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if hasattr(self.base_lm, "_model") and hasattr(
                             self.base_lm._model, "config"
                         ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
-                            )
+                            vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                             if vocab_size is not None:
                                 first_base = [
-                                    max(0, min(int(tok), vocab_size - 1))
-                                    for tok in first_base
+                                    max(0, min(int(tok), vocab_size - 1)) for tok in first_base
                                 ]
                         accepted_tokens = first_base
                         batch_generated_tokens[global_idx].extend(first_base)
@@ -3241,14 +3093,10 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     accepted_lengths.append(accepted_len)
                     batch_metrics["total_accepted"] += accepted_len
-                    batch_metrics[
-                        "total_generated_tokens"
-                    ] += accepted_len  # Track total generated
+                    batch_metrics["total_generated_tokens"] += accepted_len  # Track total generated
 
                     # Track per-prompt metrics for accurate reporting
-                    per_prompt_proposed_counts[global_idx] += prompt_draft_tokens.shape[
-                        1
-                    ]
+                    per_prompt_proposed_counts[global_idx] += prompt_draft_tokens.shape[1]
                     per_prompt_accepted_counts[global_idx] += accepted_len
 
                     # Update current input for next iteration
@@ -3260,14 +3108,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if hasattr(self.base_lm, "_model") and hasattr(
                             self.base_lm._model, "config"
                         ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
-                            )
+                            vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                             if vocab_size is not None:
                                 # Ensure all tokens are valid integers in range
                                 accepted_tokens = [
-                                    max(0, min(int(tok), vocab_size - 1))
-                                    for tok in accepted_tokens
+                                    max(0, min(int(tok), vocab_size - 1)) for tok in accepted_tokens
                                 ]
 
                         accepted_tokens_tensor = torch.tensor(
@@ -3278,21 +3123,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if hasattr(self.base_lm, "_model") and hasattr(
                             self.base_lm._model, "config"
                         ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
-                            )
+                            vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                             if vocab_size is not None:
                                 if (accepted_tokens_tensor >= vocab_size).any() or (
                                     accepted_tokens_tensor < 0
                                 ).any():
                                     # Get min/max safely - move to CPU first to avoid CUDA errors
                                     try:
-                                        max_token = (
-                                            accepted_tokens_tensor.cpu().max().item()
-                                        )
-                                        min_token = (
-                                            accepted_tokens_tensor.cpu().min().item()
-                                        )
+                                        max_token = accepted_tokens_tensor.cpu().max().item()
+                                        min_token = accepted_tokens_tensor.cpu().min().item()
                                     except Exception:
                                         max_token = vocab_size  # Assume worst case
                                         min_token = -1
@@ -3303,10 +3142,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                                         flush=True,
                                     )
                                     # Clamp to valid range
-                                    accepted_tokens_tensor = (
-                                        accepted_tokens_tensor.clamp(
-                                            min=0, max=vocab_size - 1
-                                        )
+                                    accepted_tokens_tensor = accepted_tokens_tensor.clamp(
+                                        min=0, max=vocab_size - 1
                                     )
 
                         current_seq = current_input_ids[global_idx]  # Shape: [seq_len]
@@ -3315,13 +3152,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if hasattr(self.base_lm, "_model") and hasattr(
                             self.base_lm._model, "config"
                         ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
-                            )
+                            vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                             if vocab_size is not None:
-                                if (current_seq >= vocab_size).any() or (
-                                    current_seq < 0
-                                ).any():
+                                if (current_seq >= vocab_size).any() or (current_seq < 0).any():
                                     # Get min/max safely - move to CPU first to avoid CUDA errors
                                     try:
                                         max_token = current_seq.cpu().max().item()
@@ -3336,9 +3169,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                         flush=True,
                                     )
                                     # Clamp to valid range
-                                    current_seq = current_seq.clamp(
-                                        min=0, max=vocab_size - 1
-                                    )
+                                    current_seq = current_seq.clamp(min=0, max=vocab_size - 1)
 
                         # Debug: log before/after append (only first step to reduce CPU overhead)
                         if step == 1:
@@ -3351,21 +3182,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                             )
 
                         # Concatenate along sequence dimension (both are 1D)
-                        updated_seq = torch.cat(
-                            [current_seq, accepted_tokens_tensor], dim=0
-                        )
+                        updated_seq = torch.cat([current_seq, accepted_tokens_tensor], dim=0)
 
                         # CRITICAL: Final validation after concatenation
                         if hasattr(self.base_lm, "_model") and hasattr(
                             self.base_lm._model, "config"
                         ):
-                            vocab_size = getattr(
-                                self.base_lm._model.config, "vocab_size", None
-                            )
+                            vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
                             if vocab_size is not None:
-                                if (updated_seq >= vocab_size).any() or (
-                                    updated_seq < 0
-                                ).any():
+                                if (updated_seq >= vocab_size).any() or (updated_seq < 0).any():
                                     # Get min/max safely - move to CPU first to avoid CUDA errors
                                     try:
                                         max_token = updated_seq.cpu().max().item()
@@ -3374,10 +3199,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                         max_token = vocab_size  # Assume worst case
                                         min_token = -1
                                     invalid_count = (
-                                        (
-                                            (updated_seq >= vocab_size)
-                                            | (updated_seq < 0)
-                                        )
+                                        ((updated_seq >= vocab_size) | (updated_seq < 0))
                                         .sum()
                                         .item()
                                     )
@@ -3390,9 +3212,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                         flush=True,
                                     )
                                     # Clamp to valid range
-                                    updated_seq = updated_seq.clamp(
-                                        min=0, max=vocab_size - 1
-                                    )
+                                    updated_seq = updated_seq.clamp(min=0, max=vocab_size - 1)
                                     print(
                                         f"[WARNING] Step {step}, prompt {global_idx}: "
                                         f"Clamped updated_seq to valid range [0, {vocab_size - 1}]",
@@ -3413,20 +3233,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if tokenizer is not None:
                         eos_token_id = tokenizer.eos_token_id
                     elif (
-                        hasattr(self.base_lm, "_tokenizer")
-                        and self.base_lm._tokenizer is not None
+                        hasattr(self.base_lm, "_tokenizer") and self.base_lm._tokenizer is not None
                     ):
                         base_tokenizer = self.base_lm._tokenizer
-                        if base_tokenizer is not None and hasattr(
-                            base_tokenizer, "eos_token_id"
-                        ):
+                        if base_tokenizer is not None and hasattr(base_tokenizer, "eos_token_id"):
                             eos_token_id = base_tokenizer.eos_token_id
                     # Check if prompt is done
                     if len(batch_generated_tokens[global_idx]) >= max_tokens:
                         batch_active[global_idx] = False
-                    elif (
-                        len(accepted_tokens) > 0 and accepted_tokens[-1] == eos_token_id
-                    ):
+                    elif len(accepted_tokens) > 0 and accepted_tokens[-1] == eos_token_id:
                         batch_active[global_idx] = False
 
                 batch_metrics["total_steps"] += 1
@@ -3434,14 +3249,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Log batch progress with accurate timing
                 if step % 8 == 0 or step == 1:
                     avg_draft_time = (
-                        batch_metrics["total_draft_time_ms"]
-                        / batch_metrics["total_steps"]
+                        batch_metrics["total_draft_time_ms"] / batch_metrics["total_steps"]
                         if batch_metrics["total_steps"] > 0
                         else 0.0
                     )
                     avg_verify_time = (
-                        batch_metrics["total_verification_time_ms"]
-                        / batch_metrics["total_steps"]
+                        batch_metrics["total_verification_time_ms"] / batch_metrics["total_steps"]
                         if batch_metrics["total_steps"] > 0
                         else 0.0
                     )
@@ -3457,9 +3270,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
             total_time_ms = (time.time() - generation_start) * 1000
             batch_metrics["total_generation_time_ms"] = total_time_ms
-            batch_metrics["total_time_ms"] = (
-                total_time_ms  # Add for throughput calculation
-            )
+            batch_metrics["total_time_ms"] = total_time_ms  # Add for throughput calculation
 
             # Calculate batch-level throughput
             batch_metrics["tokens_per_sec"] = (
@@ -3486,9 +3297,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
             # Convert batched results to per-prompt dictionaries
             results = []
-            for i, (prompt, generated_tokens) in enumerate(
-                zip(prompts, batch_generated_tokens)
-            ):
+            for i, (prompt, generated_tokens) in enumerate(zip(prompts, batch_generated_tokens)):
                 # Decode generated tokens
                 if generated_tokens:
                     generated_text = self.base_lm.decode(
@@ -3504,16 +3313,12 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Throughput: tokens generated for this prompt / total time
                 prompt_throughput = (
-                    len(generated_tokens) / (total_time_ms / 1000.0)
-                    if total_time_ms > 0
-                    else 0.0
+                    len(generated_tokens) / (total_time_ms / 1000.0) if total_time_ms > 0 else 0.0
                 )
 
                 # Latency: average time per token for this prompt
                 prompt_latency_ms = (
-                    total_time_ms / len(generated_tokens)
-                    if len(generated_tokens) > 0
-                    else 0.0
+                    total_time_ms / len(generated_tokens) if len(generated_tokens) > 0 else 0.0
                 )
 
                 # Calculate averages for reporting
@@ -3523,8 +3328,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                     else 0.0
                 )
                 avg_verify_time = (
-                    batch_metrics["total_verification_time_ms"]
-                    / batch_metrics["total_steps"]
+                    batch_metrics["total_verification_time_ms"] / batch_metrics["total_steps"]
                     if batch_metrics["total_steps"] > 0
                     else 0.0
                 )

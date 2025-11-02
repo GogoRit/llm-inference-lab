@@ -46,9 +46,11 @@ class HFWrapper(LanguageModel):
 
         # KV cache management
         self._kv_cache: Optional[KVCache] = None
-        self._kv_append_enabled = os.getenv(
-            "SPECDEC_ENABLE_KV_APPEND", "1"
-        ).lower() in ("1", "true", "yes")
+        self._kv_append_enabled = os.getenv("SPECDEC_ENABLE_KV_APPEND", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         # Load model and tokenizer
         self._load_model()
@@ -172,9 +174,7 @@ class HFWrapper(LanguageModel):
                         except Exception:
                             max_token = vocab_size  # Assume worst case
                             min_token = -1
-                        invalid_count = (
-                            ((input_ids >= vocab_size) | (input_ids < 0)).sum().item()
-                        )
+                        invalid_count = ((input_ids >= vocab_size) | (input_ids < 0)).sum().item()
                         self.logger.error(
                             "[HF-WRAPPER] Invalid token indices detected: "
                             "min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
@@ -346,9 +346,7 @@ class HFWrapper(LanguageModel):
                     except Exception:
                         max_token = vocab_size  # Assume worst case
                         min_token = -1
-                    invalid_count = (
-                        ((input_ids >= vocab_size) | (input_ids < 0)).sum().item()
-                    )
+                    invalid_count = ((input_ids >= vocab_size) | (input_ids < 0)).sum().item()
                     self.logger.error(
                         "[HF-WRAPPER ASYNC] Invalid token indices: "
                         "min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
@@ -412,9 +410,7 @@ class HFWrapper(LanguageModel):
                     if hasattr(self._model, "config"):
                         vocab_size = getattr(self._model.config, "vocab_size", None)
                         if vocab_size is not None:
-                            if (current_input >= vocab_size).any() or (
-                                current_input < 0
-                            ).any():
+                            if (current_input >= vocab_size).any() or (current_input < 0).any():
                                 # Get min/max safely - move to CPU first to avoid CUDA errors
                                 try:
                                     max_token = current_input.cpu().max().item()
@@ -423,10 +419,7 @@ class HFWrapper(LanguageModel):
                                     max_token = vocab_size  # Assume worst case
                                     min_token = -1
                                 invalid_count = (
-                                    (
-                                        (current_input >= vocab_size)
-                                        | (current_input < 0)
-                                    )
+                                    ((current_input >= vocab_size) | (current_input < 0))
                                     .sum()
                                     .item()
                                 )
@@ -437,9 +430,7 @@ class HFWrapper(LanguageModel):
                                     flush=True,
                                 )
                                 # Clamp invalid tokens
-                                current_input = current_input.clamp(
-                                    min=0, max=vocab_size - 1
-                                )
+                                current_input = current_input.clamp(min=0, max=vocab_size - 1)
 
                     # Forward pass with past_key_values if available
                     if current_past_kv is not None:
@@ -456,10 +447,7 @@ class HFWrapper(LanguageModel):
                                 if has_invalid:
                                     # Calculate invalid count safely
                                     invalid_count = (
-                                        (
-                                            (current_input >= vocab_size)
-                                            | (current_input < 0)
-                                        )
+                                        ((current_input >= vocab_size) | (current_input < 0))
                                         .sum()
                                         .item()
                                     )
@@ -486,9 +474,7 @@ class HFWrapper(LanguageModel):
                                         flush=True,
                                     )
                                     # Force clamp BEFORE any other operations
-                                    current_input = current_input.clamp(
-                                        min=0, max=vocab_size - 1
-                                    )
+                                    current_input = current_input.clamp(min=0, max=vocab_size - 1)
                                     # Raise exception to stop execution and debug
                                     raise RuntimeError(
                                         f"Invalid tokens detected in async loop step {step}: "
@@ -517,10 +503,7 @@ class HFWrapper(LanguageModel):
                                 if has_invalid:
                                     # Calculate invalid count safely
                                     invalid_count = (
-                                        (
-                                            (current_input >= vocab_size)
-                                            | (current_input < 0)
-                                        )
+                                        ((current_input >= vocab_size) | (current_input < 0))
                                         .sum()
                                         .item()
                                     )
@@ -546,9 +529,7 @@ class HFWrapper(LanguageModel):
                                         flush=True,
                                     )
                                     # Force clamp BEFORE any other operations
-                                    current_input = current_input.clamp(
-                                        min=0, max=vocab_size - 1
-                                    )
+                                    current_input = current_input.clamp(min=0, max=vocab_size - 1)
                                     # Raise exception to stop execution and debug
                                     raise RuntimeError(
                                         f"Invalid tokens detected in async loop step {step}: "
@@ -588,15 +569,24 @@ class HFWrapper(LanguageModel):
                             or (probs < 0).any()
                             or torch.isinf(probs).any()
                         ):
-                            print(
-                                "[ERROR] Invalid probs detected: NaN/Inf or negative values"
-                            )
+                            print("[ERROR] Invalid probs detected: NaN/Inf or negative values")
                             torch.cuda.synchronize()
                             raise RuntimeError("Softmax instability on GPU")
 
-                        next_token = torch.multinomial(
-                            probs, num_samples=1
-                        )  # [batch_size, 1]
+                        # CRITICAL: Ensure probs are valid before multinomial
+                        if (
+                            torch.isnan(probs).any()
+                            or torch.isinf(probs).any()
+                            or (probs < 0).any()
+                        ):
+                            print(
+                                "[ERROR] Invalid probabilities before multinomial in async!",
+                                flush=True,
+                            )
+                            # Fallback to argmax if probs are invalid
+                            next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                        else:
+                            next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
                     else:
                         # Greedy sampling - apply temperature if needed
                         if temperature != 1.0:
@@ -606,14 +596,15 @@ class HFWrapper(LanguageModel):
                     )  # [batch_size, 1]
                     # --- END PATCH ---
 
+                    # CRITICAL: Ensure dtype is long/int64 and validate IMMEDIATELY
+                    next_token = next_token.long()
+
                     # CRITICAL: Validate generated token indices before storing
                     # This prevents invalid token IDs from causing embedding layer crashes
                     if hasattr(self._model, "config"):
                         vocab_size = getattr(self._model.config, "vocab_size", None)
                         if vocab_size is not None:
-                            if (next_token >= vocab_size).any() or (
-                                next_token < 0
-                            ).any():
+                            if (next_token >= vocab_size).any() or (next_token < 0).any():
                                 # Get min/max safely - move to CPU first to avoid CUDA errors
                                 try:
                                     max_token = next_token.cpu().max().item()
@@ -621,6 +612,11 @@ class HFWrapper(LanguageModel):
                                 except Exception:
                                     max_token = vocab_size  # Assume worst case
                                     min_token = -1
+                                print(
+                                    f"[CRITICAL ERROR] Invalid token from argmax/multinomial in async! "
+                                    f"min={min_token}, max={max_token}, vocab={vocab_size}",
+                                    flush=True,
+                                )
                                 self.logger.error(
                                     "[HF-WRAPPER] Invalid token index generated: "
                                     "min=%d, max=%d, vocab_size=%d",
@@ -665,9 +661,7 @@ class HFWrapper(LanguageModel):
                             break
 
                 # Concatenate results
-                generated_ids = torch.cat(
-                    generated_tokens, dim=1
-                )  # [batch_size, max_new_tokens]
+                generated_ids = torch.cat(generated_tokens, dim=1)  # [batch_size, max_new_tokens]
                 logits = torch.cat(
                     generated_logits, dim=1
                 )  # [batch_size, max_new_tokens, vocab_size]
@@ -740,9 +734,7 @@ class HFWrapper(LanguageModel):
         with torch.no_grad():
             outputs = self._model(  # type: ignore
                 new_input_ids,
-                past_key_values=(
-                    self._kv_cache.past_key_values if self._kv_cache else None
-                ),
+                past_key_values=(self._kv_cache.past_key_values if self._kv_cache else None),
                 use_cache=True,
             )
 
@@ -759,11 +751,20 @@ class HFWrapper(LanguageModel):
 
         if do_sample:
             probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            # CRITICAL: Ensure probs are valid before multinomial
+            if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any():
+                print("[ERROR] Invalid probabilities before multinomial!", flush=True)
+                # Fallback to argmax if probs are invalid
+                next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+            else:
+                next_token = torch.multinomial(probs, num_samples=1)
         else:
             next_token = next_token_logits.argmax(dim=-1, keepdim=True)
 
-        # CRITICAL: Validate generated token indices
+        # CRITICAL: Validate generated token indices IMMEDIATELY
+        # Ensure dtype is long/int64 for proper token ID representation
+        next_token = next_token.long()
+
         if hasattr(self._model, "config"):
             vocab_size = getattr(self._model.config, "vocab_size", None)
             if vocab_size is not None:
@@ -775,6 +776,11 @@ class HFWrapper(LanguageModel):
                     except Exception:
                         max_token = vocab_size  # Assume worst case
                         min_token = -1
+                    print(
+                        f"[CRITICAL ERROR] Invalid token from argmax/multinomial! "
+                        f"min={min_token}, max={max_token}, vocab={vocab_size}",
+                        flush=True,
+                    )
                     # Clamp invalid tokens to valid range
                     next_token = next_token.clamp(min=0, max=vocab_size - 1)
                     print(
@@ -969,9 +975,7 @@ class HFWrapper(LanguageModel):
             # Append to existing cache
             if kv_append_fn is not None:
                 # Use kernel for efficient append
-                self._kv_cache = self._append_kv_with_kernel(
-                    kv_append_fn, self._kv_cache, kv_chunk
-                )
+                self._kv_cache = self._append_kv_with_kernel(kv_append_fn, self._kv_cache, kv_chunk)
             else:
                 # Fallback to PyTorch concat
                 self._kv_cache = self._append_kv_pytorch(self._kv_cache, kv_chunk)
@@ -1040,9 +1044,7 @@ class HFWrapper(LanguageModel):
                 out_k, out_v = kv_append_fn(base_k, base_v, new_k, new_v)
                 appended_kv.append((out_k, out_v))
             except Exception as e:
-                self.logger.warning(
-                    f"Kernel append failed, falling back to PyTorch: {e}"
-                )
+                self.logger.warning(f"Kernel append failed, falling back to PyTorch: {e}")
                 # Fallback to concat
                 out_k = torch.cat([base_k, new_k], dim=2)
                 out_v = torch.cat([base_v, new_v], dim=2)
