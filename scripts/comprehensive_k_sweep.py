@@ -49,12 +49,21 @@ if torch.cuda.is_available():
         compute_capability = f"{device_capability[0]}{device_capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = compute_capability
 
-    # Enable synchronous CUDA error reporting for debugging
-    # This ensures errors are reported immediately at the call site
-    if "CUDA_LAUNCH_BLOCKING" not in os.environ:
-        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    # Note: CUDA_LAUNCH_BLOCKING should be set by user if needed for debugging
+    # We do NOT auto-enable it as it disables async stream optimization
+    # For production performance, leave it unset or set to "0"
+    if os.getenv("CUDA_LAUNCH_BLOCKING") == "1":
         print(
-            "[STARTUP] CUDA_LAUNCH_BLOCKING=1 enabled for synchronous error reporting",
+            "[STARTUP] WARNING: CUDA_LAUNCH_BLOCKING=1 is set - "
+            "async streams will be disabled! "
+            "This will reduce GPU utilization and throughput. "
+            "Remove for production runs.",
+            flush=True,
+        )
+    else:
+        print(
+            "[STARTUP] CUDA_LAUNCH_BLOCKING not set - "
+            "async streams enabled for optimal performance",
             flush=True,
         )
 
@@ -216,7 +225,8 @@ def run_comprehensive_k_sweep(
         reserved_mb = torch.cuda.memory_reserved() / (1024**2)
         print(f"[STARTUP] GPU Memory: {total_mem_gb:.2f} GB total", flush=True)
         print(
-            f"[STARTUP] GPU Memory: {allocated_mb:.2f} MB allocated, {reserved_mb:.2f} MB reserved",
+            f"[STARTUP] GPU Memory: {allocated_mb:.2f} MB allocated, "
+            f"{reserved_mb:.2f} MB reserved",
             flush=True,
         )
     else:
@@ -368,17 +378,22 @@ def run_comprehensive_k_sweep(
                 if current_time - last_heartbeat_time >= 60.0:
                     print(
                         f"[HEARTBEAT] {time.strftime('%H:%M:%S')} still running... "
-                        f"K={k}, Iter={iteration+1}/{iterations}, Batch={batch_idx+1}/{num_batches}",
+                        f"K={k}, Iter={iteration+1}/{iterations}, "
+                        f"Batch={batch_idx+1}/{num_batches}",
                         flush=True,
                     )
                     last_heartbeat_time = current_time
 
-                # GPU utilization estimate (memory-based proxy)
+                # GPU utilization estimate (memory-based proxy - NOT actual compute)
+                # NOTE: This is a flawed metric - actual GPU compute utilization
+                # requires nvidia-smi. Memory allocation != compute utilization
+                # (GPU can be 100% utilized with low memory)
                 if resolved_device == "cuda" and torch.cuda.is_available():
                     gpu_mem_mb = torch.cuda.memory_allocated() / (1024**2)
                     gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (
                         1024**3
                     )
+                    # Memory-based estimate (not accurate for compute utilization)
                     gpu_util_est = min(100.0, (gpu_mem_mb / (gpu_mem_gb * 1024)) * 100)
                 elif resolved_device == "mps" and torch.backends.mps.is_available():
                     # MPS GPU memory tracking (if available in PyTorch)
@@ -773,21 +788,29 @@ def run_comprehensive_k_sweep(
         gpu_mem_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
 
         print(
-            f"[FINAL] GPU Memory Peak: {gpu_mem_peak_mb:.2f} MB / {gpu_mem_total_gb:.2f} GB",
+            f"[FINAL] GPU Memory Peak: {gpu_mem_peak_mb:.2f} MB / "
+            f"{gpu_mem_total_gb:.2f} GB",
             flush=True,
         )
         print(f"[FINAL] GPU Memory Current: {gpu_mem_current_mb:.2f} MB", flush=True)
+        # NOTE: This is memory-based, NOT actual compute utilization
+        # For real GPU utilization, use: nvidia-smi dmon -s u
+        gpu_util_mem_based = (gpu_mem_peak_mb / (gpu_mem_total_gb * 1024)) * 100
         print(
-            f"[FINAL] GPU Utilization Estimate: {(gpu_mem_peak_mb / (gpu_mem_total_gb * 1024)) * 100:.1f}%",
+            f"[FINAL] GPU Memory Utilization: {gpu_util_mem_based:.1f}% "
+            "(NOTE: This is memory-based, not compute utilization. "
+            "Use 'nvidia-smi' for actual GPU%)",
             flush=True,
         )
 
     print(
-        f"[FINAL] Total Runtime: {total_runtime_min:.2f} minutes ({total_runtime:.2f}s)",
+        f"[FINAL] Total Runtime: {total_runtime_min:.2f} minutes "
+        f"({total_runtime:.2f}s)",
         flush=True,
     )
+    k_values_tested = len([r for r in results if r.get("n_samples", 0) > 0])
     print(
-        f"[FINAL] Total K Values Tested: {len([r for r in results if r.get('n_samples', 0) > 0])}",
+        f"[FINAL] Total K Values Tested: {k_values_tested}",
         flush=True,
     )
 
