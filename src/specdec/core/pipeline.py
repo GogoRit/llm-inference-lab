@@ -1580,13 +1580,24 @@ class SpeculativePipeline(SpeculativeDecoder):
                 if len(active_seqs) == 0:
                     break
 
-                # Single centralized validation point - efficient GPU operation
-                # Note: We validate before padding since sequences may have different lengths
-                # Validation happens on individual sequences (already on GPU) to avoid padding overhead
-                vocab_size = get_vocab_size(self.base_lm)
+                # CRITICAL: Validate sequences with DRAFT vocab size since we're passing to draft model
+                # This is the root cause fix - draft model may have different vocab size than base
+                draft_vocab_size = get_vocab_size(self.draft_lm)
+                base_vocab_size = get_vocab_size(self.base_lm)
+
+                # Use minimum vocab size to ensure tokens are valid for both models
+                vocab_size = None
+                if draft_vocab_size is not None and base_vocab_size is not None:
+                    vocab_size = min(draft_vocab_size, base_vocab_size)
+                elif draft_vocab_size is not None:
+                    vocab_size = draft_vocab_size
+                elif base_vocab_size is not None:
+                    vocab_size = base_vocab_size
+
+                # Validate sequences with appropriate vocab size BEFORE padding
                 if vocab_size is not None and len(active_seqs) > 0:
                     # Validate each sequence in-place on GPU (minimal CPU overhead)
-                    # This is more efficient than padding first then validating
+                    # This ensures all tokens are valid before padding
                     for i, seq in enumerate(active_seqs):
                         active_seqs[i] = validate_and_clamp_tokens(
                             seq, vocab_size, f"seq_{i}"
@@ -1601,17 +1612,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                     max_seq_len = max(max_seq_len, seq_len)
 
                 # Pad all sequences to max length for batching
-                vocab_size = get_vocab_size(self.base_lm)
+                # CRITICAL: Ensure pad_value is valid for both base and draft models
                 pad_value = (
                     tokenizer.pad_token_id
                     if tokenizer is not None and tokenizer.pad_token_id is not None
                     else 0
                 )
-                # Ensure pad_value is valid
+                # Validate pad_value against the vocab size we're using
                 if vocab_size is not None and (
                     pad_value >= vocab_size or pad_value < 0
                 ):
-                    pad_value = 0 if vocab_size > 0 else 0
+                    pad_value = 0  # Use 0 as safe default (always valid for GPT models)
 
                 # Pad sequences efficiently
                 padded_seqs: List[Optional[torch.Tensor]] = [None] * len(active_seqs)
@@ -1634,10 +1645,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                     padded_seqs, dim=0
                 )  # [active_count, max_seq_len]
 
-                # Single final validation - efficient GPU operation
-                if vocab_size is not None:
+                # CRITICAL: Final validation with draft vocab size before passing to draft model
+                # This is the last safety check before embedding layer
+                draft_vocab_size = get_vocab_size(self.draft_lm)
+                if draft_vocab_size is not None:
                     active_input_ids = validate_and_clamp_tokens(
-                        active_input_ids, vocab_size, "batch_input"
+                        active_input_ids, draft_vocab_size, "batch_input_draft"
                     )
 
                 # Create attention mask to ignore padding tokens
@@ -1726,11 +1739,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                         relative_indices_tensor
                     )
 
-                # Single validation point (already done above, but double-check before model call)
+                # CRITICAL: Final validation with draft vocab size (already done above, but double-check)
+                # This ensures no invalid tokens reach the embedding layer
                 draft_vocab_size = get_vocab_size(self.draft_lm)
                 if draft_vocab_size is not None:
+                    # Re-validate one more time as final safety check
                     active_input_ids = validate_and_clamp_tokens(
-                        active_input_ids, draft_vocab_size, "draft_input"
+                        active_input_ids, draft_vocab_size, "draft_input_final"
                     )
 
                 if draft_stream is not None:
@@ -2313,11 +2328,13 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                         current_seq = current_input_ids[global_idx]  # Shape: [seq_len]
 
-                        # Validate current sequence with centralized validation
-                        if base_vocab_size is not None:
+                        # CRITICAL: Validate current sequence with DRAFT vocab size
+                        # Since this will be used for draft model in next iteration
+                        draft_vocab_size = get_vocab_size(self.draft_lm)
+                        if draft_vocab_size is not None:
                             current_seq = validate_and_clamp_tokens(
                                 current_seq,
-                                base_vocab_size,
+                                draft_vocab_size,
                                 f"current_seq_{global_idx}",
                             )
 
@@ -2336,12 +2353,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                             [current_seq, accepted_tokens_tensor], dim=0
                         )
 
-                        # Validate after concatenation with centralized validation
-                        base_vocab_size = get_vocab_size(self.base_lm)
-                        if base_vocab_size is not None:
+                        # CRITICAL: Validate after concatenation with DRAFT vocab size
+                        # Since this will be used for draft model in next iteration
+                        draft_vocab_size = get_vocab_size(self.draft_lm)
+                        if draft_vocab_size is not None:
                             updated_seq = validate_and_clamp_tokens(
                                 updated_seq,
-                                base_vocab_size,
+                                draft_vocab_size,
                                 f"updated_seq_{global_idx}",
                             )
 
