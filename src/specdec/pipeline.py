@@ -2238,15 +2238,30 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
-                        draft_tokens, draft_logits = self.draft_lm.generate_tokens(
-                            active_input_ids,
-                            max_new_tokens=k,
-                            temperature=draft_temperature,  # Lower temperature for draft
-                            do_sample=False,  # Use greedy for draft to maximize acceptance
-                            stream=draft_stream,
-                            past_key_values=draft_past_kv,
-                            **kwargs,
-                        )
+                        try:
+                            draft_tokens, draft_logits = self.draft_lm.generate_tokens(
+                                active_input_ids,
+                                max_new_tokens=k,
+                                temperature=draft_temperature,  # Lower temperature for draft
+                                do_sample=False,  # Use greedy for draft to maximize acceptance
+                                stream=draft_stream,
+                                past_key_values=draft_past_kv,
+                                **kwargs,
+                            )
+                        except RuntimeError as e:
+                            # Catch CUDA errors and provide better diagnostics
+                            if "indexSelectLargeIndex" in str(
+                                e
+                            ) or "device-side assert" in str(e):
+                                print(
+                                    f"[CRITICAL ERROR] Step {step}: CUDA embedding error in draft model!\n"
+                                    f"active_input_ids.shape={active_input_ids.shape}\n"
+                                    f"active_input_ids.min()={active_input_ids.min().item()}, max()={active_input_ids.max().item()}\n"
+                                    f"vocab_size={getattr(self.draft_lm._model.config, 'vocab_size', 'unknown') if hasattr(self.draft_lm, '_model') else 'unknown'}\n"
+                                    f"Error: {e}",
+                                    flush=True,
+                                )
+                            raise
                     if draft_end_event is not None:
                         draft_end_event.record(draft_stream)
                 else:

@@ -411,6 +411,41 @@ class HFWrapper(LanguageModel):
                     # Forward pass with past_key_values if available
                     if current_past_kv is not None:
                         # Only pass new tokens (not cached ones)
+                        # CRITICAL: Final validation RIGHT before model forward in async loop
+                        # This is the absolute last check - tokens must be valid here
+                        if hasattr(self._model, "config"):
+                            vocab_size = getattr(self._model.config, "vocab_size", None)
+                            if vocab_size is not None:
+                                if (current_input >= vocab_size).any() or (
+                                    current_input < 0
+                                ).any():
+                                    max_token = current_input.max().item()
+                                    min_token = current_input.min().item()
+                                    invalid_count = (
+                                        (
+                                            (current_input >= vocab_size)
+                                            | (current_input < 0)
+                                        )
+                                        .sum()
+                                        .item()
+                                    )
+                                    print(
+                                        f"[CRITICAL ERROR] Async loop step {step}: Invalid tokens RIGHT before model forward! "
+                                        f"min={min_token}, max={max_token}, vocab={vocab_size}, "
+                                        f"invalid={invalid_count}/{current_input.numel()}\n"
+                                        f"current_input.shape={current_input.shape}, dtype={current_input.dtype}",
+                                        flush=True,
+                                    )
+                                    # Force clamp - this should NEVER happen but prevent crash
+                                    current_input = current_input.clamp(
+                                        min=0, max=vocab_size - 1
+                                    )
+                                    # Raise exception to stop execution and debug
+                                    raise RuntimeError(
+                                        f"Invalid tokens detected in async loop step {step}: "
+                                        f"min={min_token}, max={max_token}, vocab={vocab_size}"
+                                    )
+
                         # Assuming past_kv contains cached sequence length info
                         outputs = self._model(  # type: ignore
                             current_input,
@@ -422,6 +457,39 @@ class HFWrapper(LanguageModel):
                             current_past_kv = outputs.past_key_values
                             last_past_kv = current_past_kv
                     else:
+                        # CRITICAL: Final validation RIGHT before model forward (no past_kv case)
+                        if hasattr(self._model, "config"):
+                            vocab_size = getattr(self._model.config, "vocab_size", None)
+                            if vocab_size is not None:
+                                if (current_input >= vocab_size).any() or (
+                                    current_input < 0
+                                ).any():
+                                    max_token = current_input.max().item()
+                                    min_token = current_input.min().item()
+                                    invalid_count = (
+                                        (
+                                            (current_input >= vocab_size)
+                                            | (current_input < 0)
+                                        )
+                                        .sum()
+                                        .item()
+                                    )
+                                    print(
+                                        f"[CRITICAL ERROR] Async loop step {step} (no past_kv): Invalid tokens RIGHT before model forward! "
+                                        f"min={min_token}, max={max_token}, vocab={vocab_size}, "
+                                        f"invalid={invalid_count}/{current_input.numel()}",
+                                        flush=True,
+                                    )
+                                    # Force clamp
+                                    current_input = current_input.clamp(
+                                        min=0, max=vocab_size - 1
+                                    )
+                                    # Raise exception to stop execution and debug
+                                    raise RuntimeError(
+                                        f"Invalid tokens detected in async loop step {step}: "
+                                        f"min={min_token}, max={max_token}, vocab={vocab_size}"
+                                    )
+
                         outputs = self._model(current_input, use_cache=True)  # type: ignore
                         # Initialize past_key_values on first step if KV cache enabled
                         if outputs.past_key_values is not None:

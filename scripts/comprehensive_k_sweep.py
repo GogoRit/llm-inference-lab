@@ -49,6 +49,15 @@ if torch.cuda.is_available():
         compute_capability = f"{device_capability[0]}{device_capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = compute_capability
 
+    # Enable synchronous CUDA error reporting for debugging
+    # This ensures errors are reported immediately at the call site
+    if "CUDA_LAUNCH_BLOCKING" not in os.environ:
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+        print(
+            "[STARTUP] CUDA_LAUNCH_BLOCKING=1 enabled for synchronous error reporting",
+            flush=True,
+        )
+
     # Reset dynamo and disable dynamic shape capture (fixes graph capture issues)
     try:
         import torch._dynamo  # noqa: E402
