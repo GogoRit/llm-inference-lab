@@ -1586,8 +1586,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                     relative_indices, dtype=torch.long, device=self.device
                 )
 
-                # Create batched input for active prompts only
-                active_seqs = [current_input_ids[i] for i in active_indices]
+                # CRITICAL ROOT CAUSE FIX: Clone sequences with detach() for complete independence
+                # Use detach().clone() to break computation graph and prevent shared memory issues
+                # This ensures tensors are completely independent before entering CUDA streams
+                # Best practice: Prepare all tensors synchronously BEFORE async operations
+                active_seqs = [
+                    current_input_ids[i].detach().clone().contiguous()
+                    for i in active_indices
+                ]
                 if len(active_seqs) == 0:
                     break
 
@@ -1750,48 +1756,64 @@ class SpeculativePipeline(SpeculativeDecoder):
                         relative_indices_tensor
                     )
 
-                # CRITICAL: Clone and validate INSIDE stream context to prevent corruption
-                # The tensor must be validated in the same stream where it will be used
+                # OPTIMAL FIX: Prepare tensor ONCE before both streams (best practice)
+                # Root cause: active_input_ids can be corrupted if shared between streams
+                # Solution: Clone once synchronously, then both streams use independent copies
+                # Performance: Minimal overhead (single clone) vs massive speedup (parallel execution)
                 draft_vocab_size = get_vocab_size(self.draft_lm)
+                base_vocab_size = get_vocab_size(self.base_lm)
 
-                if draft_stream is not None:
-                    # CRITICAL: Synchronize before entering stream to ensure tensor is ready
-                    # This prevents race conditions where tensor is modified while being accessed
+                if draft_stream is not None or verify_stream is not None:
+                    # CRITICAL: Synchronize before preparing tensors to ensure all previous ops complete
+                    # This prevents corruption from concurrent modifications
                     torch.cuda.synchronize()
 
-                    with torch.cuda.stream(draft_stream):
-                        # Clone tensor INSIDE stream context to ensure it's not corrupted
-                        # This creates a fresh copy that's guaranteed to be in the stream's memory space
-                        active_input_ids_clone = active_input_ids.clone()
+                    # OPTIMAL: Clone ONCE with detach() BEFORE streams for complete independence
+                    # This breaks computation graph and ensures no shared memory between streams
+                    # Performance: Single clone operation is negligible vs model execution time
+                    # Both draft and verify streams will use this prepared tensor
+                    try:
+                        # Use detach().clone() to ensure complete independence from computation graph
+                        # This prevents any shared memory or reference issues with CUDA streams
+                        active_input_ids_prepared = (
+                            active_input_ids.detach().clone().contiguous()
+                        )
 
-                        # CRITICAL: Explicit min/max validation BEFORE embedding call (as recommended)
-                        # This is the final check right before the model call
+                        # CRITICAL: Validate BEFORE entering streams (synchronous validation)
+                        # Validate with draft vocab size since draft is more restrictive
                         if draft_vocab_size is not None:
-                            # Validate with strict=True to get detailed diagnostics
-                            active_input_ids_clone = validate_and_clamp_tokens(
-                                active_input_ids_clone,
+                            active_input_ids_prepared = validate_and_clamp_tokens(
+                                active_input_ids_prepared,
                                 draft_vocab_size,
-                                "draft_input_stream",
+                                "batch_input_pre_stream",
                                 strict=True,
                             )
 
-                            # Additional explicit check (as recommended in debugging guides)
-                            # Ensure all values are within valid range before embedding
-                            if (
-                                torch.min(active_input_ids_clone) < 0
-                                or torch.max(active_input_ids_clone) >= draft_vocab_size
-                            ):
-                                # This should never happen after validate_and_clamp_tokens, but double-check
-                                min_val = torch.min(active_input_ids_clone).item()
-                                max_val = torch.max(active_input_ids_clone).item()
+                            # Explicit min/max check before stream entry
+                            min_val = torch.min(active_input_ids_prepared).item()
+                            max_val = torch.max(active_input_ids_prepared).item()
+                            if min_val < 0 or max_val >= draft_vocab_size:
                                 raise RuntimeError(
-                                    f"CRITICAL: Invalid tokens AFTER validation! "
+                                    f"CRITICAL: Invalid tokens before stream! "
                                     f"Min={min_val}, Max={max_val}, Vocab_size={draft_vocab_size}"
                                 )
 
+                    except Exception as e:
+                        print(
+                            f"[CRITICAL ERROR] Step {step}: Failed to prepare tensor for streams! "
+                            f"Error: {e}",
+                            flush=True,
+                        )
+                        raise RuntimeError(
+                            f"Failed to prepare tensor for CUDA streams: {e}"
+                        ) from e
+
+                # Draft stream: Use prepared tensor
+                if draft_stream is not None:
+                    with torch.cuda.stream(draft_stream):
                         try:
                             draft_tokens, draft_logits = self.draft_lm.generate_tokens(
-                                active_input_ids_clone,
+                                active_input_ids_prepared,
                                 max_new_tokens=k,
                                 temperature=draft_temperature,  # Lower temperature for draft
                                 do_sample=False,  # Use greedy for draft to maximize acceptance
@@ -1960,11 +1982,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if verify_start_event is not None:
                             verify_start_event.record(verify_stream)
                         # Use scheduler's verification (it manages streams internally)
+                        # Use prepared tensor for consistency and safety
                         base_tokens, base_logits, verify_info = (
                             self.scheduler.schedule_verification(
                                 self.base_lm,
                                 dummy_draft_tokens,  # Shape only, not actual draft tokens
-                                active_input_ids,
+                                active_input_ids_prepared,
                                 temperature=temperature,
                                 do_sample=do_sample,
                                 **kwargs,
@@ -2004,8 +2027,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # For verification, always use greedy (argmax) to ensure deterministic matching
                         # This ensures base_logits.argmax() matches the tokens we compare
                         try:
+                            # Use prepared tensor (same as draft stream) for consistency and safety
                             base_tokens, base_logits = self.base_lm.generate_tokens(
-                                active_input_ids,
+                                active_input_ids_prepared,
                                 max_new_tokens=k,  # Use k directly, not draft_tokens.shape[1]
                                 temperature=1.0,  # Temperature=1.0 for deterministic argmax
                                 do_sample=False,  # Always use greedy for verification
