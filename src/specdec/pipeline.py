@@ -27,6 +27,71 @@ from .policies import AcceptancePolicy, create_policy
 
 logger = logging.getLogger(__name__)
 
+
+def filter_kv_cache_safe(
+    cache: torch.Tensor, active_indices, name: str = "base"
+) -> Optional[torch.Tensor]:
+    """
+    Safely filter KV cache tensor by active_indices on CUDA without device asserts.
+
+    This function validates and clips active_indices before indexing, preventing
+    CUDA device-side assertion failures. It ensures indices are:
+    - Within bounds of cache batch dimension
+    - On the same device as cache
+    - Valid before any indexing operation
+
+    Args:
+        cache: KV cache tensor with shape [batch, ...]
+        active_indices: List or tensor of active sequence indices
+        name: Name identifier for logging (e.g., "draft" or "base")
+
+    Returns:
+        Filtered cache tensor or None if filtering fails
+    """
+    if cache is None:
+        return None
+
+    cache_batch = cache.shape[0]
+
+    # Convert active_indices to tensor if needed, ensure correct device
+    if not isinstance(active_indices, torch.Tensor):
+        active_indices_tensor = torch.tensor(
+            active_indices, dtype=torch.long, device=cache.device
+        )
+    else:
+        active_indices_tensor = active_indices.to(cache.device, non_blocking=True)
+
+    # Clip invalid indices
+    valid_mask = active_indices_tensor < cache_batch
+    if not torch.all(valid_mask):
+        invalid_count = (~valid_mask).sum().item()
+        logger.warning(
+            "[%s KV] Clipping %d invalid indices (max valid=%d)",
+            name.upper(),
+            invalid_count,
+            cache_batch - 1,
+        )
+        active_indices_tensor = active_indices_tensor[valid_mask]
+
+    if active_indices_tensor.numel() == 0:
+        logger.warning("[%s KV] No valid active indices after clipping", name.upper())
+        return None
+
+    # Safe indexing with try/except
+    try:
+        filtered_cache = cache.index_select(0, active_indices_tensor)
+        logger.debug(
+            "[%s KV] Filtered %d/%d entries",
+            name.upper(),
+            len(active_indices_tensor),
+            cache_batch,
+        )
+        return filtered_cache
+    except RuntimeError as e:
+        logger.error("[%s KV] Cache filtering failed: %s", name.upper(), e)
+        return None
+
+
 # Import optimization modules (conditional to avoid import errors during development)
 try:
     from benchmarks.profiler import create_profiler
@@ -1893,85 +1958,52 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # Check if cache batch dimension matches active_count
                         first_layer_idx = sorted(draft_kv_cache.keys())[0]
                         cache_batch_dim = draft_kv_cache[first_layer_idx][0].shape[0]
-                        cache_device = draft_kv_cache[first_layer_idx][0].device
 
                         if cache_batch_dim != active_count:
                             # Filter cache to match active sequences
                             # If cache has full batch_size, select active_indices
                             # Otherwise, assume cache already filtered (should match active_count)
                             if cache_batch_dim == batch_size:
-                                # CRITICAL: Validate and clip active_indices before indexing
-                                # Convert active_indices to tensor if needed, ensure correct device
-                                if isinstance(active_indices, list):
-                                    active_indices_tensor = torch.tensor(
-                                        active_indices,
-                                        dtype=torch.long,
-                                        device=cache_device,
-                                    )
-                                else:
-                                    active_indices_tensor = active_indices.to(
-                                        cache_device, non_blocking=True
-                                    )
+                                # CRITICAL: Use safe filtering function (runs before CUDA graph capture)
+                                # This ensures validation happens every iteration, not just first one
+                                try:
+                                    # Filter each layer using safe function
+                                    filtered_layers = []
+                                    for i in sorted(draft_kv_cache.keys()):
+                                        k_filtered = filter_kv_cache_safe(
+                                            draft_kv_cache[i][0],
+                                            active_indices,
+                                            name="draft",
+                                        )
+                                        v_filtered = filter_kv_cache_safe(
+                                            draft_kv_cache[i][1],
+                                            active_indices,
+                                            name="draft",
+                                        )
+                                        if k_filtered is None or v_filtered is None:
+                                            # Filtering failed for this layer - skip KV cache
+                                            print(
+                                                "[WARNING] Step {}: Draft KV cache filtering failed for layer {}, "
+                                                "skipping KV cache".format(step, i),
+                                                flush=True,
+                                            )
+                                            draft_past_kv = None
+                                            break
+                                        filtered_layers.append((k_filtered, v_filtered))
 
-                                # Validate indices are within bounds
-                                valid_mask = active_indices_tensor < cache_batch_dim
-                                if not valid_mask.all():
-                                    # Clip invalid indices
-                                    invalid_count = (~valid_mask).sum().item()
+                                    if draft_past_kv is None:
+                                        # One of the layers failed - already set to None
+                                        pass
+                                    else:
+                                        # All layers filtered successfully
+                                        draft_past_kv = tuple(filtered_layers)
+                                except Exception as e:
                                     print(
-                                        "[WARNING] Step {}: Clipping {} invalid draft KV cache indices "
-                                        "(cache_size={}, max_index={})".format(
-                                            step,
-                                            invalid_count,
-                                            cache_batch_dim,
-                                            (
-                                                active_indices_tensor.max().item()
-                                                if len(active_indices_tensor) > 0
-                                                else -1
-                                            ),
-                                        ),
-                                        flush=True,
-                                    )
-                                    active_indices_tensor = active_indices_tensor[
-                                        valid_mask
-                                    ]
-
-                                if len(active_indices_tensor) == 0:
-                                    print(
-                                        "[WARNING] Step {}: No valid active_indices after filtering, "
-                                        "skipping draft KV cache".format(step),
+                                        "[WARNING] Step {}: Draft KV cache safe filtering exception: {}. "
+                                        "Skipping KV cache.".format(step, e),
                                         flush=True,
                                     )
                                     draft_past_kv = None
-                                else:
-                                    # Filter cache using validated indices
-                                    print(
-                                        "[DEBUG] Safe-filtered draft active_indices: {} / {}".format(
-                                            len(active_indices_tensor), cache_batch_dim
-                                        ),
-                                        flush=True,
-                                    )
-                                    try:
-                                        draft_past_kv = tuple(
-                                            (
-                                                draft_kv_cache[i][0].index_select(
-                                                    0, active_indices_tensor
-                                                ),
-                                                draft_kv_cache[i][1].index_select(
-                                                    0, active_indices_tensor
-                                                ),
-                                            )
-                                            for i in sorted(draft_kv_cache.keys())
-                                        )
-                                    except RuntimeError as e:
-                                        print(
-                                            "[WARNING] Step {}: Draft KV cache indexing failed: {}. "
-                                            "Skipping KV cache for this step.".format(
-                                                step, e
-                                            ),
-                                            flush=True,
-                                        )
-                                        draft_past_kv = None
                             else:
                                 # Cache mismatch - log warning and skip KV cache for this step
                                 print(
@@ -2228,14 +2260,68 @@ class SpeculativePipeline(SpeculativeDecoder):
                 elif verify_stream is not None and draft_stream is not None:
                     # Manual stream management if scheduler not available
                     # Prepare past_key_values for base model if KV cache is enabled
+                    # CRITICAL: Use safe filtering function (runs before CUDA graph capture)
                     base_past_kv = None
                     if kv_cache_enabled and base_kv_cache is not None:
                         # Convert dict format to tuple format expected by model
                         if len(base_kv_cache) > 0:
-                            base_past_kv = tuple(
-                                (base_kv_cache[i][0], base_kv_cache[i][1])
-                                for i in sorted(base_kv_cache.keys())
-                            )
+                            # Check cache batch dimension and validate if filtering needed
+                            first_layer_idx = sorted(base_kv_cache.keys())[0]
+                            cache_batch_dim = base_kv_cache[first_layer_idx][0].shape[0]
+
+                            if cache_batch_dim != active_count:
+                                # Need to filter - use safe function
+                                if cache_batch_dim == batch_size:
+                                    # CRITICAL: Use safe filtering function (runs before CUDA graph capture)
+                                    try:
+                                        # Filter each layer using safe function
+                                        filtered_layers = []
+                                        for i in sorted(base_kv_cache.keys()):
+                                            k_filtered = filter_kv_cache_safe(
+                                                base_kv_cache[i][0],
+                                                active_indices,
+                                                name="base",
+                                            )
+                                            v_filtered = filter_kv_cache_safe(
+                                                base_kv_cache[i][1],
+                                                active_indices,
+                                                name="base",
+                                            )
+                                            if k_filtered is None or v_filtered is None:
+                                                # Filtering failed for this layer - skip KV cache
+                                                print(
+                                                    "[WARNING] Step {}: Base KV cache filtering failed for layer {}, "
+                                                    "skipping KV cache".format(step, i),
+                                                    flush=True,
+                                                )
+                                                base_past_kv = None
+                                                break
+                                            filtered_layers.append(
+                                                (k_filtered, v_filtered)
+                                            )
+
+                                        if len(filtered_layers) > 0:
+                                            # All layers filtered successfully
+                                            base_past_kv = tuple(filtered_layers)
+                                        else:
+                                            # No layers filtered successfully
+                                            base_past_kv = None
+                                    except Exception as e:
+                                        print(
+                                            "[WARNING] Step {}: Base KV cache safe filtering exception: {}. "
+                                            "Skipping KV cache.".format(step, e),
+                                            flush=True,
+                                        )
+                                        base_past_kv = None
+                                else:
+                                    # Cache mismatch - skip KV cache
+                                    base_past_kv = None
+                            else:
+                                # Cache batch dimension matches active_count - use directly
+                                base_past_kv = tuple(
+                                    (base_kv_cache[i][0], base_kv_cache[i][1])
+                                    for i in sorted(base_kv_cache.keys())
+                                )
 
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
