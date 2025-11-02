@@ -2619,15 +2619,31 @@ class SpeculativePipeline(SpeculativeDecoder):
                             verify_start_event.record(verify_stream)
                         # For verification, always use greedy (argmax) to ensure deterministic matching
                         # This ensures base_logits.argmax() matches the tokens we compare
-                        base_tokens, base_logits = self.base_lm.generate_tokens(
-                            active_input_ids,
-                            max_new_tokens=k,  # Use k directly, not draft_tokens.shape[1]
-                            temperature=1.0,  # Temperature=1.0 for deterministic argmax
-                            do_sample=False,  # Always use greedy for verification
-                            stream=verify_stream,
-                            past_key_values=base_past_kv,
-                            **kwargs,
-                        )
+                        try:
+                            base_tokens, base_logits = self.base_lm.generate_tokens(
+                                active_input_ids,
+                                max_new_tokens=k,  # Use k directly, not draft_tokens.shape[1]
+                                temperature=1.0,  # Temperature=1.0 for deterministic argmax
+                                do_sample=False,  # Always use greedy for verification
+                                stream=verify_stream,
+                                past_key_values=base_past_kv,
+                                **kwargs,
+                            )
+                        except RuntimeError as e:
+                            # Catch CUDA errors and provide better diagnostics
+                            if "indexSelectLargeIndex" in str(
+                                e
+                            ) or "device-side assert" in str(e):
+                                print(
+                                    f"[CRITICAL ERROR] Step {step}: CUDA embedding error in base model (scheduler path)!\n"
+                                    f"active_input_ids.shape={active_input_ids.shape}\n"
+                                    f"active_input_ids.min()={active_input_ids.min().item()}, max()={active_input_ids.max().item()}\n"
+                                    f"vocab_size={getattr(self.base_lm._model.config, 'vocab_size', 'unknown') if hasattr(self.base_lm, '_model') else 'unknown'}\n"
+                                    f"base_past_kv is None={base_past_kv is None}\n"
+                                    f"Error: {e}",
+                                    flush=True,
+                                )
+                            raise
                         if verify_end_event is not None:
                             verify_end_event.record(verify_stream)
 
