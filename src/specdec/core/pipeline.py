@@ -1512,9 +1512,17 @@ class SpeculativePipeline(SpeculativeDecoder):
             generation_start = time.time()
 
             # Create CUDA streams for draft/verify overlap
+            # CRITICAL: Disable streams if CUDA_LAUNCH_BLOCKING=1 (forces synchronous execution)
+            # Streams won't provide benefit and may cause confusion with synchronous mode
             draft_stream = None
             verify_stream = None
-            if self.device == "cuda" and torch.cuda.is_available():
+            cuda_launch_blocking = os.getenv("CUDA_LAUNCH_BLOCKING") == "1"
+
+            if (
+                self.device == "cuda"
+                and torch.cuda.is_available()
+                and not cuda_launch_blocking
+            ):
                 # Use scheduler's streams if available, otherwise create new ones
                 if (
                     hasattr(self.scheduler, "verification_stream")
@@ -1525,6 +1533,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                 else:
                     draft_stream = torch.cuda.Stream()
                     verify_stream = torch.cuda.Stream()
+            elif cuda_launch_blocking:
+                print(
+                    "[INFO] CUDA_LAUNCH_BLOCKING=1 detected - disabling async streams "
+                    "for synchronous execution (better for debugging)",
+                    flush=True,
+                )
 
             while step < max_tokens:
                 step += 1
@@ -1657,10 +1671,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                     else:
                         padded_seqs[i] = seq
 
-                # Stack into batch tensor
-                active_input_ids = torch.stack(
+                # CRITICAL: Stack and immediately clone to ensure complete independence
+                # torch.stack() may create views or shared memory - clone immediately
+                active_input_ids_stacked = torch.stack(
                     padded_seqs, dim=0
                 )  # [active_count, max_seq_len]
+
+                # CRITICAL: Clone immediately after stacking to break any memory sharing
+                # This ensures the batch tensor is completely independent
+                active_input_ids = (
+                    active_input_ids_stacked.detach().clone().contiguous()
+                )
 
                 # CRITICAL: Final validation with draft vocab size before passing to draft model
                 # This is the last safety check before embedding layer
@@ -2447,6 +2468,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 f"updated_seq_{global_idx}",
                             )
 
+                        # CRITICAL: Clone before storing to ensure independence
+                        # This prevents corruption if tensor is still being used elsewhere
+                        updated_seq = updated_seq.detach().clone().contiguous()
+
                         # Update sequence (keep as 1D list item, no padding)
                         current_input_ids[global_idx] = updated_seq
                     else:
@@ -2478,6 +2503,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                         batch_active[global_idx] = False
 
                 batch_metrics["total_steps"] += 1
+
+                # CRITICAL: Synchronize ALL CUDA operations before next iteration
+                # This ensures all tensor updates are complete before we clone sequences
+                # Prevents corruption from concurrent modifications
+                if self.device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
                 # Log batch progress with accurate timing
                 if step % 8 == 0 or step == 1:
