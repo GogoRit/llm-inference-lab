@@ -375,6 +375,10 @@ class HFWrapper(LanguageModel):
                 last_past_kv = None  # Track KV cache for return
 
                 for step in range(max_new_tokens):
+                    # CRITICAL: Synchronize stream before validation to ensure all previous ops complete
+                    if stream is not None:
+                        torch.cuda.synchronize()
+
                     # CRITICAL: Validate current_input before EACH forward pass
                     # This is the absolute last check before embedding lookup in async loop
                     if hasattr(self._model, "config"):
@@ -385,9 +389,18 @@ class HFWrapper(LanguageModel):
                             ).any():
                                 max_token = current_input.max().item()
                                 min_token = current_input.min().item()
+                                invalid_count = (
+                                    (
+                                        (current_input >= vocab_size)
+                                        | (current_input < 0)
+                                    )
+                                    .sum()
+                                    .item()
+                                )
                                 print(
-                                    f"[ERROR] Invalid tokens in async loop before forward: "
-                                    f"step={step}, min={min_token}, max={max_token}, vocab={vocab_size}",
+                                    f"[CRITICAL ERROR] Async loop step {step}: Invalid tokens before forward! "
+                                    f"min={min_token}, max={max_token}, vocab={vocab_size}, "
+                                    f"invalid={invalid_count}/{current_input.numel()}",
                                     flush=True,
                                 )
                                 # Clamp invalid tokens

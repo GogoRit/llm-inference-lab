@@ -1881,16 +1881,48 @@ class SpeculativePipeline(SpeculativeDecoder):
                     max_seq_len = max(max_seq_len, seq_len)
 
                 # Pad all sequences to max length for batching (optimized: pre-allocate)
+                # CRITICAL: Validate pad_value is within vocab_size before using it
+                vocab_size = None
+                if hasattr(self.base_lm, "_model") and hasattr(
+                    self.base_lm._model, "config"
+                ):
+                    vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
+
                 pad_value = (
                     tokenizer.pad_token_id
                     if tokenizer is not None and tokenizer.pad_token_id is not None
                     else 0
                 )
+
+                # Validate pad_value is within vocabulary
+                if vocab_size is not None:
+                    if pad_value >= vocab_size or pad_value < 0:
+                        # Try eos_token_id as fallback
+                        eos_id = (
+                            tokenizer.eos_token_id
+                            if tokenizer is not None
+                            and tokenizer.eos_token_id is not None
+                            else None
+                        )
+                        if eos_id is not None and 0 <= eos_id < vocab_size:
+                            pad_value = eos_id
+                        else:
+                            # Final fallback: use a safe value (usually 0 is valid, but validate)
+                            pad_value = 0
+                            if pad_value >= vocab_size:
+                                # Last resort: use vocab_size - 1 (but this is wrong, just prevent crash)
+                                pad_value = vocab_size - 1
+                                print(
+                                    f"[WARNING] Step {step}: pad_value invalid, using {pad_value} "
+                                    f"(should never happen - vocab issue)",
+                                    flush=True,
+                                )
+
                 # Pre-allocate list to avoid repeated appends
                 padded_seqs = [None] * len(active_seqs)
                 for i, seq in enumerate(active_seqs):
                     if seq.shape[0] < max_seq_len:
-                        # Pad with pad_token_id
+                        # Pad with validated pad_token_id
                         pad_length = max_seq_len - seq.shape[0]
                         padding = torch.full(
                             (pad_length,),
@@ -1899,6 +1931,22 @@ class SpeculativePipeline(SpeculativeDecoder):
                             device=seq.device,
                         )
                         seq_padded = torch.cat([seq, padding], dim=0)
+
+                        # CRITICAL: Validate immediately after padding
+                        if vocab_size is not None:
+                            if (seq_padded >= vocab_size).any() or (
+                                seq_padded < 0
+                            ).any():
+                                max_val = seq_padded.max().item()
+                                min_val = seq_padded.min().item()
+                                print(
+                                    f"[ERROR] Step {step}, seq {i}: Invalid tokens after padding! "
+                                    f"min={min_val}, max={max_val}, vocab={vocab_size}, pad_value={pad_value}",
+                                    flush=True,
+                                )
+                                # Clamp to valid range
+                                seq_padded = seq_padded.clamp(min=0, max=vocab_size - 1)
+
                         padded_seqs[i] = seq_padded
                     else:
                         padded_seqs[i] = seq
@@ -2091,8 +2139,66 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 for i in sorted(draft_kv_cache.keys())
                             )
 
-                # CRITICAL: Validate tokens before model forward pass
-                # This prevents invalid token indices from crashing CUDA kernels
+                    # CRITICAL: Validate tokens before model forward pass
+                    # This prevents invalid token indices from crashing CUDA kernels
+                    if hasattr(self.draft_lm, "_model") and hasattr(
+                        self.draft_lm._model, "config"
+                    ):
+                        vocab_size = getattr(
+                            self.draft_lm._model.config, "vocab_size", None
+                        )
+                        if vocab_size is not None:
+                            # Check both >= vocab_size and < 0
+                            if (active_input_ids >= vocab_size).any() or (
+                                active_input_ids < 0
+                            ).any():
+                                max_token = active_input_ids.max().item()
+                                min_token = active_input_ids.min().item()
+                                invalid_count = (
+                                    (
+                                        (active_input_ids >= vocab_size)
+                                        | (active_input_ids < 0)
+                                    )
+                                    .sum()
+                                    .item()
+                                )
+                                logger.error(
+                                    "[DRAFT] Invalid token index detected: min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
+                                    min_token,
+                                    max_token,
+                                    vocab_size,
+                                    invalid_count,
+                                    active_input_ids.numel(),
+                                )
+                                print(
+                                    "[ERROR] Step {}: Invalid tokens in active_input_ids before draft model: "
+                                    "min={}, max={}, vocab={}, invalid={}/{}".format(
+                                        step,
+                                        min_token,
+                                        max_token,
+                                        vocab_size,
+                                        invalid_count,
+                                        active_input_ids.numel(),
+                                    ),
+                                    flush=True,
+                                )
+                                # Clamp invalid tokens to valid range
+                                active_input_ids = active_input_ids.clamp(
+                                    min=0, max=vocab_size - 1
+                                )
+                                print(
+                                    "[WARNING] Step {}: Clamped draft input tokens to valid range [0, {}]".format(
+                                        step, vocab_size - 1
+                                    ),
+                                    flush=True,
+                                )
+
+                # CRITICAL: Device synchronization before graph capture/replay
+                if self.device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+                # CRITICAL: Final validation IMMEDIATELY before draft model call
+                # This is the absolute last check before tokens reach embedding layer
                 if hasattr(self.draft_lm, "_model") and hasattr(
                     self.draft_lm._model, "config"
                 ):
@@ -2100,27 +2206,35 @@ class SpeculativePipeline(SpeculativeDecoder):
                         self.draft_lm._model.config, "vocab_size", None
                     )
                     if vocab_size is not None:
-                        if (active_input_ids >= vocab_size).any():
+                        if (active_input_ids >= vocab_size).any() or (
+                            active_input_ids < 0
+                        ).any():
                             max_token = active_input_ids.max().item()
-                            logger.error(
-                                "[DRAFT] Invalid token index detected: %d >= %d",
-                                max_token,
-                                vocab_size,
-                            )
-                            # Clamp invalid tokens to valid range
-                            active_input_ids = active_input_ids.clamp(
-                                max=vocab_size - 1
+                            min_token = active_input_ids.min().item()
+                            invalid_count = (
+                                (
+                                    (active_input_ids >= vocab_size)
+                                    | (active_input_ids < 0)
+                                )
+                                .sum()
+                                .item()
                             )
                             print(
-                                "[WARNING] Step {}: Clamped draft input tokens to valid range [0, {}]".format(
-                                    step, vocab_size - 1
+                                "[CRITICAL ERROR] Step {}: Invalid tokens IMMEDIATELY before draft model! "
+                                "min={}, max={}, vocab={}, invalid={}/{}".format(
+                                    step,
+                                    min_token,
+                                    max_token,
+                                    vocab_size,
+                                    invalid_count,
+                                    active_input_ids.numel(),
                                 ),
                                 flush=True,
                             )
-
-                # CRITICAL: Device synchronization before graph capture/replay
-                if self.device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                            # Force clamp to prevent crash
+                            active_input_ids = active_input_ids.clamp(
+                                min=0, max=vocab_size - 1
+                            )
 
                 if draft_stream is not None:
                     with torch.cuda.stream(draft_stream):
@@ -2631,16 +2745,59 @@ class SpeculativePipeline(SpeculativeDecoder):
                         draft_end_event.synchronize()
 
                     # Prepare past_key_values for base model if KV cache is enabled
+                    # CRITICAL: Check cache batch dimension matches active_count
                     base_past_kv = None
                     if kv_cache_enabled and base_kv_cache is not None:
                         if len(base_kv_cache) > 0:
-                            base_past_kv = tuple(
-                                (base_kv_cache[i][0], base_kv_cache[i][1])
-                                for i in sorted(base_kv_cache.keys())
-                            )
+                            # Check cache batch dimension
+                            first_layer_idx = sorted(base_kv_cache.keys())[0]
+                            cache_batch_dim = base_kv_cache[first_layer_idx][0].shape[0]
 
-                    # CRITICAL: Validate tokens before model forward pass
-                    # This prevents invalid token indices from crashing CUDA kernels
+                            if cache_batch_dim == active_count:
+                                # Cache matches - use directly
+                                base_past_kv = tuple(
+                                    (base_kv_cache[i][0], base_kv_cache[i][1])
+                                    for i in sorted(base_kv_cache.keys())
+                                )
+                            elif cache_batch_dim == batch_size:
+                                # Need to filter - use safe function
+                                try:
+                                    filtered_layers = []
+                                    for i in sorted(base_kv_cache.keys()):
+                                        k_filtered = filter_kv_cache_safe(
+                                            base_kv_cache[i][0],
+                                            active_indices,
+                                            name="base",
+                                        )
+                                        v_filtered = filter_kv_cache_safe(
+                                            base_kv_cache[i][1],
+                                            active_indices,
+                                            name="base",
+                                        )
+                                        if k_filtered is None or v_filtered is None:
+                                            base_past_kv = None
+                                            break
+                                        filtered_layers.append((k_filtered, v_filtered))
+
+                                    if len(filtered_layers) == len(base_kv_cache):
+                                        base_past_kv = tuple(filtered_layers)
+                                except Exception as e:
+                                    print(
+                                        f"[WARNING] Step {step}: Base KV cache filtering failed: {e}",
+                                        flush=True,
+                                    )
+                                    base_past_kv = None
+                            else:
+                                # Cache dimension mismatch - skip KV cache
+                                print(
+                                    f"[WARNING] Step {step}: Base KV cache batch mismatch: "
+                                    f"cache={cache_batch_dim}, active={active_count}, batch={batch_size}",
+                                    flush=True,
+                                )
+                                base_past_kv = None
+
+                    # CRITICAL: Final validation IMMEDIATELY before base model call
+                    # This is the absolute last check before tokens reach embedding layer
                     if hasattr(self.base_lm, "_model") and hasattr(
                         self.base_lm._model, "config"
                     ):
@@ -2648,16 +2805,43 @@ class SpeculativePipeline(SpeculativeDecoder):
                             self.base_lm._model.config, "vocab_size", None
                         )
                         if vocab_size is not None:
-                            if (active_input_ids >= vocab_size).any():
+                            # Check both >= vocab_size and < 0
+                            if (active_input_ids >= vocab_size).any() or (
+                                active_input_ids < 0
+                            ).any():
                                 max_token = active_input_ids.max().item()
+                                min_token = active_input_ids.min().item()
+                                invalid_count = (
+                                    (
+                                        (active_input_ids >= vocab_size)
+                                        | (active_input_ids < 0)
+                                    )
+                                    .sum()
+                                    .item()
+                                )
                                 logger.error(
-                                    "[BASE] Invalid token index detected: %d >= %d",
+                                    "[BASE] Invalid token index detected: min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
+                                    min_token,
                                     max_token,
                                     vocab_size,
+                                    invalid_count,
+                                    active_input_ids.numel(),
+                                )
+                                print(
+                                    "[CRITICAL ERROR] Step {}: Invalid tokens IMMEDIATELY before base model! "
+                                    "min={}, max={}, vocab={}, invalid={}/{}".format(
+                                        step,
+                                        min_token,
+                                        max_token,
+                                        vocab_size,
+                                        invalid_count,
+                                        active_input_ids.numel(),
+                                    ),
+                                    flush=True,
                                 )
                                 # Clamp invalid tokens to valid range
                                 active_input_ids = active_input_ids.clamp(
-                                    max=vocab_size - 1
+                                    min=0, max=vocab_size - 1
                                 )
                                 print(
                                     "[WARNING] Step {}: Clamped base input tokens to valid range [0, {}]".format(
@@ -3087,15 +3271,30 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 ).any():
                                     max_token = updated_seq.max().item()
                                     min_token = updated_seq.min().item()
+                                    invalid_count = (
+                                        (
+                                            (updated_seq >= vocab_size)
+                                            | (updated_seq < 0)
+                                        )
+                                        .sum()
+                                        .item()
+                                    )
                                     print(
                                         f"[ERROR] Step {step}, prompt {global_idx}: "
                                         f"Invalid tokens in updated_seq after concat: "
-                                        f"min={min_token}, max={max_token}, vocab={vocab_size}",
+                                        f"min={min_token}, max={max_token}, vocab={vocab_size}, "
+                                        f"invalid={invalid_count}/{updated_seq.numel()}\n"
+                                        f"This is a critical error - embedding layer will crash!",
                                         flush=True,
                                     )
                                     # Clamp to valid range
                                     updated_seq = updated_seq.clamp(
                                         min=0, max=vocab_size - 1
+                                    )
+                                    print(
+                                        f"[WARNING] Step {step}, prompt {global_idx}: "
+                                        f"Clamped updated_seq to valid range [0, {vocab_size - 1}]",
+                                        flush=True,
                                     )
 
                         # Update sequence (keep as 1D list item, no padding)
