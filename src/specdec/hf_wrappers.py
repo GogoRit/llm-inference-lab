@@ -374,8 +374,8 @@ class HFWrapper(LanguageModel):
                     else:
                         current_input = torch.cat([current_input, next_token], dim=1)
 
-                    # Progress print every 8 tokens
-                    if step % 8 == 0 or step == max_new_tokens - 1:
+                    # Progress print (reduced frequency to reduce CPU overhead)
+                    if step % 16 == 0 or step == max_new_tokens - 1:
                         print(
                             f"[GEN] Step {step+1}/{max_new_tokens} | "
                             f"Current seq len: {current_input.shape[-1]}",

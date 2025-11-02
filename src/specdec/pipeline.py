@@ -1903,6 +1903,37 @@ class SpeculativePipeline(SpeculativeDecoder):
                     padded_seqs, dim=0
                 )  # [active_count, max_seq_len]
 
+                # CRITICAL: Validate all input IDs before creating attention mask
+                # This catches any invalid tokens that may have been introduced during padding/concatenation
+                if hasattr(self.base_lm, "_model") and hasattr(
+                    self.base_lm._model, "config"
+                ):
+                    vocab_size = getattr(self.base_lm._model.config, "vocab_size", None)
+                    if vocab_size is not None:
+                        if (active_input_ids >= vocab_size).any() or (
+                            active_input_ids < 0
+                        ).any():
+                            max_token = active_input_ids.max().item()
+                            min_token = active_input_ids.min().item()
+                            invalid_count = (
+                                (
+                                    (active_input_ids >= vocab_size)
+                                    | (active_input_ids < 0)
+                                )
+                                .sum()
+                                .item()
+                            )
+                            print(
+                                f"[ERROR] Step {step}: Invalid tokens in active_input_ids before attention mask: "
+                                f"min={min_token}, max={max_token}, vocab={vocab_size}, "
+                                f"invalid_count={invalid_count}/{active_input_ids.numel()}",
+                                flush=True,
+                            )
+                            # Clamp to valid range
+                            active_input_ids = active_input_ids.clamp(
+                                min=0, max=vocab_size - 1
+                            )
+
                 # Create attention mask to ignore padding tokens
                 active_attention_mask = torch.ones(
                     (len(active_indices), max_seq_len),
@@ -1967,7 +1998,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Use CUDA events for accurate timing (same as verify)
                 draft_start_wall = time.time()
 
-                # Debug: log before draft execution
+                # Debug: log before draft execution (only first step to reduce CPU overhead)
                 if step == 1:
                     print(
                         f"[DEBUG] Before draft - input shape: {active_input_ids.shape}, "
@@ -2265,7 +2296,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                     )
                     break
 
-                # Debug: decode draft tokens
+                # Debug: decode draft tokens (only first step to reduce CPU overhead)
                 if step == 1 and tokenizer is not None:
                     try:
                         draft_text = tokenizer.decode(draft_tokens[0])
@@ -2283,16 +2314,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                 else:
                     draft_time_ms = (time.time() - draft_start_wall) * 1000
 
-                # Debug: log draft outputs shape and sample tokens
-                print(
-                    f"[DEBUG] Draft execution - tokens shape: {draft_tokens.shape}, "
-                    f"logits shape: {draft_logits.shape}, "
-                    f"time: {draft_time_ms:.2f}ms, "
-                    f"proposed_tokens: {draft_tokens.shape[0] * draft_tokens.shape[1]}",
-                    flush=True,
-                )
+                # Debug: log draft outputs shape (reduced frequency to reduce CPU overhead)
+                if step == 1 or step % 16 == 0:
+                    print(
+                        f"[DEBUG] Draft execution - tokens shape: {draft_tokens.shape}, "
+                        f"logits shape: {draft_logits.shape}, "
+                        f"time: {draft_time_ms:.2f}ms, "
+                        f"proposed_tokens: {draft_tokens.shape[0] * draft_tokens.shape[1]}",
+                        flush=True,
+                    )
                 if step == 1:
-                    # Log sample token IDs
+                    # Log sample token IDs (only first step)
                     print(
                         f"[DEBUG] Sample draft token IDs (first batch): "
                         f"{draft_tokens[0, :min(5, draft_tokens.shape[1])].tolist()}",
@@ -2732,8 +2764,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                 batch_metrics["total_draft_time_ms"] += draft_time_ms
                 batch_metrics["total_verification_time_ms"] += verify_time_ms
 
-                # Debug: log batch metrics after each step
-                if step == 1 or step % 8 == 0:
+                # Debug: log batch metrics after each step (reduced frequency to reduce CPU overhead)
+                if step == 1 or step % 16 == 0:
                     print(
                         f"[DEBUG] Step {step} metrics - "
                         f"proposed: {batch_metrics['total_proposed']}, "
@@ -2747,15 +2779,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                 accepted_lengths = []
                 accepted_tokens_list = []
 
-                # Debug: log verify outputs shape
-                print(
-                    f"[DEBUG] Verify execution - base_tokens shape: {base_tokens.shape}, "
-                    f"base_logits shape: {base_logits.shape}, "
-                    f"verify_time: {verify_time_ms:.2f}ms",
-                    flush=True,
-                )
+                # Debug: log verify outputs shape (only first step and every 16 steps to reduce CPU overhead)
+                if step == 1 or step % 16 == 0:
+                    print(
+                        f"[DEBUG] Verify execution - base_tokens shape: {base_tokens.shape}, "
+                        f"base_logits shape: {base_logits.shape}, "
+                        f"verify_time: {verify_time_ms:.2f}ms",
+                        flush=True,
+                    )
                 if step == 1:
-                    # Decode verify tokens
+                    # Decode verify tokens (only first step)
                     if tokenizer is not None:
                         try:
                             verify_text = tokenizer.decode(base_tokens[0])
@@ -2833,8 +2866,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                         prompt_base_logits,
                     )
 
-                    # Debug: log policy result with more detail
-                    if step <= 2 or os.getenv("SPECDEC_DEBUG_ACCEPT", "0") == "1":
+                    # Debug: log policy result (reduced frequency unless debug mode enabled)
+                    debug_accept = os.getenv("SPECDEC_DEBUG_ACCEPT", "0") == "1"
+                    if (step <= 2 or debug_accept) and (step % 8 == 0 or step <= 2):
                         proposed_count = prompt_draft_tokens.shape[1]
                         accept_rate = accepted_len / max(proposed_count, 1)
                         print(
@@ -2905,8 +2939,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 flush=True,
                             )
 
-                    # Debug: log acceptance per prompt (after append)
-                    if step <= 3 or idx_in_active == 0:
+                    # Debug: log acceptance per prompt (reduced frequency to reduce CPU overhead)
+                    debug_accept = os.getenv("SPECDEC_DEBUG_ACCEPT", "0") == "1"
+                    if (step <= 2 or debug_accept) and (step % 8 == 0 or step <= 2):
                         print(
                             f"[DEBUG] Acceptance - prompt {global_idx}, "
                             f"proposed={prompt_draft_tokens.shape[1]}, "
@@ -2931,13 +2966,79 @@ class SpeculativePipeline(SpeculativeDecoder):
                     # Concatenate accepted tokens to current input (no padding, keep as 1D)
                     # Use accepted_tokens directly (already extracted above)
                     if len(accepted_tokens) > 0:
+                        # CRITICAL: Validate accepted tokens one more time before creating tensor
+                        # This ensures no invalid indices are introduced during list operations
+                        if hasattr(self.base_lm, "_model") and hasattr(
+                            self.base_lm._model, "config"
+                        ):
+                            vocab_size = getattr(
+                                self.base_lm._model.config, "vocab_size", None
+                            )
+                            if vocab_size is not None:
+                                # Ensure all tokens are valid integers in range
+                                accepted_tokens = [
+                                    max(0, min(int(tok), vocab_size - 1))
+                                    for tok in accepted_tokens
+                                ]
+
                         accepted_tokens_tensor = torch.tensor(
                             accepted_tokens, device=self.device, dtype=torch.long
                         )  # Shape: [accepted_len]
+
+                        # CRITICAL: Final validation on tensor before concatenation
+                        if hasattr(self.base_lm, "_model") and hasattr(
+                            self.base_lm._model, "config"
+                        ):
+                            vocab_size = getattr(
+                                self.base_lm._model.config, "vocab_size", None
+                            )
+                            if vocab_size is not None:
+                                if (accepted_tokens_tensor >= vocab_size).any() or (
+                                    accepted_tokens_tensor < 0
+                                ).any():
+                                    max_token = accepted_tokens_tensor.max().item()
+                                    min_token = accepted_tokens_tensor.min().item()
+                                    print(
+                                        f"[ERROR] Step {step}, prompt {global_idx}: "
+                                        f"Invalid tokens in tensor before concat: "
+                                        f"min={min_token}, max={max_token}, vocab={vocab_size}",
+                                        flush=True,
+                                    )
+                                    # Clamp to valid range
+                                    accepted_tokens_tensor = (
+                                        accepted_tokens_tensor.clamp(
+                                            min=0, max=vocab_size - 1
+                                        )
+                                    )
+
                         current_seq = current_input_ids[global_idx]  # Shape: [seq_len]
 
-                        # Debug: log before/after append
-                        if step <= 2:
+                        # CRITICAL: Validate current sequence as well
+                        if hasattr(self.base_lm, "_model") and hasattr(
+                            self.base_lm._model, "config"
+                        ):
+                            vocab_size = getattr(
+                                self.base_lm._model.config, "vocab_size", None
+                            )
+                            if vocab_size is not None:
+                                if (current_seq >= vocab_size).any() or (
+                                    current_seq < 0
+                                ).any():
+                                    max_token = current_seq.max().item()
+                                    min_token = current_seq.min().item()
+                                    print(
+                                        f"[ERROR] Step {step}, prompt {global_idx}: "
+                                        f"Invalid tokens in current_seq before concat: "
+                                        f"min={min_token}, max={max_token}, vocab={vocab_size}",
+                                        flush=True,
+                                    )
+                                    # Clamp to valid range
+                                    current_seq = current_seq.clamp(
+                                        min=0, max=vocab_size - 1
+                                    )
+
+                        # Debug: log before/after append (only first step to reduce CPU overhead)
+                        if step == 1:
                             print(
                                 f"[DEBUG] Sequence update - prompt {global_idx}: "
                                 f"before_len={current_seq.shape[0]}, "
@@ -2950,6 +3051,31 @@ class SpeculativePipeline(SpeculativeDecoder):
                         updated_seq = torch.cat(
                             [current_seq, accepted_tokens_tensor], dim=0
                         )
+
+                        # CRITICAL: Final validation after concatenation
+                        if hasattr(self.base_lm, "_model") and hasattr(
+                            self.base_lm._model, "config"
+                        ):
+                            vocab_size = getattr(
+                                self.base_lm._model.config, "vocab_size", None
+                            )
+                            if vocab_size is not None:
+                                if (updated_seq >= vocab_size).any() or (
+                                    updated_seq < 0
+                                ).any():
+                                    max_token = updated_seq.max().item()
+                                    min_token = updated_seq.min().item()
+                                    print(
+                                        f"[ERROR] Step {step}, prompt {global_idx}: "
+                                        f"Invalid tokens in updated_seq after concat: "
+                                        f"min={min_token}, max={max_token}, vocab={vocab_size}",
+                                        flush=True,
+                                    )
+                                    # Clamp to valid range
+                                    updated_seq = updated_seq.clamp(
+                                        min=0, max=vocab_size - 1
+                                    )
+
                         # Update sequence (keep as 1D list item, no padding)
                         current_input_ids[global_idx] = updated_seq
                     else:
