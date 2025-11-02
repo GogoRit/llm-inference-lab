@@ -1267,6 +1267,9 @@ class SpeculativePipeline(SpeculativeDecoder):
         This method processes multiple prompts simultaneously to maximize GPU utilization.
         Prompts are tokenized together, padded to the same length, and processed as a batch.
 
+        Note: For better error diagnostics, set CUDA_LAUNCH_BLOCKING=1 environment variable.
+        This forces synchronous CUDA execution and provides more accurate stack traces.
+
         Args:
             prompts: List of input prompt strings
             max_tokens: Maximum tokens to generate per prompt
@@ -1277,6 +1280,14 @@ class SpeculativePipeline(SpeculativeDecoder):
         Returns:
             List of result dictionaries, one per prompt
         """
+        # Check if CUDA_LAUNCH_BLOCKING is set (recommended for debugging)
+        if self.device == "cuda" and os.getenv("CUDA_LAUNCH_BLOCKING") == "1":
+            print(
+                "[INFO] CUDA_LAUNCH_BLOCKING=1 is set - using synchronous CUDA execution "
+                "for better error diagnostics",
+                flush=True,
+            )
+
         if not prompts:
             return []
 
@@ -1739,20 +1750,48 @@ class SpeculativePipeline(SpeculativeDecoder):
                         relative_indices_tensor
                     )
 
-                # CRITICAL: Final validation with draft vocab size (already done above, but double-check)
-                # This ensures no invalid tokens reach the embedding layer
+                # CRITICAL: Clone and validate INSIDE stream context to prevent corruption
+                # The tensor must be validated in the same stream where it will be used
                 draft_vocab_size = get_vocab_size(self.draft_lm)
-                if draft_vocab_size is not None:
-                    # Re-validate one more time as final safety check
-                    active_input_ids = validate_and_clamp_tokens(
-                        active_input_ids, draft_vocab_size, "draft_input_final"
-                    )
 
                 if draft_stream is not None:
+                    # CRITICAL: Synchronize before entering stream to ensure tensor is ready
+                    # This prevents race conditions where tensor is modified while being accessed
+                    torch.cuda.synchronize()
+
                     with torch.cuda.stream(draft_stream):
+                        # Clone tensor INSIDE stream context to ensure it's not corrupted
+                        # This creates a fresh copy that's guaranteed to be in the stream's memory space
+                        active_input_ids_clone = active_input_ids.clone()
+
+                        # CRITICAL: Explicit min/max validation BEFORE embedding call (as recommended)
+                        # This is the final check right before the model call
+                        if draft_vocab_size is not None:
+                            # Validate with strict=True to get detailed diagnostics
+                            active_input_ids_clone = validate_and_clamp_tokens(
+                                active_input_ids_clone,
+                                draft_vocab_size,
+                                "draft_input_stream",
+                                strict=True,
+                            )
+
+                            # Additional explicit check (as recommended in debugging guides)
+                            # Ensure all values are within valid range before embedding
+                            if (
+                                torch.min(active_input_ids_clone) < 0
+                                or torch.max(active_input_ids_clone) >= draft_vocab_size
+                            ):
+                                # This should never happen after validate_and_clamp_tokens, but double-check
+                                min_val = torch.min(active_input_ids_clone).item()
+                                max_val = torch.max(active_input_ids_clone).item()
+                                raise RuntimeError(
+                                    f"CRITICAL: Invalid tokens AFTER validation! "
+                                    f"Min={min_val}, Max={max_val}, Vocab_size={draft_vocab_size}"
+                                )
+
                         try:
                             draft_tokens, draft_logits = self.draft_lm.generate_tokens(
-                                active_input_ids,
+                                active_input_ids_clone,
                                 max_new_tokens=k,
                                 temperature=draft_temperature,  # Lower temperature for draft
                                 do_sample=False,  # Use greedy for draft to maximize acceptance
@@ -1777,6 +1816,27 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if draft_end_event is not None:
                         draft_end_event.record(draft_stream)
                 else:
+                    # For non-stream path, still validate before model call
+                    if draft_vocab_size is not None:
+                        active_input_ids = validate_and_clamp_tokens(
+                            active_input_ids,
+                            draft_vocab_size,
+                            "draft_input_sync",
+                            strict=True,
+                        )
+
+                        # Additional explicit check (as recommended in debugging guides)
+                        if (
+                            torch.min(active_input_ids) < 0
+                            or torch.max(active_input_ids) >= draft_vocab_size
+                        ):
+                            min_val = torch.min(active_input_ids).item()
+                            max_val = torch.max(active_input_ids).item()
+                            raise RuntimeError(
+                                f"CRITICAL: Invalid tokens AFTER validation! "
+                                f"Min={min_val}, Max={max_val}, Vocab_size={draft_vocab_size}"
+                            )
+
                     draft_tokens, draft_logits = self.draft_lm.generate_tokens(
                         active_input_ids,
                         max_new_tokens=k,

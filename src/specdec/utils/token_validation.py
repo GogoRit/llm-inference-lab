@@ -16,6 +16,7 @@ def validate_and_clamp_tokens(
     input_ids: torch.Tensor,
     vocab_size: int,
     name: str = "input",
+    strict: bool = False,
 ) -> torch.Tensor:
     """
     Efficiently validate and clamp token IDs to valid range (GPU-optimized).
@@ -27,6 +28,7 @@ def validate_and_clamp_tokens(
         input_ids: Token tensor [batch, seq_len] or [seq_len] (kept on GPU)
         vocab_size: Model vocabulary size
         name: Identifier for logging
+        strict: If True, sync to CPU to get min/max for detailed error messages
 
     Returns:
         Clamped token tensor (always valid: 0 <= token < vocab_size), stays on GPU
@@ -37,20 +39,40 @@ def validate_and_clamp_tokens(
     # Fast GPU path: check if any invalid tokens exist (no CPU sync)
     invalid_mask = (input_ids >= vocab_size) | (input_ids < 0)
     if invalid_mask.any():
-        # Clamp to valid range (efficient GPU operation, no CPU transfer)
-        clamped = input_ids.clamp(min=0, max=vocab_size - 1)
-
-        # Only sync to CPU for logging if significant corruption (reduce overhead)
+        # For strict mode or significant corruption, get detailed diagnostics
         invalid_count = invalid_mask.sum()
         total_count = input_ids.numel()
-        # Use threshold check on GPU before CPU sync
-        if invalid_count > total_count * 0.01:  # Log if > 1% invalid
-            invalid_count_cpu = invalid_count.item()  # Only sync if logging
-            logger.warning(
-                f"[{name}] Clamped {invalid_count_cpu}/{total_count} invalid tokens "
-                f"(vocab_size={vocab_size})"
+
+        # Always get min/max when corruption detected (needed for debugging)
+        # Move to CPU safely to avoid CUDA errors during error reporting
+        try:
+            min_val = input_ids.min().item()
+            max_val = input_ids.max().item()
+            invalid_count_cpu = invalid_count.item()
+
+            # Log detailed error (as recommended in debugging guides)
+            logger.error(
+                f"[{name}] Input ID out of bounds detected! "
+                f"Min: {min_val}, Max: {max_val}, Vocab_size: {vocab_size}, "
+                f"Invalid_count: {invalid_count_cpu}/{total_count}"
+            )
+            print(
+                f"[ERROR] [{name}] Input ID out of bounds: "
+                f"Min={min_val}, Max={max_val}, Vocab_size={vocab_size}, "
+                f"Invalid={invalid_count_cpu}/{total_count}",
+                flush=True,
+            )
+        except Exception as e:
+            # If tensor is corrupted and we can't read it, report that
+            logger.error(f"[{name}] Tensor corrupted - cannot read min/max values: {e}")
+            print(
+                f"[ERROR] [{name}] Tensor corrupted - cannot read values. "
+                f"Vocab_size={vocab_size}",
+                flush=True,
             )
 
+        # Clamp to valid range (efficient GPU operation, no CPU transfer)
+        clamped = input_ids.clamp(min=0, max=vocab_size - 1)
         return clamped
 
     return input_ids
