@@ -1482,6 +1482,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                     flush=True,
                 )
 
+        # Keep KV manager batch metadata in sync with the current workload
+        self.kv_cache_manager.set_batch_size(batch_size)
+
         # Reset metrics for batch
         batch_metrics = {
             "total_proposed": 0,
@@ -2309,6 +2312,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             )
 
                 # Process each active prompt's acceptance
+                kv_cache_reset_needed = False
                 for idx_in_active, global_idx in enumerate(active_indices):
                     # Extract tokens/logits for this prompt
                     prompt_draft_tokens = draft_tokens[
@@ -2371,6 +2375,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                         prompt_draft_logits,
                         prompt_base_logits,
                     )
+                    policy_accept_len = accepted_len
+
+                    if policy_accept_len < prompt_draft_tokens.shape[1]:
+                        kv_cache_reset_needed = True
 
                     # Debug: log policy result (reduced frequency unless debug mode enabled)
                     debug_accept = os.getenv("SPECDEC_DEBUG_ACCEPT", "0") == "1"
@@ -2548,6 +2556,18 @@ class SpeculativePipeline(SpeculativeDecoder):
                         batch_active[global_idx] = False
 
                 batch_metrics["total_steps"] += 1
+
+                if kv_cache_reset_needed and kv_cache_enabled:
+                    print(
+                        "[BATCH] Disabling KV cache reuse after partial acceptance to maintain consistency",
+                        flush=True,
+                    )
+                    self.kv_cache_manager.reset()
+                    kv_cache_enabled = False
+                    if hasattr(self.base_lm, "clear_kv_cache"):
+                        self.base_lm.clear_kv_cache()
+                    if hasattr(self.draft_lm, "clear_kv_cache"):
+                        self.draft_lm.clear_kv_cache()
 
                 # CRITICAL: Synchronize ALL CUDA operations before next iteration
                 # This ensures all tensor updates are complete before we clone sequences
