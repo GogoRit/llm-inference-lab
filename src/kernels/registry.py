@@ -77,8 +77,8 @@ class KernelRegistry:
         if isinstance(best, dict) and "function" in best:
             function = best["function"]
             if callable(function):
-                priority = best.get('priority', 0)
-                device = best.get('device', 'unknown')
+                priority = best.get("priority", 0)
+                device = best.get("device", "unknown")
                 logger.debug(
                     f"Selected {op_name} kernel: {function.__name__} "
                     f"(priority={priority}, device={device})"
