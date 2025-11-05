@@ -4,9 +4,6 @@ Tests for structured profiler and metrics JSON keys.
 
 import json
 import tempfile
-from pathlib import Path
-
-import pytest
 
 from src.metrics.structured_profiler import StructuredProfiler
 

@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from specdec.policies.controllers import (
+from specdec.policies.controllers import (  # noqa: E402
     AdaptiveKController,
     FixedKController,
     create_controller,

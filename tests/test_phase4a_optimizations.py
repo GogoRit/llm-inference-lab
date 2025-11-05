@@ -8,7 +8,7 @@ Tests the optimizations implemented in Phase 4A:
 """
 
 import os
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch

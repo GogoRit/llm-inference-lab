@@ -3,7 +3,7 @@ CUDA/Triton kernels for speculative decoding with safe fallbacks.
 """
 
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Optional
 
 import torch
 

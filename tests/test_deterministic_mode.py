@@ -4,8 +4,6 @@ Tests for deterministic seeding and reproducibility.
 
 import os
 
-import numpy as np
-import pytest
 import torch
 
 from specdec.utils.deterministic import ensure_deterministic

@@ -57,8 +57,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         do_sample=args.do_sample,
     )
     kinfo = get_kernel_info()
+    verify_backend = kinfo.get('verify_backend')
+    kv_backend = kinfo.get('kv_append_backend')
     print(
-        f"Device: {res.get('device')} | Dtype: {res.get('dtype')} | Backends: verify={kinfo.get('verify_backend')}, kv_append={kinfo.get('kv_append_backend')}"
+        f"Device: {res.get('device')} | Dtype: {res.get('dtype')} | "
+        f"Backends: verify={verify_backend}, kv_append={kv_backend}"
     )
     print(f"Text: {res.get('text', '')}")
     return 0

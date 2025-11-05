@@ -15,7 +15,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from specdec import SpeculativePipeline  # noqa: E402
-from specdec.models.fake_lm import FakeLM, create_fake_lm  # noqa: E402
+from specdec.models.fake_lm import FakeLM  # noqa: E402
 
 
 class TestCUDAGraphFallback:

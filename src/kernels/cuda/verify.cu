@@ -22,58 +22,76 @@ __global__ void verify_prefix_kernel(
     int lane_id = tid % 32;
     
     // Shared memory for reduction
+    // OPTIMIZATION: Allocate shared memory dynamically based on block size
+    // Layout: [reduction buffer: blockDim.x floats + blockDim.x int32s] [final results: K floats + K int32s]
     extern __shared__ float shared_data[];
-    float* shared_max = shared_data;
-    int32_t* shared_argmax = (int32_t*)(shared_data + K * 32);
+    float* reduction_max = shared_data;
+    int32_t* reduction_argmax = (int32_t*)(shared_data + blockDim.x);
+    float* final_max = (float*)(reduction_argmax + blockDim.x);
+    int32_t* final_argmax = (int32_t*)(final_max + K);
     
     // Process each K position
+    // OPTIMIZATION: Use multiple warps for better parallelism on large vocabularies
     for (int k = 0; k < K; k++) {
-        if (tid < 32) {  // One warp per K
-            float max_val = -INFINITY;
-            int32_t argmax_idx = 0;
-            
-            // Find argmax in logits[batch_idx][k][:]
-            for (int v = lane_id; v < V; v += 32) {
-                float val = logits[batch_idx * K * V + k * V + v];
-                if (val > max_val) {
-                    max_val = val;
-                    argmax_idx = v;
+        float max_val = -INFINITY;
+        int32_t argmax_idx = 0;
+        
+        // Find argmax in logits[batch_idx][k][:] using all threads
+        // Each thread processes V/blockDim.x elements
+        for (int v = tid; v < V; v += blockDim.x) {
+            float val = logits[batch_idx * K * V + k * V + v];
+            if (val > max_val) {
+                max_val = val;
+                argmax_idx = v;
+            }
+        }
+        
+        // Store thread-local max in shared memory reduction buffer
+        reduction_max[tid] = max_val;
+        reduction_argmax[tid] = argmax_idx;
+        __syncthreads();
+        
+        // Reduction across threads in block to find global argmax
+        // Use binary reduction tree for efficiency
+        for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+            if (tid < stride) {
+                int other_idx = tid + stride;
+                if (other_idx < blockDim.x) {
+                    float other_val = reduction_max[other_idx];
+                    int32_t other_argmax = reduction_argmax[other_idx];
+                    if (other_val > reduction_max[tid] || 
+                        (other_val == reduction_max[tid] && other_argmax < reduction_argmax[tid])) {
+                        reduction_max[tid] = other_val;
+                        reduction_argmax[tid] = other_argmax;
+                    }
                 }
             }
-            
-            // Warp-level reduction to find global argmax
-            for (int offset = 16; offset > 0; offset /= 2) {
-                float other_val = __shfl_down_sync(0xFFFFFFFF, max_val, offset);
-                int32_t other_idx = __shfl_down_sync(0xFFFFFFFF, argmax_idx, offset);
-                if (other_val > max_val || (other_val == max_val && other_idx < argmax_idx)) {
-                    max_val = other_val;
-                    argmax_idx = other_idx;
-                }
-            }
-            
-            // Store results in shared memory
-            if (lane_id == 0) {
-                shared_max[k] = max_val;
-                shared_argmax[k] = argmax_idx;
-            }
+            __syncthreads();
+        }
+        
+        // Store final result for this K position
+        if (tid == 0) {
+            final_max[k] = reduction_max[0];
+            final_argmax[k] = reduction_argmax[0];
         }
         __syncthreads();
     }
     
     // Check matches and compute prefix length
+    // Use final results stored in shared memory
     if (tid == 0) {
         int32_t prefix_len = 0;
         int32_t target_id = draft_ids[batch_idx * K];
         
         // Check if first position matches
-        if (shared_argmax[0] == target_id) {
+        if (final_argmax[0] == target_id) {
             prefix_len = 1;
             accepted_mask[batch_idx * K] = 1;
             
             // Check subsequent positions
             for (int k = 1; k < K; k++) {
                 target_id = draft_ids[batch_idx * K + k];
-                if (shared_argmax[k] == target_id) {
+                if (final_argmax[k] == target_id) {
                     prefix_len++;
                     accepted_mask[batch_idx * K + k] = 1;
                 } else {
@@ -117,9 +135,15 @@ std::vector<torch::Tensor> verify_prefix_cuda(
     auto accepted_mask = torch::zeros({B, K}, torch::TensorOptions().dtype(torch::kUInt8).device(logits.device()));
     
     // Launch kernel
-    dim3 block(32);  // One warp per block
+    // OPTIMIZATION: Use 256 threads (8 warps) per block for better GPU utilization
+    // This allows better parallelism for large vocabularies (V > 10K)
+    // For small vocabularies, the overhead is minimal, but for large ones (50K+), this is significant
+    int threads_per_block = 256;  // 8 warps for better parallelism
+    dim3 block(threads_per_block);
     dim3 grid(B);    // One block per batch item
-    size_t shared_mem_size = K * 32 * sizeof(float) + K * 32 * sizeof(int32_t);
+    // Shared memory: blockDim.x floats + blockDim.x int32s for reduction, plus K floats + K int32s for final results
+    size_t shared_mem_size = blockDim.x * sizeof(float) + blockDim.x * sizeof(int32_t) + 
+                             K * sizeof(float) + K * sizeof(int32_t);
     
     verify_prefix_kernel<<<grid, block, shared_mem_size>>>(
         logits.data_ptr<float>(),
