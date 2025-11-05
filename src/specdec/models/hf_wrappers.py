@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ..cache.kv_types import KVCache
 from ..utils.interfaces import LanguageModel
+from ..utils.token_validation import get_vocab_size, validate_and_clamp_tokens
 
 
 class HFWrapper(LanguageModel):
@@ -164,38 +165,12 @@ class HFWrapper(LanguageModel):
         """
         try:
             # CRITICAL: Validate input_ids BEFORE any model operations
-            # This is the final safety check before embedding layer
-            if hasattr(self._model, "config"):
-                vocab_size = getattr(self._model.config, "vocab_size", None)
-                if vocab_size is not None:
-                    if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                        # Get min/max safely - move to CPU first to avoid CUDA errors
-                        try:
-                            max_token = input_ids.cpu().max().item()
-                            min_token = input_ids.cpu().min().item()
-                        except Exception:
-                            max_token = vocab_size  # Assume worst case
-                            min_token = -1
-                        invalid_count = (
-                            ((input_ids >= vocab_size) | (input_ids < 0)).sum().item()
-                        )
-                        self.logger.error(
-                            "[HF-WRAPPER] Invalid token indices detected: "
-                            "min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
-                            min_token,
-                            max_token,
-                            vocab_size,
-                            invalid_count,
-                            input_ids.numel(),
-                        )
-                        print(
-                            f"[ERROR] Invalid tokens in generate_tokens: "
-                            f"min={min_token}, max={max_token}, vocab={vocab_size}, "
-                            f"invalid={invalid_count}/{input_ids.numel()}",
-                            flush=True,
-                        )
-                        # Clamp invalid tokens to valid range
-                        input_ids = input_ids.clamp(min=0, max=vocab_size - 1)
+            # Use centralized validation helper
+            vocab_size = get_vocab_size(self)
+            if vocab_size is not None:
+                input_ids = validate_and_clamp_tokens(
+                    input_ids, vocab_size, "generate_tokens"
+                )
 
             # Use async generation if stream is provided and device is CUDA
             if stream is not None and self._device == "cuda":
@@ -214,26 +189,12 @@ class HFWrapper(LanguageModel):
                 if input_ids.device != torch.device(self._device):
                     input_ids = input_ids.to(self._device)
 
-                # CRITICAL: Re-validate after device transfer (tensors can be corrupted)
-                if hasattr(self._model, "config"):
-                    vocab_size = getattr(self._model.config, "vocab_size", None)
-                    if vocab_size is not None:
-                        if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                            # Get min/max safely - move to CPU first to avoid CUDA errors
-                            try:
-                                max_token = input_ids.cpu().max().item()
-                                min_token = input_ids.cpu().min().item()
-                            except Exception:
-                                max_token = vocab_size  # Assume worst case
-                                min_token = -1
-                            print(
-                                f"[ERROR] Invalid tokens after device transfer: "
-                                f"min={min_token}, max={max_token}, "
-                                f"vocab={vocab_size}",
-                                flush=True,
-                            )
-                            # Clamp invalid tokens to valid range
-                            input_ids = input_ids.clamp(min=0, max=vocab_size - 1)
+                # Re-validate after device transfer (trust device transfer, but safety check)
+                vocab_size = get_vocab_size(self)
+                if vocab_size is not None:
+                    input_ids = validate_and_clamp_tokens(
+                        input_ids, vocab_size, "generate_tokens_after_transfer"
+                    )
 
                 # Use KV-aware generation if supported and enabled
                 if self.supports_kv_append() and self._kv_cache is not None:
@@ -242,26 +203,7 @@ class HFWrapper(LanguageModel):
                     )
 
                 # Standard generation without KV cache
-                # CRITICAL: Final validation before model.generate()
-                if hasattr(self._model, "config"):
-                    vocab_size = getattr(self._model.config, "vocab_size", None)
-                    if vocab_size is not None:
-                        if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                            # Get min/max safely - move to CPU first to avoid CUDA errors
-                            try:
-                                max_token = input_ids.cpu().max().item()
-                                min_token = input_ids.cpu().min().item()
-                            except Exception:
-                                max_token = vocab_size  # Assume worst case
-                                min_token = -1
-                            print(
-                                f"[ERROR] Invalid tokens before model.generate(): "
-                                f"min={min_token}, max={max_token}, "
-                                f"vocab={vocab_size}",
-                                flush=True,
-                            )
-                            # Clamp invalid tokens
-                            input_ids = input_ids.clamp(min=0, max=vocab_size - 1)
+                # Input already validated at entry point - trust validation
 
                 # Create attention mask for proper padding handling
                 attention_mask = torch.ones_like(input_ids)
@@ -337,40 +279,12 @@ class HFWrapper(LanguageModel):
         Returns:
             Tuple of (generated_ids, logits)
         """
-        # CRITICAL: Validate input_ids BEFORE async execution
-        # This prevents invalid tokens from reaching the embedding layer during async operations
-        if hasattr(self._model, "config"):
-            vocab_size = getattr(self._model.config, "vocab_size", None)
-            if vocab_size is not None:
-                if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                    # Get min/max safely - move to CPU first to avoid CUDA errors
-                    try:
-                        max_token = input_ids.cpu().max().item()
-                        min_token = input_ids.cpu().min().item()
-                    except Exception:
-                        max_token = vocab_size  # Assume worst case
-                        min_token = -1
-                    invalid_count = (
-                        ((input_ids >= vocab_size) | (input_ids < 0)).sum().item()
-                    )
-                    self.logger.error(
-                        "[HF-WRAPPER ASYNC] Invalid token indices: "
-                        "min=%d, max=%d, vocab_size=%d, invalid_count=%d/%d",
-                        min_token,
-                        max_token,
-                        vocab_size,
-                        invalid_count,
-                        input_ids.numel(),
-                    )
-                    print(
-                        f"[ERROR] Invalid tokens in _generate_tokens_async: "
-                        f"min={min_token}, max={max_token}, "
-                        f"vocab={vocab_size}, invalid={invalid_count}/"
-                        f"{input_ids.numel()}",
-                        flush=True,
-                    )
-                    # Clamp invalid tokens to valid range
-                    input_ids = input_ids.clamp(min=0, max=vocab_size - 1)
+        # Validate input_ids BEFORE async execution using centralized helper
+        vocab_size = get_vocab_size(self)
+        if vocab_size is not None:
+            input_ids = validate_and_clamp_tokens(
+                input_ids, vocab_size, "_generate_tokens_async"
+            )
 
         with torch.cuda.stream(stream):
             with torch.no_grad():
@@ -378,25 +292,12 @@ class HFWrapper(LanguageModel):
                 if input_ids.device != torch.device(self._device):
                     input_ids = input_ids.to(self._device)
 
-                # CRITICAL: Re-validate after device transfer in async context
-                if hasattr(self._model, "config"):
-                    vocab_size = getattr(self._model.config, "vocab_size", None)
-                    if vocab_size is not None:
-                        if (input_ids >= vocab_size).any() or (input_ids < 0).any():
-                            # Get min/max safely - move to CPU first to avoid CUDA errors
-                            try:
-                                max_token = input_ids.cpu().max().item()
-                                min_token = input_ids.cpu().min().item()
-                            except Exception:
-                                max_token = vocab_size  # Assume worst case
-                                min_token = -1
-                            print(
-                                f"[ERROR] Invalid tokens after device transfer in async: "
-                                f"min={min_token}, max={max_token}, vocab={vocab_size}",
-                                flush=True,
-                            )
-                            # Clamp invalid tokens
-                            input_ids = input_ids.clamp(min=0, max=vocab_size - 1)
+                # Re-validate after device transfer (trust device transfer, safety check only)
+                vocab_size = get_vocab_size(self)
+                if vocab_size is not None:
+                    input_ids = validate_and_clamp_tokens(
+                        input_ids, vocab_size, "async_after_transfer"
+                    )
 
                 batch_size, seq_len = input_ids.shape
                 generated_tokens = []
@@ -407,11 +308,8 @@ class HFWrapper(LanguageModel):
                 last_past_kv = None  # Track KV cache for return
 
                 for step in range(max_new_tokens):
-                    # CRITICAL: Synchronize stream before validation to ensure all previous ops complete
-                    if stream is not None:
-                        torch.cuda.synchronize()
-
                     # CRITICAL: Validate current_input before EACH forward pass
+                    # Note: We rely on CUDA events for synchronization, not explicit sync
                     # This is the absolute last check before embedding lookup in async loop
                     if hasattr(self._model, "config"):
                         vocab_size = getattr(self._model.config, "vocab_size", None)
@@ -592,10 +490,12 @@ class HFWrapper(LanguageModel):
                             or (probs < 0).any()
                             or torch.isinf(probs).any()
                         ):
-                            print(
+                            logger.error(
                                 "[ERROR] Invalid probs detected: NaN/Inf or negative values"
                             )
-                            torch.cuda.synchronize()
+                            # Use event-based sync if available, otherwise fallback to sync
+                            if hasattr(torch.cuda, "current_stream"):
+                                torch.cuda.current_stream().synchronize()
                             raise RuntimeError("Softmax instability on GPU")
 
                         # CRITICAL: Ensure probs are valid before multinomial

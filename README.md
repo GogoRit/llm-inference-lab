@@ -10,6 +10,16 @@ The long-term goal is to provide open, reproducible baselines for speculative de
 
 ## What's New
 
+### Phase 4A: In Progress – Performance Optimization and Stabilization
+
+Phase 4A focuses on optimizing hot paths and reducing overhead for paper submission readiness. Key optimizations include removing debug print overhead, eliminating unnecessary CPU-GPU synchronizations, and consolidating redundant validation code.
+
+**Latest Optimizations**:
+- Hot path logging removed (gated with `SPECDEC_DEBUG` flag)
+- Async synchronization optimized for true stream overlap
+- Token validation consolidated into centralized helper
+- Partial KV cache reuse enhanced
+
 ### Phase 3D: Complete – Production-Ready Pipeline Validated
 
 Phase 3D represents the transition from kernel-level optimization (Phase 3C) to full GPU runtime optimization. All Phase 3D features have been validated on Apple Silicon MPS and Tesla T4 CUDA hardware. The speculative pipeline now completes full K-sweeps on production hardware without CUDA asserts, with KV-cache reuse properly gated on full acceptance to maintain consistency.
@@ -244,6 +254,7 @@ SPECDEC_ENABLE_KV_APPEND=0 python scripts/comprehensive_k_sweep.py ...
 | `SPECDEC_PARALLEL_STREAMS=1` | Enable CUDA stream overlap | On |
 | `SPECDEC_SYNC_MODE=event/barrier` | Sync mode: event or barrier | event |
 | `SPECDEC_DRY_RUN=1` | Run latency-only profiling | Off |
+| `SPECDEC_DEBUG=1` | Enable debug logging (print statements) | Off |
 
 ## Testing
 

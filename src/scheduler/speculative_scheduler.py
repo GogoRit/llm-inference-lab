@@ -215,18 +215,18 @@ class SpeculativeScheduler:
         self.metrics["verification_time_ms"] += verification_time_ms
         self.metrics["total_steps"] += 1
 
-        # Log verification step info
-        k = draft_tokens.shape[1] if hasattr(draft_tokens, "shape") else 0
-        draft_time_ms = self.metrics.get("draft_time_ms", 0.0) / max(
-            self.metrics.get("total_steps", 1), 1
-        )
-        print(
-            f"[SCHED] K={k} | "
-            f"verify={verification_time_ms:.1f}ms | "
-            f"draft_avg={draft_time_ms:.1f}ms | "
-            f"stream={True}, sync={('event' if self.use_event_sync else 'barrier')}",
-            flush=True,
-        )
+        # Log verification step info (only if debug flag enabled)
+        if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+            k = draft_tokens.shape[1] if hasattr(draft_tokens, "shape") else 0
+            draft_time_ms = self.metrics.get("draft_time_ms", 0.0) / max(
+                self.metrics.get("total_steps", 1), 1
+            )
+            logger.debug(
+                f"[SCHED] K={k} | "
+                f"verify={verification_time_ms:.1f}ms | "
+                f"draft_avg={draft_time_ms:.1f}ms | "
+                f"stream={True}, sync={('event' if self.use_event_sync else 'barrier')}"
+            )
 
         return (
             base_tokens,

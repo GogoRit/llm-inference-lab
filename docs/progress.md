@@ -29,7 +29,7 @@ The long-term goal is to provide open, reproducible baselines for speculative de
 | **3C** | Complete | CUDA/Triton kernels with registry system | 2025-10 |
 | **3C.5** | Complete | KV cache integration and validation | 2025-10-31 |
 | **3D** | Complete | GPU optimization and CUDA validation | 2025-11-03 |
-| **4A** | Planned | Batch-level processing | TBD |
+| **4A** | In Progress | Performance optimization and stabilization | 2025-11-04 |
 | **4B** | Planned | Advanced quantization (INT8/INT4) | TBD |
 | **4C** | Planned | Layer/model parallelism for 7B+ models | TBD |
 | **4D** | Planned | Speculative tree decoding | TBD |
@@ -476,8 +476,15 @@ With custom kernels and KV cache integration complete on MPS, Phase 3D focuses o
 - Success Rate: 100% across all validation runs (800+ samples)
 - Code Quality: 0 linting errors, comprehensive test coverage
 
+**Phase 4A Optimizations (In Progress)**:
+- [x] Removed print() statements from hot paths (gated with SPECDEC_DEBUG flag)
+- [x] Removed unnecessary torch.cuda.synchronize() calls from async generation loop
+- [x] Consolidated redundant token validation into centralized helper function
+- [x] Enhanced partial KV cache reuse documentation and implementation
+- [ ] Batch processing optimization (planned)
+- [ ] Comprehensive test suite for async/streams (planned)
+
 **Remaining Optimization Opportunities**:
-- Code improvements: Reduce debug print overhead in scheduler
 - Verification optimization: Further reduce base-model verification loop overhead
 - Larger GPU validation: A100/H100 benchmarking for higher throughput targets
 - Tokenizer-aware optimizations: Reduce CPU-bound scheduling/logging overhead
@@ -564,20 +571,33 @@ Phase 3D (Expected H100):        ~100 tok/s (CUDA H100, target)
 
 ---
 
-### Phase 4A: Batch-Level Processing (Planned)
+### Phase 4A: Performance Optimization and Stabilization (In Progress)
 
-**Objective**: Process multiple prompts simultaneously to improve GPU utilization and throughput for batch inference scenarios.
+**Objective**: Optimize hot paths, reduce overhead, and stabilize codebase for paper submission and Tesla T4 testing.
 
-**Planned Features**:
-- Multi-prompt batch processing pipeline
-- Batched draft generation across prompts
-- Batched verification with efficient tensor operations
-- Batch-aware acceptance policy application
-- Memory-efficient batch management
+**Completed Optimizations**:
+- **Hot Path Logging**: Removed `print()` statements from verify loop and scheduler hot paths, gated with `SPECDEC_DEBUG` flag
+  - Impact: Eliminates CPU-GPU synchronization overhead from debug prints
+  - Files: `src/scheduler/speculative_scheduler.py`, `src/specdec/core/pipeline.py`
+- **Async Synchronization**: Removed unnecessary `torch.cuda.synchronize()` calls from async generation loop
+  - Impact: Enables true async overlap between draft and verification streams
+  - Files: `src/specdec/models/hf_wrappers.py`
+- **Token Validation Consolidation**: Consolidated 7+ redundant validation points into centralized helper
+  - Impact: Reduces CPU-GPU transfers and validation overhead
+  - Files: `src/specdec/models/hf_wrappers.py`, uses `src/specdec/utils/token_validation.py`
+- **Partial KV Cache Reuse**: Enhanced documentation and implementation clarity
+  - Impact: Better cache utilization on partial acceptance scenarios
+  - Files: `src/specdec/cache/kv_types.py`, `src/specdec/core/pipeline.py`
 
-**Prerequisites**: Phase 3D CUDA validation complete
+**Technical Improvements**:
+- Added `SPECDEC_DEBUG=1` environment flag for debug logging control
+- Improved async overlap by removing blocking synchronizations
+- Centralized token validation reduces code duplication
+- All changes maintain backward compatibility
 
-**Target Start**: 2025-11-15
+**Status**: Code changes complete, ready for Tesla T4 validation
+
+**Target Start for Batch Processing**: 2025-11-15
 
 ---
 

@@ -954,18 +954,18 @@ class SpeculativePipeline(SpeculativeDecoder):
                     else torch.empty(draft_tokens.shape[0], 0, dtype=draft_tokens.dtype)
                 )
 
-                # Log acceptance details
-                proposed_count = draft_tokens.shape[1]
-                rejected_count = proposed_count - accepted_len
-                print(
-                    f"[SCHED] Step {step} | "
-                    f"K={proposed_count} | "
-                    f"accepted={accepted_len} | "
-                    f"rejected={rejected_count} | "
-                    f"draft={draft_time_ms:.1f}ms | "
-                    f"verify={verify_time_ms:.1f}ms",
-                    flush=True,
-                )
+                # Log acceptance details (only if debug flag enabled)
+                if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                    proposed_count = draft_tokens.shape[1]
+                    rejected_count = proposed_count - accepted_len
+                    self.logger.debug(
+                        f"[SCHED] Step {step} | "
+                        f"K={proposed_count} | "
+                        f"accepted={accepted_len} | "
+                        f"rejected={rejected_count} | "
+                        f"draft={draft_time_ms:.1f}ms | "
+                        f"verify={verify_time_ms:.1f}ms"
+                    )
 
                 # Update metrics
                 self.metrics["total_proposed"] += draft_tokens.shape[1]
@@ -984,7 +984,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Step 3: Handle results
                 if accepted_len > 0:
                     # KV cache integration: append accepted tokens' KV
-                    # to base model cache
+                    # to base model cache (supports partial acceptance)
                     if (
                         hasattr(self.base_lm, "supports_kv_append")
                         and self.base_lm.supports_kv_append()
@@ -998,7 +998,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     base_kv is not None
                                     and accepted_len <= base_kv.seq_len
                                 ):
-                                    # Slice to accepted length
+                                    # Slice to accepted length (partial KV cache reuse)
+                                    # This enables reuse even when only some tokens are accepted
                                     accepted_kv = base_kv.slice_prefix(accepted_len)
                                     # Append to base model's cache
                                     self.base_lm.append_kv_cache(accepted_kv)
