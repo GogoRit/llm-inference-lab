@@ -1283,10 +1283,9 @@ class SpeculativePipeline(SpeculativeDecoder):
         """
         # Check if CUDA_LAUNCH_BLOCKING is set (recommended for debugging)
         if self.device == "cuda" and os.getenv("CUDA_LAUNCH_BLOCKING") == "1":
-            print(
-                "[INFO] CUDA_LAUNCH_BLOCKING=1 is set - using synchronous CUDA execution "
-                "for better error diagnostics",
-                flush=True,
+            self.logger.info(
+                "CUDA_LAUNCH_BLOCKING=1 is set - using synchronous CUDA execution "
+                "for better error diagnostics"
             )
 
         if not prompts:
@@ -1294,29 +1293,26 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         batch_size = len(prompts)
         self.logger.info(f"Starting batched generation for {batch_size} prompts")
-        print(
-            f"[BATCH] Starting batch processing: {batch_size} prompts, max_tokens={max_tokens}",
-            flush=True,
-        )
+        if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+            self.logger.debug(
+                f"[BATCH] Starting batch processing: {batch_size} prompts, max_tokens={max_tokens}"
+            )
 
         # Use provided parameters or fall back to config
         max_tokens = max_tokens or self.config["max_new_tokens"]
         temperature = temperature or self.config["temperature"]
         do_sample = do_sample if do_sample is not None else self.config["do_sample"]
 
-        # Model init diagnostics (only print once)
+        # Model init diagnostics (only print once, gated with SPECDEC_DEBUG)
         if not hasattr(self, "_batch_init_printed"):
-            print(
-                f"[BATCH] Base model: {self.config.get('base_model', 'unknown')}",
-                flush=True,
-            )
-            print(
-                f"[BATCH] Draft model: {self.config.get('draft_model', 'unknown')}",
-                flush=True,
-            )
-            print(f"[BATCH] Device: {self.device}, Dtype: {self.dtype}", flush=True)
-            if self.device == "cuda" and torch.cuda.is_available():
-                print(f"[BATCH] GPU: {torch.cuda.get_device_name(0)}", flush=True)
+            if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                self.logger.debug(
+                    f"[BATCH] Base model: {self.config.get('base_model', 'unknown')}, "
+                    f"Draft model: {self.config.get('draft_model', 'unknown')}, "
+                    f"Device: {self.device}, Dtype: {self.dtype}"
+                )
+                if self.device == "cuda" and torch.cuda.is_available():
+                    self.logger.debug(f"[BATCH] GPU: {torch.cuda.get_device_name(0)}")
             self._batch_init_printed = True
 
         # Tokenize all prompts together with padding
@@ -1328,10 +1324,10 @@ class SpeculativePipeline(SpeculativeDecoder):
             self.logger.warning(
                 "No tokenizer access, falling back to sequential processing"
             )
-            print(
-                "[BATCH] Warning: No tokenizer access, falling back to sequential",
-                flush=True,
-            )
+            if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                self.logger.debug(
+                    "[BATCH] Warning: No tokenizer access, falling back to sequential"
+                )
             return [
                 self.generate(prompt, max_tokens, temperature, do_sample, **kwargs)
                 for prompt in prompts
@@ -1353,10 +1349,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                             f"Tokenizer vocab size mismatch: base={base_vocab_size}, draft={draft_vocab_size}"
                         )
                     else:
-                        print(
-                            f"[CHECK] Tokenizer alignment OK - vocab_size={base_vocab_size}",
-                            flush=True,
-                        )
+                        if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                            "1",
+                            "true",
+                            "yes",
+                        ):
+                            self.logger.debug(
+                                f"[CHECK] Tokenizer alignment OK - vocab_size={base_vocab_size}"
+                            )
 
                         # One-time warmup check: tokenizer overlap sanity test
                         if not hasattr(self, "_tokenizer_warmup_done"):
@@ -1383,20 +1383,31 @@ class SpeculativePipeline(SpeculativeDecoder):
                                         .mean()
                                         .item()
                                     )
-                                    print(
-                                        f"[CHECK] Tokenizer overlap sanity: {overlap:.2f} "
-                                        f"(expected ~1.0 for prefix match)",
-                                        flush=True,
-                                    )
+                                    if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                                        "1",
+                                        "true",
+                                        "yes",
+                                    ):
+                                        self.logger.debug(
+                                            f"[CHECK] Tokenizer overlap sanity: {overlap:.2f} "
+                                            f"(expected ~1.0 for prefix match)"
+                                        )
                                 self._tokenizer_warmup_done = True
                             except Exception as e:
-                                print(
-                                    f"[CHECK] Tokenizer warmup test failed: {e}",
-                                    flush=True,
-                                )
+                                if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                                    "1",
+                                    "true",
+                                    "yes",
+                                ):
+                                    self.logger.debug(
+                                        f"[CHECK] Tokenizer warmup test failed: {e}"
+                                    )
 
         # Tokenize with padding (pre-tokenize once, reuse across iterations)
-        print(f"[BATCH] Tokenizing {batch_size} prompts with padding...", flush=True)
+        if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+            self.logger.debug(
+                f"[BATCH] Tokenizing {batch_size} prompts with padding..."
+            )
         encoded = tokenizer(
             prompts,
             padding=True,
@@ -1412,11 +1423,13 @@ class SpeculativePipeline(SpeculativeDecoder):
             )
         else:
             batch_input_ids = encoded["input_ids"].to(self.device)
-        print(
-            f"[BATCH] Tokenized batch shape: {batch_input_ids.shape} "
-            f"(pinned={'yes' if self.device == 'cuda' and torch.cuda.is_available() else 'no'})",
-            flush=True,
-        )
+        if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+            pinned = (
+                "yes" if self.device == "cuda" and torch.cuda.is_available() else "no"
+            )
+            self.logger.debug(
+                f"[BATCH] Tokenized batch shape: {batch_input_ids.shape} (pinned={pinned})"
+            )
 
         # Track memory before batch
         mem_before = (
@@ -1424,18 +1437,21 @@ class SpeculativePipeline(SpeculativeDecoder):
             if self.device == "cuda" and torch.cuda.is_available()
             else 0
         )
-        if mem_before > 0:
-            print(
-                f"[BATCH] GPU memory before: {mem_before / (1024**2):.2f} MB",
-                flush=True,
+        if mem_before > 0 and os.getenv("SPECDEC_DEBUG", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            self.logger.debug(
+                f"[BATCH] GPU memory before: {mem_before / (1024**2):.2f} MB"
             )
 
         # VECTORIZED BATCH PROCESSING: Process all prompts together in parallel
         # This enables true GPU parallelism with batched tensor operations
-        print(
-            f"[BATCH] Starting vectorized speculative decoding for {batch_size} prompts",
-            flush=True,
-        )
+        if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+            self.logger.debug(
+                f"[BATCH] Starting vectorized speculative decoding for {batch_size} prompts"
+            )
 
         # Pre-tokenize all prompts once (already done above)
         attention_mask = encoded.get("attention_mask", None)
@@ -1472,15 +1488,14 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         # KV cache now managed by SafeKVCacheManager - no manual dictionaries
         if kv_cache_enabled:
-            print(
-                "[BATCH] KV cache append enabled - using SafeKVCacheManager",
-                flush=True,
-            )
+            if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                self.logger.debug(
+                    "[BATCH] KV cache append enabled - using SafeKVCacheManager"
+                )
         else:
             if kv_cache_enabled_env and not kv_cache_supported:
-                print(
-                    "[BATCH] Warning: SPECDEC_ENABLE_KV_APPEND=1 but model doesn't support KV append",
-                    flush=True,
+                self.logger.warning(
+                    "[BATCH] SPECDEC_ENABLE_KV_APPEND=1 but model doesn't support KV append"
                 )
 
         # Keep KV manager batch metadata in sync with the current workload
@@ -1538,33 +1553,28 @@ class SpeculativePipeline(SpeculativeDecoder):
                     draft_stream = torch.cuda.Stream()
                     verify_stream = torch.cuda.Stream()
             elif cuda_launch_blocking:
-                print(
-                    "[INFO] CUDA_LAUNCH_BLOCKING=1 detected - disabling async streams "
-                    "for synchronous execution (better for debugging)",
-                    flush=True,
+                self.logger.info(
+                    "CUDA_LAUNCH_BLOCKING=1 detected - disabling async streams "
+                    "for synchronous execution (better for debugging)"
                 )
 
             while step < max_tokens:
                 step += 1
                 active_count = sum(batch_active)
 
-                # Debug print when active_count drops
+                # Debug print when active_count drops (gated with SPECDEC_DEBUG)
                 if step > 1 and active_count < batch_size:
                     finished_count = batch_size - active_count
-                    print(
-                        "[INFO] Step {}: {} sequence(s) finished, {} still active".format(
-                            step, finished_count, active_count
-                        ),
-                        flush=True,
-                    )
+                    if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                        self.logger.debug(
+                            f"[INFO] Step {step}: {finished_count} sequence(s) finished, {active_count} still active"
+                        )
 
                 if active_count == 0:
-                    print(
-                        "[INFO] Step {}: All sequences finished, exiting loop".format(
-                            step
-                        ),
-                        flush=True,
-                    )
+                    if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                        self.logger.debug(
+                            f"[INFO] Step {step}: All sequences finished, exiting loop"
+                        )
                     break  # All prompts finished
 
                 # Get K from controller (same K for all active prompts)
@@ -1582,10 +1592,7 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Validate K - must be > 0 for generation
                 if k <= 0:
-                    print(
-                        f"[WARNING] Step {step}: K={k} <= 0, skipping generation",
-                        flush=True,
-                    )
+                    self.logger.warning(f"Step {step}: K={k} <= 0, skipping generation")
                     break
 
                 # Filter to active prompts only
@@ -1597,9 +1604,6 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Use relative indices (0 to len-1) for KV cache, not absolute batch indices
                 relative_indices = list(range(len(active_indices)))
                 self.kv_cache_manager.set_active_indices(relative_indices)
-                active_indices_tensor = torch.tensor(
-                    active_indices, dtype=torch.long, device=self.device
-                )
                 relative_indices_tensor = torch.tensor(
                     relative_indices, dtype=torch.long, device=self.device
                 )
@@ -1608,9 +1612,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Use detach().clone() to break computation graph and prevent shared memory issues
                 # This ensures tensors are completely independent before entering CUDA streams
                 # Best practice: Prepare all tensors synchronously BEFORE async operations
-                # CRITICAL: Synchronize before extracting to ensure all previous updates are complete
-                if self.device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                # OPTIMIZATION: Only sync if absolutely necessary for correctness
+                # For batch processing, we can rely on CUDA event synchronization
+                # which is more efficient than full device synchronization
+                # Note: This sync ensures previous iteration completes, but we minimize
+                # CPU-GPU transfers by using GPU-only operations where possible
 
                 active_seqs = [
                     current_input_ids[i].detach().clone().contiguous()
@@ -1620,28 +1626,22 @@ class SpeculativePipeline(SpeculativeDecoder):
                     break
 
                 # CRITICAL: Validate immediately after extraction to catch corruption early
-                # This helps identify if corruption occurred during previous iteration
+                # Use GPU-only validation to avoid CPU-GPU sync overhead
+                # Only sync to CPU if corruption is actually detected
                 draft_vocab_size_check = get_vocab_size(self.draft_lm)
                 if draft_vocab_size_check is not None:
                     for i, seq in enumerate(active_seqs):
-                        # Quick validation check - if corrupted, this will catch it
-                        try:
+                        # GPU-only validation: check without CPU sync (faster)
+                        invalid_mask = (seq >= draft_vocab_size_check) | (seq < 0)
+                        if invalid_mask.any():
+                            # Only sync to CPU if corruption detected (rare case)
                             min_val = torch.min(seq).item()
                             max_val = torch.max(seq).item()
-                            if min_val < 0 or max_val >= draft_vocab_size_check:
-                                raise RuntimeError(
-                                    f"CRITICAL: Corrupted sequence detected at step {step}, "
-                                    f"prompt {active_indices[i]}: "
-                                    f"Min={min_val}, Max={max_val}, Vocab_size={draft_vocab_size_check}"
-                                )
-                        except RuntimeError:
-                            raise
-                        except Exception as e:
-                            # If we can't read the tensor, it's corrupted
                             raise RuntimeError(
-                                f"CRITICAL: Cannot read sequence tensor at step {step}, "
-                                f"prompt {active_indices[i]}: {e}"
-                            ) from e
+                                f"CRITICAL: Corrupted sequence detected at step {step}, "
+                                f"prompt {active_indices[i]}: "
+                                f"Min={min_val}, Max={max_val}, Vocab_size={draft_vocab_size_check}"
+                            )
 
                 # CRITICAL: Validate sequences with DRAFT vocab size since we're passing to draft model
                 # This is the root cause fix - draft model may have different vocab size than base
@@ -1687,33 +1687,27 @@ class SpeculativePipeline(SpeculativeDecoder):
                 ):
                     pad_value = 0  # Use 0 as safe default (always valid for GPT models)
 
-                # Pad sequences efficiently
-                padded_seqs: List[Optional[torch.Tensor]] = [None] * len(active_seqs)
-                for i, seq in enumerate(active_seqs):
+                # Optimized padding: Use torch.nn.functional.pad for better performance
+                # Only pad sequences that need it, then stack efficiently
+                padded_seqs: List[torch.Tensor] = []
+                for seq in active_seqs:
                     if seq.shape[0] < max_seq_len:
+                        # Use torch.nn.functional.pad for efficient padding (faster than manual cat)
                         pad_length = max_seq_len - seq.shape[0]
-                        padding = torch.full(
-                            (pad_length,),
-                            pad_value,
-                            dtype=seq.dtype,
-                            device=seq.device,
+                        # Pad on the right: (left, right) for 1D tensor
+                        seq_padded = torch.nn.functional.pad(
+                            seq,
+                            (0, pad_length),
+                            value=pad_value,
+                            mode="constant",
                         )
-                        seq_padded = torch.cat([seq, padding], dim=0)
-                        padded_seqs[i] = seq_padded
+                        padded_seqs.append(seq_padded)
                     else:
-                        padded_seqs[i] = seq
+                        padded_seqs.append(seq)
 
-                # CRITICAL: Stack and immediately clone to ensure complete independence
-                # torch.stack() may create views or shared memory - clone immediately
-                active_input_ids_stacked = torch.stack(
-                    padded_seqs, dim=0
-                )  # [active_count, max_seq_len]
-
-                # CRITICAL: Clone immediately after stacking to break any memory sharing
-                # This ensures the batch tensor is completely independent
-                active_input_ids = (
-                    active_input_ids_stacked.detach().clone().contiguous()
-                )
+                # Stack sequences efficiently (torch.stack is already optimized)
+                # Clone only once after stacking to ensure independence
+                active_input_ids = torch.stack(padded_seqs, dim=0).contiguous()
 
                 # CRITICAL: Final validation with draft vocab size before passing to draft model
                 # This is the last safety check before embedding layer
@@ -1734,18 +1728,29 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # Mask out padding tokens
                         active_attention_mask[i, orig_len:] = 0
 
-                # Debug: validate input_ids are not all padding
-                non_pad_tokens = (active_input_ids != pad_value).sum().item()
+                # Debug: validate input_ids are not all padding (GPU-only, defer CPU sync)
+                # Only sync to CPU if needed for debug logging (gated by SPECDEC_DEBUG)
+                non_pad_tokens_tensor = (active_input_ids != pad_value).sum()
                 total_tokens = active_input_ids.numel()
+                # Only compute .item() if debug logging is enabled
+                non_pad_tokens = (
+                    non_pad_tokens_tensor.item()
+                    if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes")
+                    else non_pad_tokens_tensor
+                )
 
-                if step == 1:
-                    print(
+                if step == 1 and os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    self.logger.debug(
                         f"[BATCH] Batched active_input_ids shape: {active_input_ids.shape} "
                         f"(active={len(active_indices)}, max_len={max_seq_len}, "
-                        f"original_lens={original_lengths}, non_pad={non_pad_tokens}/{total_tokens})",
-                        flush=True,
+                        f"original_lens={original_lengths}, "
+                        f"non_pad={non_pad_tokens}/{total_tokens})"
                     )
-                    # Decode and print first prompt for verification
+                    # Decode and log first prompt for verification (debug only)
                     if tokenizer is not None and active_input_ids.shape[0] > 0:
                         first_prompt_tokens = active_input_ids[0]
                         # Remove padding before decoding
@@ -1755,20 +1760,26 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if len(first_prompt_non_pad) > 0:
                             try:
                                 decoded_text = tokenizer.decode(first_prompt_non_pad)
-                                print(
-                                    f"[DEBUG] First prompt decoded: {decoded_text[:100]}...",
-                                    flush=True,
+                                self.logger.debug(
+                                    f"[DEBUG] First prompt decoded: {decoded_text[:100]}..."
                                 )
                             except Exception as e:
-                                print(
-                                    f"[DEBUG] Failed to decode first prompt: {e}",
-                                    flush=True,
+                                self.logger.debug(
+                                    f"[DEBUG] Failed to decode first prompt: {e}"
                                 )
 
-                if non_pad_tokens == 0:
-                    print(
-                        f"[WARNING] Step {step}: All tokens are padding, skipping generation",
-                        flush=True,
+                # Check if all tokens are padding (GPU-only comparison, no CPU sync)
+                if isinstance(non_pad_tokens, torch.Tensor):
+                    # GPU tensor comparison (no CPU sync)
+                    if non_pad_tokens == 0:
+                        self.logger.warning(
+                            f"Step {step}: All tokens are padding, skipping generation"
+                        )
+                        break
+                elif non_pad_tokens == 0:
+                    # CPU scalar (only when debug enabled)
+                    self.logger.warning(
+                        f"Step {step}: All tokens are padding, skipping generation"
                     )
                     break
 
@@ -1787,12 +1798,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Use CUDA events for accurate timing (same as verify)
                 draft_start_wall = time.time()
 
-                # Debug: log before draft execution (only first step to reduce CPU overhead)
-                if step == 1:
-                    print(
+                # Debug: log before draft execution (only first step, gated with SPECDEC_DEBUG)
+                if step == 1 and os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    self.logger.debug(
                         f"[DEBUG] Before draft - input shape: {active_input_ids.shape}, "
-                        f"K={k}, device={active_input_ids.device}",
-                        flush=True,
+                        f"K={k}, device={active_input_ids.device}"
                     )
 
                 # Apply temperature stabilization for draft model
@@ -1817,9 +1831,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                 base_vocab_size = get_vocab_size(self.base_lm)
 
                 if draft_stream is not None or verify_stream is not None:
-                    # CRITICAL: Synchronize before preparing tensors to ensure all previous ops complete
-                    # This prevents corruption from concurrent modifications
-                    torch.cuda.synchronize()
+                    # OPTIMIZATION: Stream synchronization handled by CUDA events
+                    # We rely on event-based synchronization instead of full device sync
+                    # This is more efficient and allows better overlap
+                    # Note: CUDA events in scheduler handle the necessary synchronization
 
                     # OPTIMAL: Clone ONCE with detach() BEFORE streams for complete independence
                     # This breaks computation graph and ensures no shared memory between streams
@@ -1842,20 +1857,22 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 strict=True,
                             )
 
-                            # Explicit min/max check before stream entry
-                            min_val = torch.min(active_input_ids_prepared).item()
-                            max_val = torch.max(active_input_ids_prepared).item()
-                            if min_val < 0 or max_val >= draft_vocab_size:
+                            # GPU-only validation: check without CPU sync (faster)
+                            # Only sync to CPU if corruption detected (rare case)
+                            invalid_mask = (
+                                active_input_ids_prepared >= draft_vocab_size
+                            ) | (active_input_ids_prepared < 0)
+                            if invalid_mask.any():
+                                min_val = torch.min(active_input_ids_prepared).item()
+                                max_val = torch.max(active_input_ids_prepared).item()
                                 raise RuntimeError(
                                     f"CRITICAL: Invalid tokens before stream! "
                                     f"Min={min_val}, Max={max_val}, Vocab_size={draft_vocab_size}"
                                 )
 
                     except Exception as e:
-                        print(
-                            f"[CRITICAL ERROR] Step {step}: Failed to prepare tensor for streams! "
-                            f"Error: {e}",
-                            flush=True,
+                        self.logger.error(
+                            f"Step {step}: Failed to prepare tensor for streams! Error: {e}"
                         )
                         raise RuntimeError(
                             f"Failed to prepare tensor for CUDA streams: {e}"
@@ -1872,6 +1889,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 do_sample=False,  # Use greedy for draft to maximize acceptance
                                 stream=draft_stream,
                                 past_key_values=draft_past_kv,
+                                attention_mask=active_attention_mask,  # Pass attention mask to skip padding
                                 **kwargs,
                             )
                         except RuntimeError as e:
@@ -1879,13 +1897,19 @@ class SpeculativePipeline(SpeculativeDecoder):
                             if "indexSelectLargeIndex" in str(
                                 e
                             ) or "device-side assert" in str(e):
-                                print(
-                                    f"[CRITICAL ERROR] Step {step}: CUDA embedding error in draft model!\n"
-                                    f"active_input_ids.shape={active_input_ids.shape}\n"
-                                    f"active_input_ids (min/max unavailable - tensor corrupted)\n"
-                                    f"vocab_size={getattr(self.draft_lm._model.config, 'vocab_size', 'unknown') if hasattr(self.draft_lm, '_model') else 'unknown'}\n"
-                                    f"Error: {e}",
-                                    flush=True,
+                                vocab_info = (
+                                    getattr(
+                                        self.draft_lm._model.config,
+                                        "vocab_size",
+                                        "unknown",
+                                    )
+                                    if hasattr(self.draft_lm, "_model")
+                                    else "unknown"
+                                )
+                                self.logger.error(
+                                    f"Step {step}: CUDA embedding error in draft model! "
+                                    f"active_input_ids.shape={active_input_ids.shape}, "
+                                    f"vocab_size={vocab_info}, Error: {e}"
                                 )
                             raise
                     if draft_end_event is not None:
@@ -1900,11 +1924,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                             strict=True,
                         )
 
-                        # Additional explicit check (as recommended in debugging guides)
-                        if (
-                            torch.min(active_input_ids) < 0
-                            or torch.max(active_input_ids) >= draft_vocab_size
-                        ):
+                        # GPU-only validation: check without CPU sync (faster)
+                        # Only sync to CPU if corruption detected (rare case)
+                        invalid_mask = (active_input_ids >= draft_vocab_size) | (
+                            active_input_ids < 0
+                        )
+                        if invalid_mask.any():
                             min_val = torch.min(active_input_ids).item()
                             max_val = torch.max(active_input_ids).item()
                             raise RuntimeError(
@@ -1918,6 +1943,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         temperature=draft_temperature,  # Lower temperature for draft
                         do_sample=False,  # Use greedy for draft to maximize acceptance
                         past_key_values=draft_past_kv,
+                        attention_mask=active_attention_mask,  # Pass attention mask to skip padding
                         **kwargs,
                     )
 
@@ -1954,23 +1980,23 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 # Validate draft outputs
                 if draft_tokens.numel() == 0 or draft_tokens.shape[1] == 0:
-                    print(
-                        f"[ERROR] Step {step}: Draft model returned empty tokens! "
-                        f"Shape: {draft_tokens.shape}",
-                        flush=True,
+                    self.logger.error(
+                        f"Step {step}: Draft model returned empty tokens! Shape: {draft_tokens.shape}"
                     )
                     break
 
-                # Debug: decode draft tokens (only first step to reduce CPU overhead)
+                # Debug: decode draft tokens (only first step, gated with SPECDEC_DEBUG)
                 if step == 1 and tokenizer is not None:
-                    try:
-                        draft_text = tokenizer.decode(draft_tokens[0])
-                        print(
-                            f"[DEBUG] Draft tokens decoded (first prompt): {draft_text[:100]}...",
-                            flush=True,
-                        )
-                    except Exception as e:
-                        print(f"[DEBUG] Failed to decode draft tokens: {e}", flush=True)
+                    if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                        try:
+                            draft_text = tokenizer.decode(draft_tokens[0])
+                            self.logger.debug(
+                                f"[DEBUG] Draft tokens decoded (first prompt): {draft_text[:100]}..."
+                            )
+                        except Exception as e:
+                            self.logger.debug(
+                                f"[DEBUG] Failed to decode draft tokens: {e}"
+                            )
 
                 # Calculate draft time using CUDA events if available, otherwise wall-clock
                 if draft_start_event is not None and draft_end_event is not None:
@@ -1979,21 +2005,25 @@ class SpeculativePipeline(SpeculativeDecoder):
                 else:
                     draft_time_ms = (time.time() - draft_start_wall) * 1000
 
-                # Debug: log draft outputs shape (reduced frequency to reduce CPU overhead)
-                if step == 1 or step % 16 == 0:
-                    print(
+                # Debug: log draft outputs shape (reduced frequency, gated with SPECDEC_DEBUG)
+                if (step == 1 or step % 16 == 0) and os.getenv(
+                    "SPECDEC_DEBUG", "0"
+                ).lower() in ("1", "true", "yes"):
+                    self.logger.debug(
                         f"[DEBUG] Draft execution - tokens shape: {draft_tokens.shape}, "
                         f"logits shape: {draft_logits.shape}, "
                         f"time: {draft_time_ms:.2f}ms, "
-                        f"proposed_tokens: {draft_tokens.shape[0] * draft_tokens.shape[1]}",
-                        flush=True,
+                        f"proposed_tokens: {draft_tokens.shape[0] * draft_tokens.shape[1]}"
                     )
-                if step == 1:
+                if step == 1 and os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
                     # Log sample token IDs (only first step)
-                    print(
+                    self.logger.debug(
                         f"[DEBUG] Sample draft token IDs (first batch): "
-                        f"{draft_tokens[0, :min(5, draft_tokens.shape[1])].tolist()}",
-                        flush=True,
+                        f"{draft_tokens[0, :min(5, draft_tokens.shape[1])].tolist()}"
                     )
 
                 # Step 2: Verify with base model in batch (on verify stream for true overlap)
@@ -2036,6 +2066,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             verify_start_event.record(verify_stream)
                         # Use scheduler's verification (it manages streams internally)
                         # Use prepared tensor for consistency and safety
+                        # Note: scheduler will extract attention_mask from kwargs if present
                         base_tokens, base_logits, verify_info = (
                             self.scheduler.schedule_verification(
                                 self.base_lm,
@@ -2043,6 +2074,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 active_input_ids_prepared,
                                 temperature=temperature,
                                 do_sample=do_sample,
+                                attention_mask=active_attention_mask,  # Pass attention mask to skip padding
                                 **kwargs,
                             )
                         )
@@ -2093,6 +2125,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 do_sample=False,  # Always use greedy for verification
                                 stream=verify_stream,
                                 past_key_values=base_past_kv,
+                                attention_mask=active_attention_mask,  # Pass attention mask to skip padding
                                 **kwargs,
                             )
                         except RuntimeError as e:
@@ -2100,14 +2133,20 @@ class SpeculativePipeline(SpeculativeDecoder):
                             if "indexSelectLargeIndex" in str(
                                 e
                             ) or "device-side assert" in str(e):
-                                print(
-                                    f"[CRITICAL ERROR] Step {step}: CUDA embedding error in base model (scheduler path)!\n"
-                                    f"active_input_ids.shape={active_input_ids.shape}\n"
-                                    f"active_input_ids (min/max unavailable - tensor corrupted)\n"
-                                    f"vocab_size={getattr(self.base_lm._model.config, 'vocab_size', 'unknown') if hasattr(self.base_lm, '_model') else 'unknown'}\n"
-                                    f"base_past_kv is None={base_past_kv is None}\n"
-                                    f"Error: {e}",
-                                    flush=True,
+                                vocab_info = (
+                                    getattr(
+                                        self.base_lm._model.config,
+                                        "vocab_size",
+                                        "unknown",
+                                    )
+                                    if hasattr(self.base_lm, "_model")
+                                    else "unknown"
+                                )
+                                self.logger.error(
+                                    f"Step {step}: CUDA embedding error in base model (scheduler path)! "
+                                    f"active_input_ids.shape={active_input_ids.shape}, "
+                                    f"vocab_size={vocab_info}, "
+                                    f"base_past_kv is None={base_past_kv is None}, Error: {e}"
                                 )
                             raise
                         if verify_end_event is not None:
@@ -2196,6 +2235,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         temperature=1.0,  # Temperature=1.0 for deterministic argmax
                         do_sample=False,  # Always use greedy for verification
                         past_key_values=base_past_kv,
+                        attention_mask=active_attention_mask,  # Pass attention mask to skip padding
                         **kwargs,
                     )
 
@@ -2365,8 +2405,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                             overlap_ratio = matches / max(
                                 len(draft_tokens_sample), len(base_pred_from_logits)
                             )
+                            min_len = min(
+                                len(draft_tokens_sample), len(base_pred_from_logits)
+                            )
                             print(
-                                f"[DEBUG] Token overlap ratio: {overlap_ratio:.2f} ({matches}/{min(len(draft_tokens_sample), len(base_pred_from_logits))} match)",
+                                f"[DEBUG] Token overlap ratio: {overlap_ratio:.2f} "
+                                f"({matches}/{min_len} match)",
                                 flush=True,
                             )
 

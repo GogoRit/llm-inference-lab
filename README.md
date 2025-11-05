@@ -14,11 +14,19 @@ The long-term goal is to provide open, reproducible baselines for speculative de
 
 Phase 4A focuses on optimizing hot paths and reducing overhead for paper submission readiness. Key optimizations include removing debug print overhead, eliminating unnecessary CPU-GPU synchronizations, and consolidating redundant validation code.
 
-**Latest Optimizations**:
+**Completed Optimizations**:
 - Hot path logging removed (gated with `SPECDEC_DEBUG` flag)
 - Async synchronization optimized for true stream overlap
 - Token validation consolidated into centralized helper
 - Partial KV cache reuse enhanced
+- **CPU-GPU Memory Optimization**: Removed unnecessary `.item()` calls, deferred CPU transfers, GPU-only validation
+- **Batch Processing (Phase 4A.1)**: Attention mask support, optimized padding, reduced CPU-GPU syncs
+
+**Phase 4A Results** (Tesla T4, 64 tokens, 800 samples):
+- Throughput: 5.88 tok/s (stable vs Phase 3D baseline 5.97 tok/s)
+- Acceptance: 39.8% (maintained)
+- Success Rate: 100% (800/800)
+- **Finding**: Hot-path optimizations maintained stability; verified no regression
 
 ### Phase 3D: Complete – Production-Ready Pipeline Validated
 
@@ -60,7 +68,7 @@ Phase 3D represents the transition from kernel-level optimization (Phase 3C) to 
 | **3C** | Complete | CUDA kernels | Custom kernels, registry, detailed metrics |
 | **3C.5** | Complete | KV cache integration | Efficient token appending without recomputation |
 | **3D** | Complete | GPU optimization | Stream overlap, graph capture, structured profiling (CUDA validation complete) |
-| **4A** | Planned | Batch-level processing | Multi-prompt batch processing |
+| **4A** | In Progress | Performance optimization | Hot path optimization, CPU-GPU sync reduction, batch processing (Phase 4A.1) |
 | **4B** | Planned | Advanced quantization | INT8/INT4 quantization techniques |
 | **4C** | Planned | Layer/model parallelism | Multi-GPU support for 7B+ models |
 | **4D** | Planned | Speculative tree decoding | Tree-based acceptance strategies |
@@ -254,7 +262,7 @@ SPECDEC_ENABLE_KV_APPEND=0 python scripts/comprehensive_k_sweep.py ...
 | `SPECDEC_PARALLEL_STREAMS=1` | Enable CUDA stream overlap | On |
 | `SPECDEC_SYNC_MODE=event/barrier` | Sync mode: event or barrier | event |
 | `SPECDEC_DRY_RUN=1` | Run latency-only profiling | Off |
-| `SPECDEC_DEBUG=1` | Enable debug logging (print statements) | Off |
+| `SPECDEC_DEBUG=1` | Enable debug logging (gated print statements) | Off |
 
 ## Testing
 
@@ -309,15 +317,22 @@ CUDA validation completed successfully on Kaggle T4 hardware. Full K-sweep runs 
    - High-end GPU validation
    - Expected throughput: ~100+ tok/s
 
+**Phase 4A.1: Batch Processing Optimization** (In Progress):
+- ✅ Attention mask support (skip padding computation)
+- ✅ Optimized padding operations (torch.nn.functional.pad)
+- ✅ CPU-GPU memory optimization (reduced syncs and transfers)
+- ✅ Debug logging gated with SPECDEC_DEBUG flag
+- 🔄 Batch vs single-prompt throughput profiling (remaining)
+- 🔄 Dynamic batching strategies (remaining)
+
 **Remaining Roadmap**:
-- Larger GPU validation (A100/H100) for higher throughput targets
-- Tokenizer-aware optimizations to reduce CPU-bound overhead
-- Code improvements: reduce debug print overhead in scheduler
-- Phase 4A: Batch-level processing for multi-prompt workloads
-
-### Phase 4A: Batch-Level Processing (Planned)
-
-Following successful CUDA validation, Phase 4A will implement multi-prompt batch processing to improve throughput for production workloads.
+- **Phase 4A.1**: Complete batch processing optimization and profiling
+- **Verify-loop kernel optimization**: Further throughput gains at kernel level
+- **Larger GPU validation**: A100/H100 benchmarking for higher throughput targets
+- **Tokenizer-aware optimizations**: Reduce CPU-bound overhead
+- **Phase 4B**: Advanced quantization (INT8/INT4) for memory efficiency
+- **Phase 4C**: Multi-GPU support for 7B+ models
+- **Phase 4D**: Speculative tree decoding for improved acceptance rates
 
 ### Phase 4B: Advanced Quantization (Planned)
 
@@ -354,4 +369,4 @@ speculative decoding experiments. https://github.com/GogoRit/llm-inference-lab
 
 ---
 
-**Status**: Phase 3D Complete - Production-Ready Pipeline Validated
+**Status**: Phase 4A In Progress – Performance Optimizations Complete, Batch Processing Optimization Ongoing

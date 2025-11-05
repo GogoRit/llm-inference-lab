@@ -185,13 +185,14 @@ class SpeculativeScheduler:
         # Run verification on verification stream (async)
         # Pass stream to enable true async execution
         # For verification, always use greedy (argmax) to ensure deterministic matching
+        # Extract attention_mask from kwargs if present (for batch processing)
         base_tokens, base_logits = base_model.generate_tokens(
             input_ids,
             max_new_tokens=draft_tokens.shape[1],
             temperature=1.0,  # Temperature=1.0 for deterministic argmax
             do_sample=False,  # Always use greedy for verification
             stream=self.verification_stream,  # Enable async execution
-            **kwargs,
+            **kwargs,  # Includes attention_mask if provided
         )
 
         # Phase 3D: Record end event and wait only when needed

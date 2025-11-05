@@ -147,6 +147,7 @@ class HFWrapper(LanguageModel):
         do_sample: bool = True,
         stream: Optional[torch.cuda.Stream] = None,
         past_key_values=None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -205,8 +206,10 @@ class HFWrapper(LanguageModel):
                 # Standard generation without KV cache
                 # Input already validated at entry point - trust validation
 
-                # Create attention mask for proper padding handling
-                attention_mask = torch.ones_like(input_ids)
+                # Use provided attention mask or create default (all ones)
+                # This allows batch processing to pass proper masks that ignore padding
+                if attention_mask is None:
+                    attention_mask = torch.ones_like(input_ids)
 
                 # Generate tokens
                 outputs = self._model.generate(  # type: ignore
@@ -381,7 +384,8 @@ class HFWrapper(LanguageModel):
                                         min_token = -1
 
                                     print(
-                                        f"[CRITICAL ERROR] Async loop step {step}: Invalid tokens RIGHT before model forward! "
+                                        f"[CRITICAL ERROR] Async loop step {step}: "
+                                        f"Invalid tokens RIGHT before model forward! "
                                         f"min={min_token}, max={max_token}, vocab={vocab_size}, "
                                         f"invalid={invalid_count}/{current_input.numel()}\n"
                                         f"current_input.shape={current_input.shape}, dtype={current_input.dtype}",
@@ -434,7 +438,8 @@ class HFWrapper(LanguageModel):
                                     except Exception as cpu_err:
                                         # If even CPU fails, tensor is severely corrupted
                                         print(
-                                            f"[CRITICAL ERROR] Async loop step {step} (no past_kv): Cannot read tensor values! "
+                                            f"[CRITICAL ERROR] Async loop step {step} "
+                                            f"(no past_kv): Cannot read tensor values! "
                                             f"Error: {cpu_err}",
                                             flush=True,
                                         )
@@ -442,7 +447,8 @@ class HFWrapper(LanguageModel):
                                         min_token = -1
 
                                     print(
-                                        f"[CRITICAL ERROR] Async loop step {step} (no past_kv): Invalid tokens RIGHT before model forward! "
+                                        f"[CRITICAL ERROR] Async loop step {step} "
+                                        f"(no past_kv): Invalid tokens RIGHT before model forward! "
                                         f"min={min_token}, max={max_token}, vocab={vocab_size}, "
                                         f"invalid={invalid_count}/{current_input.numel()}",
                                         flush=True,
