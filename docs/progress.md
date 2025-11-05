@@ -595,7 +595,15 @@ Phase 3D (Expected H100):        ~100 tok/s (CUDA H100, target)
 - Centralized token validation reduces code duplication
 - All changes maintain backward compatibility
 
-**Status**: Code changes complete, ready for Tesla T4 validation
+**Status**: Code changes complete, Tesla T4 validation in progress
+
+**Test Coverage**:
+- Added `tests/test_phase4a_optimizations.py` with 15 test cases
+- Tests for SPECDEC_DEBUG flag gating (3 tests)
+- Tests for token validation consolidation (6 tests)
+- Tests for async stream optimization (3 tests)
+- Tests for partial KV cache reuse (3 tests)
+- All tests passing (14 passed, 1 skipped on non-CUDA)
 
 **Target Start for Batch Processing**: 2025-11-15
 
@@ -715,6 +723,6 @@ speculative decoding experiments. https://github.com/GogoRit/llm-inference-lab
 
 ---
 
-**Last Updated**: 2025-11-03  
-**Current Status**: Phase 3D Complete – Production-Ready Pipeline Validated  
-**Next Milestone**: Phase 4A (Batch-Level Processing) → Larger GPU Validation (A100/H100)
+**Last Updated**: 2025-11-04  
+**Current Status**: Phase 4A In Progress – Performance Optimizations Complete, Tesla T4 Validation Running  
+**Next Milestone**: Phase 4A Results Analysis → Batch-Level Processing (Phase 4A.1)

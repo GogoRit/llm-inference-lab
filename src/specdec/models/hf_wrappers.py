@@ -490,7 +490,7 @@ class HFWrapper(LanguageModel):
                             or (probs < 0).any()
                             or torch.isinf(probs).any()
                         ):
-                            logger.error(
+                            self.logger.error(
                                 "[ERROR] Invalid probs detected: NaN/Inf or negative values"
                             )
                             # Use event-based sync if available, otherwise fallback to sync
