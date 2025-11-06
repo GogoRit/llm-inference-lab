@@ -17,8 +17,16 @@ from datetime import datetime
 from pathlib import Path
 
 # Force unbuffered output for Kaggle/notebook environments
-sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
-sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, 'reconfigure') else None
+(
+    sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stdout, "reconfigure")
+    else None
+)
+(
+    sys.stderr.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure")
+    else None
+)
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 # Silence tokenizer parallelism warning
