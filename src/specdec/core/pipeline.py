@@ -2435,10 +2435,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                         )
 
                     # Get accepted tokens - ensure we always have something
-                    # Extract accepted tokens with centralized validation
+                    # CRITICAL FIX: Use base model's generated tokens, not draft tokens
+                    # This ensures correctness - base model tokens are the ground truth
+                    # Even if draft tokens "match" via argmax comparison, we must use base tokens
+                    # to maintain correct generation chain and prevent accumulation errors
                     accepted_tokens = []
                     if accepted_len > 0:
-                        accepted_tokens_tensor = prompt_draft_tokens[0, :accepted_len]
+                        # Use base model's actual generated tokens for accepted positions
+                        accepted_tokens_tensor = prompt_base_tokens[0, :accepted_len]
                         # Validate before CPU transfer
                         base_vocab_size = get_vocab_size(self.base_lm)
                         if base_vocab_size is not None:
