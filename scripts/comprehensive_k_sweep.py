@@ -16,6 +16,11 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+# Force unbuffered output for Kaggle/notebook environments
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, 'reconfigure') else None
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
 # Silence tokenizer parallelism warning
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -81,11 +86,20 @@ if torch.cuda.is_available():
 from kernels import get_kernel_info  # noqa: E402
 from specdec import SpeculativePipeline  # noqa: E402
 
-# Set up logging
+# Set up logging with explicit stream configuration for Kaggle
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,  # Explicitly use stdout for Kaggle visibility
+    force=True,  # Override any existing configuration
 )
 logger = logging.getLogger(__name__)
+
+# Ensure initial output is visible
+print("=" * 80, flush=True)
+print("[SCRIPT] Comprehensive K-Sweep Script Starting", flush=True)
+print("=" * 80, flush=True)
+sys.stdout.flush()
 
 # 10-prompt test suite
 PROMPT_SUITE = [
@@ -1141,9 +1155,15 @@ def main():
             )
 
     print("=" * 120, flush=True)
+    print(
+        f"\n[FINAL] Comprehensive K-sweep completed. Results saved to {csv_file} and {json_file}",
+        flush=True,
+    )
     logger.info(
         f"Comprehensive K-sweep completed. Results saved to {csv_file} and {json_file}"
     )
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 if __name__ == "__main__":
