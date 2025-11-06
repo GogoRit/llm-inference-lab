@@ -854,30 +854,29 @@ def run_comprehensive_k_sweep(
     print("=" * 80 + "\n", flush=True)
 
     # Cleanup pipeline resources to prevent hanging in Kaggle
-    if "pipeline_cache" in locals():
-        print("[CLEANUP] Cleaning up pipeline resources...", flush=True)
-        for k, pipeline in pipeline_cache.items():
-            if pipeline is not None:
-                try:
-                    # Clear any CUDA streams or resources
-                    if hasattr(pipeline, "scheduler") and pipeline.scheduler:
-                        if hasattr(pipeline.scheduler, "reset"):
-                            pipeline.scheduler.reset()
-                    # Clear KV caches
-                    if hasattr(pipeline, "kv_cache_manager"):
-                        pipeline.kv_cache_manager.reset()
-                    if hasattr(pipeline.base_lm, "clear_kv_cache"):
-                        pipeline.base_lm.clear_kv_cache()
-                    if hasattr(pipeline.draft_lm, "clear_kv_cache"):
-                        pipeline.draft_lm.clear_kv_cache()
-                except Exception as e:
-                    logger.warning(f"Error cleaning up pipeline K={k}: {e}")
-        pipeline_cache.clear()
-        # Force CUDA cleanup
-        if resolved_device == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-        print("[CLEANUP] Pipeline resources cleaned up", flush=True)
+    print("[CLEANUP] Cleaning up pipeline resources...", flush=True)
+    for k, pipeline in pipeline_cache.items():
+        if pipeline is not None:
+            try:
+                # Clear any CUDA streams or resources
+                if hasattr(pipeline, "scheduler") and pipeline.scheduler:
+                    if hasattr(pipeline.scheduler, "reset"):
+                        pipeline.scheduler.reset()
+                # Clear KV caches
+                if hasattr(pipeline, "kv_cache_manager"):
+                    pipeline.kv_cache_manager.reset()
+                if hasattr(pipeline.base_lm, "clear_kv_cache"):
+                    pipeline.base_lm.clear_kv_cache()
+                if hasattr(pipeline.draft_lm, "clear_kv_cache"):
+                    pipeline.draft_lm.clear_kv_cache()
+            except Exception as e:
+                logger.warning(f"Error cleaning up pipeline K={k}: {e}")
+    pipeline_cache.clear()
+    # Force CUDA cleanup
+    if resolved_device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    print("[CLEANUP] Pipeline resources cleaned up", flush=True)
 
     return (
         results,
