@@ -853,6 +853,32 @@ def run_comprehensive_k_sweep(
 
     print("=" * 80 + "\n", flush=True)
 
+    # Cleanup pipeline resources to prevent hanging in Kaggle
+    if "pipeline_cache" in locals():
+        print("[CLEANUP] Cleaning up pipeline resources...", flush=True)
+        for k, pipeline in pipeline_cache.items():
+            if pipeline is not None:
+                try:
+                    # Clear any CUDA streams or resources
+                    if hasattr(pipeline, "scheduler") and pipeline.scheduler:
+                        if hasattr(pipeline.scheduler, "reset"):
+                            pipeline.scheduler.reset()
+                    # Clear KV caches
+                    if hasattr(pipeline, "kv_cache_manager"):
+                        pipeline.kv_cache_manager.reset()
+                    if hasattr(pipeline.base_lm, "clear_kv_cache"):
+                        pipeline.base_lm.clear_kv_cache()
+                    if hasattr(pipeline.draft_lm, "clear_kv_cache"):
+                        pipeline.draft_lm.clear_kv_cache()
+                except Exception as e:
+                    logger.warning(f"Error cleaning up pipeline K={k}: {e}")
+        pipeline_cache.clear()
+        # Force CUDA cleanup
+        if resolved_device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        print("[CLEANUP] Pipeline resources cleaned up", flush=True)
+
     return (
         results,
         detailed_results,
@@ -1173,6 +1199,24 @@ def main():
     sys.stdout.flush()
     sys.stderr.flush()
 
+    # Cleanup CUDA resources to ensure clean exit in Kaggle
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        print("[CLEANUP] CUDA resources cleaned up", flush=True)
+
+    # Explicit exit to ensure script completes in Kaggle notebooks
+    print("[SCRIPT] Script completed successfully", flush=True)
+    sys.exit(0)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[SCRIPT] Interrupted by user", flush=True)
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n[ERROR] Fatal error: {e}", flush=True)
+        logger.exception("Fatal error in main()")
+        sys.exit(1)
