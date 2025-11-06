@@ -200,7 +200,10 @@ class SpeculativeScheduler:
             verify_end_event.record(self.verification_stream)
             # Wait for verification to complete before returning
             verify_end_event.wait(self.default_stream)
-            torch.cuda.synchronize()  # Ensure all operations complete
+            # OPTIMIZATION: Event wait is sufficient for stream synchronization
+            # Full device sync is redundant here - event wait already ensures completion
+            # Only sync if we need to ensure default stream sees the results immediately
+            # For async execution, this sync can be removed to improve overlap
 
             # Calculate time using CUDA events (more accurate than wall-clock)
             verification_time_ms = verify_start_event.elapsed_time(verify_end_event)

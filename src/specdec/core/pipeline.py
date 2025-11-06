@@ -2448,8 +2448,34 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 "accepted_tokens",
                             )
                         accepted_tokens = accepted_tokens_tensor.cpu().tolist()
-                        batch_generated_tokens[global_idx].extend(accepted_tokens)
-                        accepted_tokens_list.append(accepted_tokens)
+
+                        # Stop before adding EOS token if encountered
+                        # Get EOS token ID for early stopping
+                        eos_token_id = 50256  # Default GPT-2 EOS token
+                        if tokenizer is not None:
+                            eos_token_id = tokenizer.eos_token_id
+                        elif (
+                            hasattr(self.base_lm, "_tokenizer")
+                            and self.base_lm._tokenizer is not None
+                        ):
+                            base_tokenizer = self.base_lm._tokenizer
+                            if base_tokenizer is not None and hasattr(
+                                base_tokenizer, "eos_token_id"
+                            ):
+                                eos_token_id = base_tokenizer.eos_token_id
+
+                        # Truncate at EOS token if found (don't include EOS in generated tokens)
+                        tokens_to_add = accepted_tokens
+                        if eos_token_id in accepted_tokens:
+                            eos_idx = accepted_tokens.index(eos_token_id)
+                            tokens_to_add = accepted_tokens[:eos_idx]
+                            batch_active[global_idx] = False  # Stop generation
+
+                        batch_generated_tokens[global_idx].extend(tokens_to_add)
+                        accepted_tokens_list.append(tokens_to_add)
+                        # Update accepted_tokens for use in sequence update below
+                        accepted_tokens = tokens_to_add
+                        accepted_len = len(tokens_to_add)
                     else:
                         # Rejected all - accept first base token as fallback
                         first_base_tensor = prompt_base_tokens[0, 0:1]
@@ -2460,9 +2486,32 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 first_base_tensor, base_vocab_size, "fallback_base"
                             )
                         accepted_tokens = first_base_tensor.cpu().tolist()
-                        batch_generated_tokens[global_idx].extend(accepted_tokens)
-                        accepted_tokens_list.append(accepted_tokens)
-                        accepted_len = 1
+
+                        # Check for EOS in fallback token too
+                        eos_token_id = 50256  # Default GPT-2 EOS token
+                        if tokenizer is not None:
+                            eos_token_id = tokenizer.eos_token_id
+                        elif (
+                            hasattr(self.base_lm, "_tokenizer")
+                            and self.base_lm._tokenizer is not None
+                        ):
+                            base_tokenizer = self.base_lm._tokenizer
+                            if base_tokenizer is not None and hasattr(
+                                base_tokenizer, "eos_token_id"
+                            ):
+                                eos_token_id = base_tokenizer.eos_token_id
+
+                        # Don't add EOS token if it's the fallback token
+                        if accepted_tokens and accepted_tokens[0] == eos_token_id:
+                            accepted_tokens = []
+                            batch_active[global_idx] = False
+
+                        if accepted_tokens:
+                            batch_generated_tokens[global_idx].extend(accepted_tokens)
+                            accepted_tokens_list.append(accepted_tokens)
+                            accepted_len = 1
+                        else:
+                            accepted_len = 0
                         if step <= 3 or idx_in_active == 0:
                             print(
                                 f"[DEBUG] No draft tokens accepted - accepting first base token: {accepted_tokens}",
@@ -2577,25 +2626,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                             flush=True,
                         )
 
-                    # Check if this prompt is done
-                    eos_token_id = 50256  # Default GPT-2 EOS token
-                    if tokenizer is not None:
-                        eos_token_id = tokenizer.eos_token_id
-                    elif (
-                        hasattr(self.base_lm, "_tokenizer")
-                        and self.base_lm._tokenizer is not None
-                    ):
-                        base_tokenizer = self.base_lm._tokenizer
-                        if base_tokenizer is not None and hasattr(
-                            base_tokenizer, "eos_token_id"
-                        ):
-                            eos_token_id = base_tokenizer.eos_token_id
-                    # Check if prompt is done
+                    # Check if this prompt is done (additional check for max_tokens)
+                    # EOS handling is already done above when adding tokens
                     if len(batch_generated_tokens[global_idx]) >= max_tokens:
-                        batch_active[global_idx] = False
-                    elif (
-                        len(accepted_tokens) > 0 and accepted_tokens[-1] == eos_token_id
-                    ):
                         batch_active[global_idx] = False
 
                 batch_metrics["total_steps"] += 1
@@ -2623,29 +2656,30 @@ class SpeculativePipeline(SpeculativeDecoder):
                     # This reduces sync overhead when sequences don't need cloning
                     torch.cuda.synchronize()
 
-                # Log batch progress with accurate timing
-                if step % 8 == 0 or step == 1:
-                    avg_draft_time = (
-                        batch_metrics["total_draft_time_ms"]
-                        / batch_metrics["total_steps"]
-                        if batch_metrics["total_steps"] > 0
-                        else 0.0
-                    )
-                    avg_verify_time = (
-                        batch_metrics["total_verification_time_ms"]
-                        / batch_metrics["total_steps"]
-                        if batch_metrics["total_steps"] > 0
-                        else 0.0
-                    )
-                    print(
-                        f"[BATCH] Step {step}/{max_tokens} | "
-                        f"Active: {active_count}/{batch_size} | "
-                        f"K={k} | "
-                        f"Draft: {draft_time_ms:.1f}ms (avg={avg_draft_time:.1f}ms) | "
-                        f"Verify: {verify_time_ms:.1f}ms (avg={avg_verify_time:.1f}ms) | "
-                        f"Accepted: {sum(accepted_lengths)}/{len(accepted_lengths)*k}",
-                        flush=True,
-                    )
+                # Log batch progress with accurate timing (only if SPECDEC_DEBUG enabled)
+                if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                    if step % 8 == 0 or step == 1:
+                        avg_draft_time = (
+                            batch_metrics["total_draft_time_ms"]
+                            / batch_metrics["total_steps"]
+                            if batch_metrics["total_steps"] > 0
+                            else 0.0
+                        )
+                        avg_verify_time = (
+                            batch_metrics["total_verification_time_ms"]
+                            / batch_metrics["total_steps"]
+                            if batch_metrics["total_steps"] > 0
+                            else 0.0
+                        )
+                        print(
+                            f"[BATCH] Step {step}/{max_tokens} | "
+                            f"Active: {active_count}/{batch_size} | "
+                            f"K={k} | "
+                            f"Draft: {draft_time_ms:.1f}ms (avg={avg_draft_time:.1f}ms) | "
+                            f"Verify: {verify_time_ms:.1f}ms (avg={avg_verify_time:.1f}ms) | "
+                            f"Accepted: {sum(accepted_lengths)}/{len(accepted_lengths)*k}",
+                            flush=True,
+                        )
 
             total_time_ms = (time.time() - generation_start) * 1000
             batch_metrics["total_generation_time_ms"] = total_time_ms
@@ -2682,10 +2716,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                 zip(prompts, batch_generated_tokens)
             ):
                 # Decode generated tokens
+                # Pass list directly to decode - it handles conversion and skips special tokens
                 if generated_tokens:
-                    generated_text = self.base_lm.decode(
-                        torch.tensor(generated_tokens, device=self.device).unsqueeze(0)
-                    )
+                    generated_text = self.base_lm.decode(generated_tokens)
                 else:
                     generated_text = ""
 

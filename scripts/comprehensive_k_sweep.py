@@ -213,6 +213,7 @@ def run_comprehensive_k_sweep(
     iterations=10,
     device="auto",
     deterministic: bool = False,
+    verbose: bool = False,
 ):
     """Run comprehensive K-sweep test with 10-prompt suite."""
 
@@ -372,10 +373,11 @@ def run_comprehensive_k_sweep(
         last_heartbeat_time = time.time()
 
         for iteration in range(iterations):
-            print(
-                f"[ITER] ===== Starting Iteration {iteration+1}/{iterations} =====",
-                flush=True,
-            )
+            if verbose:
+                print(
+                    f"[ITER] ===== Starting Iteration {iteration+1}/{iterations} =====",
+                    flush=True,
+                )
             logger.info(f"  Iteration {iteration+1}/{iterations}")
             iter_start_time = time.time()
             iter_results = []
@@ -383,10 +385,11 @@ def run_comprehensive_k_sweep(
 
             # Process prompts in batches
             num_batches = (len(PROMPT_SUITE) + BATCH_SIZE - 1) // BATCH_SIZE
-            print(
-                f"[ITER] Processing {num_batches} batches of up to {BATCH_SIZE} prompts each",
-                flush=True,
-            )
+            if verbose:
+                print(
+                    f"[ITER] Processing {num_batches} batches of up to {BATCH_SIZE} prompts each",
+                    flush=True,
+                )
 
             for batch_idx, batch_start in enumerate(
                 range(0, len(PROMPT_SUITE), BATCH_SIZE)
@@ -395,9 +398,9 @@ def run_comprehensive_k_sweep(
                 batch_prompts = PROMPT_SUITE[batch_start:batch_end]
                 batch_indices = list(range(batch_start, batch_end))
 
-                # Heartbeat check (every 60 seconds)
+                # Heartbeat check (every 60 seconds) - only if verbose
                 current_time = time.time()
-                if current_time - last_heartbeat_time >= 60.0:
+                if verbose and current_time - last_heartbeat_time >= 60.0:
                     print(
                         f"[HEARTBEAT] {time.strftime('%H:%M:%S')} still running... "
                         f"K={k}, Iter={iteration+1}/{iterations}, "
@@ -428,13 +431,14 @@ def run_comprehensive_k_sweep(
                 else:
                     gpu_util_est = 0.0
 
-                print(
-                    f"[INFO] Iteration {iteration+1}/{iterations} | "
-                    f"Batch {batch_idx+1}/{num_batches} (prompts {batch_start+1}-{batch_end}) | "
-                    f"GPU util: {gpu_util_est:.1f}% | "
-                    f"Elapsed: {time.time() - iter_start_time:.2f}s",
-                    flush=True,
-                )
+                if verbose:
+                    print(
+                        f"[INFO] Iteration {iteration+1}/{iterations} | "
+                        f"Batch {batch_idx+1}/{num_batches} (prompts {batch_start+1}-{batch_end}) | "
+                        f"GPU util: {gpu_util_est:.1f}% | "
+                        f"Elapsed: {time.time() - iter_start_time:.2f}s",
+                        flush=True,
+                    )
 
                 try:
                     # Use cached pipeline
@@ -476,19 +480,18 @@ def run_comprehensive_k_sweep(
                     else:
                         gpu_util_est_after = gpu_util_est
 
-                    print(
-                        f"[INFO] Batch {batch_idx+1} completed | "
-                        f"Time: {batch_time_s:.2f}s ({batch_time_ms:.1f}ms) | "
-                        f"GPU util: {gpu_util_est_after:.1f}% | "
-                        f"Prompts: {len(batch_prompts)}",
-                        flush=True,
-                    )
-
-                    # Process each result in the batch
-                    print(
-                        f"[BATCH] Processing {len(batch_results)} results from batch {batch_idx+1}",
-                        flush=True,
-                    )
+                    if verbose:
+                        print(
+                            f"[INFO] Batch {batch_idx+1} completed | "
+                            f"Time: {batch_time_s:.2f}s ({batch_time_ms:.1f}ms) | "
+                            f"GPU util: {gpu_util_est_after:.1f}% | "
+                            f"Prompts: {len(batch_prompts)}",
+                            flush=True,
+                        )
+                        print(
+                            f"[BATCH] Processing {len(batch_results)} results from batch {batch_idx+1}",
+                            flush=True,
+                        )
 
                     for prompt_idx, result in zip(batch_indices, batch_results):
                         prompt = PROMPT_SUITE[prompt_idx]
@@ -516,14 +519,15 @@ def run_comprehensive_k_sweep(
                         if np.isnan(acceptance_rate) or np.isinf(acceptance_rate):
                             acceptance_rate = 0.0
 
-                        # Log progress for each prompt
-                        print(
-                            f"[PROMPT] {prompt_idx+1}/{len(PROMPT_SUITE)} | "
-                            f"Tokens: {generated_tokens_count} | "
-                            f"Accept: {accepted}/{proposed} ({acceptance_rate:.1%}) | "
-                            f"Throughput: {tokens_per_sec:.2f} tok/s",
-                            flush=True,
-                        )
+                        # Log progress for each prompt (only if verbose)
+                        if verbose:
+                            print(
+                                f"[PROMPT] {prompt_idx+1}/{len(PROMPT_SUITE)} | "
+                                f"Tokens: {generated_tokens_count} | "
+                                f"Accept: {accepted}/{proposed} ({acceptance_rate:.1%}) | "
+                                f"Throughput: {tokens_per_sec:.2f} tok/s",
+                                flush=True,
+                            )
 
                         # Store detailed result (minimal logging during generation)
                         detailed_result = {
@@ -679,10 +683,11 @@ def run_comprehensive_k_sweep(
                     flush=True,
                 )
 
-            print(
-                f"[ITER] ===== Iteration {iteration+1}/{iterations} finished =====",
-                flush=True,
-            )
+                if verbose:
+                    print(
+                        f"[ITER] ===== Iteration {iteration+1}/{iterations} finished =====",
+                        flush=True,
+                    )
 
         # Calculate statistics for this K
         valid_results = [r for r in k_results if "error" not in r]
@@ -1039,6 +1044,12 @@ def main():
     parser.add_argument("--base-model", default="gpt2", help="Base model name")
     parser.add_argument("--draft-model", default="distilgpt2", help="Draft model name")
     parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output (default: only show results)",
+    )
+    parser.add_argument(
         "--max-tokens", type=int, default=32, help="Maximum tokens to generate"
     )
     parser.add_argument(
@@ -1111,6 +1122,7 @@ def main():
         iterations=args.iterations,
         device=args.device,
         deterministic=args.deterministic,
+        verbose=args.verbose,
     )
 
     # Save results

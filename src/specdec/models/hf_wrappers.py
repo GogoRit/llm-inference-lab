@@ -47,6 +47,7 @@ class HFWrapper(LanguageModel):
 
         # KV cache management
         self._kv_cache: Optional[KVCache] = None
+        self._last_generated_kv: Optional[KVCache] = None  # Type annotation for mypy
         self._kv_append_enabled = os.getenv(
             "SPECDEC_ENABLE_KV_APPEND", "1"
         ).lower() in (
@@ -833,8 +834,16 @@ class HFWrapper(LanguageModel):
         )
         return {k: v.to(self._device) for k, v in inputs.items()}
 
-    def decode(self, token_ids) -> str:
-        """Decode token IDs to text."""
+    def decode(self, token_ids: Any) -> str:
+        """
+        Decode token IDs to text.
+
+        Args:
+            token_ids: Token IDs to decode (torch.Tensor, list, or other iterable)
+
+        Returns:
+            Decoded text string
+        """
         if isinstance(token_ids, list):
             # Convert list to tensor and flatten if needed
             token_ids = torch.tensor(token_ids)

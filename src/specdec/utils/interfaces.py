@@ -82,12 +82,12 @@ class LanguageModel(ABC):
         pass
 
     @abstractmethod
-    def decode(self, token_ids: torch.Tensor) -> str:
+    def decode(self, token_ids: Any) -> str:
         """
         Decode token IDs to text.
 
         Args:
-            token_ids: Token IDs to decode
+            token_ids: Token IDs to decode (can be torch.Tensor, list, or other iterable)
 
         Returns:
             Decoded text

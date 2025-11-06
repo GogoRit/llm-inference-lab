@@ -141,8 +141,9 @@ std::vector<torch::Tensor> verify_prefix_cuda(
     int threads_per_block = 256;  // 8 warps for better parallelism
     dim3 block(threads_per_block);
     dim3 grid(B);    // One block per batch item
-    // Shared memory: blockDim.x floats + blockDim.x int32s for reduction, plus K floats + K int32s for final results
-    size_t shared_mem_size = blockDim.x * sizeof(float) + blockDim.x * sizeof(int32_t) + 
+    // Shared memory: threads_per_block floats + threads_per_block int32s for reduction, plus K floats + K int32s for final results
+    // CRITICAL FIX: Use threads_per_block (host variable) instead of blockDim.x (device variable)
+    size_t shared_mem_size = threads_per_block * sizeof(float) + threads_per_block * sizeof(int32_t) + 
                              K * sizeof(float) + K * sizeof(int32_t);
     
     verify_prefix_kernel<<<grid, block, shared_mem_size>>>(
@@ -153,11 +154,15 @@ std::vector<torch::Tensor> verify_prefix_cuda(
         B, K, V
     );
     
-    // Check for errors
+    // Check for launch errors immediately
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error("CUDA kernel launch failed: " + std::string(cudaGetErrorString(err)));
     }
+    
+    // OPTIMIZATION: For production code, we could add cudaDeviceSynchronize() here to catch execution errors
+    // However, for async execution with streams, we skip this to allow overlap
+    // The caller should synchronize when needed
     
     return {accept_len, accepted_mask};
 }
