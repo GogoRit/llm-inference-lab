@@ -175,12 +175,15 @@ class SpeculativeScheduler:
         allowing draft and verification to overlap asynchronously.
         """
         # Phase 3D: Use CUDA events for timing and synchronization
+        verify_start_wall_time = None
         if self.use_event_sync and self.verify_ready_event is not None:
             verify_start_event = torch.cuda.Event(enable_timing=True)
             verify_end_event = torch.cuda.Event(enable_timing=True)
 
             # Record start event on verification stream
             verify_start_event.record(self.verification_stream)
+            # Also record wall-clock time as fallback for error handling
+            verify_start_wall_time = time.time()
 
         # Run verification on verification stream (async)
         # Pass stream to enable true async execution
@@ -196,17 +199,62 @@ class SpeculativeScheduler:
         )
 
         # Phase 3D: Record end event and wait only when needed
+        event_wait_succeeded = False
         if self.use_event_sync and self.verify_ready_event is not None:
             verify_end_event.record(self.verification_stream)
-            # Wait for verification to complete before returning
-            verify_end_event.wait(self.default_stream)
+            # CRITICAL FIX: Add error handling for event wait (device may be in bad state)
+            try:
+                # Wait for verification to complete before returning
+                verify_end_event.wait(self.default_stream)
+                event_wait_succeeded = True
+            except RuntimeError as e:
+                if "device not ready" in str(e) or "CUDA error" in str(e):
+                    # Device error during wait - fallback to barrier sync
+                    logger.warning(
+                        f"CUDA event wait failed ({e}), falling back to barrier synchronization"
+                    )
+                    # Recover device state with barrier sync
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    event_wait_succeeded = False
+                else:
+                    raise
+
             # OPTIMIZATION: Event wait is sufficient for stream synchronization
             # Full device sync is redundant here - event wait already ensures completion
             # Only sync if we need to ensure default stream sees the results immediately
             # For async execution, this sync can be removed to improve overlap
 
             # Calculate time using CUDA events (more accurate than wall-clock)
-            verification_time_ms = verify_start_event.elapsed_time(verify_end_event)
+            # CRITICAL FIX: Add error handling for CUDA device errors in timing
+            if event_wait_succeeded:
+                try:
+                    verification_time_ms = verify_start_event.elapsed_time(
+                        verify_end_event
+                    )
+                except RuntimeError as e:
+                    if "device not ready" in str(e) or "CUDA error" in str(e):
+                        # Device error - fallback to wall-clock time and log warning
+                        logger.warning(
+                            f"CUDA event timing failed ({e}), falling back to wall-clock time"
+                        )
+                        # Re-synchronize to ensure device is ready
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        verification_time_ms = (
+                            (time.time() - verify_start_wall_time) * 1000
+                            if verify_start_wall_time is not None
+                            else 0.0
+                        )
+                    else:
+                        raise
+            else:
+                # Event wait failed, use wall-clock time
+                verification_time_ms = (
+                    (time.time() - verify_start_wall_time) * 1000
+                    if verify_start_wall_time is not None
+                    else 0.0
+                )
         else:
             # Fallback to barrier synchronization
             if self.verification_stream is not None:

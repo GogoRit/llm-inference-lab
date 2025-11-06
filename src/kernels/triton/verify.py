@@ -38,9 +38,15 @@ def verify_prefix_triton_kernel(
         target_id = tl.load(draft_ids_ptr + draft_id_offset)
 
         # Find argmax in logits[batch_idx][k][:]
-        max_val = -float("inf")
+        # CRITICAL FIX: Initialize max_val by loading first value to match dtype (fp16/fp32)
+        # This prevents type mismatch errors when logits are fp16
+        # Using the first logit value ensures perfect dtype matching
+        first_logit_offset = batch_idx * logits_stride_b + k * logits_stride_k
+        max_val = tl.load(logits_ptr + first_logit_offset)
         argmax_idx = 0
 
+        # Process remaining values (skip v=0 since we already loaded it as initial max_val)
+        # Edge case: If V == 1, this loop won't execute any iterations, which is correct
         for v_start in range(0, V, BLOCK_SIZE):
             v_end = min(v_start + BLOCK_SIZE, V)
             v_range = v_end - v_start
@@ -53,7 +59,10 @@ def verify_prefix_triton_kernel(
             )
 
             # Vectorized argmax within chunk
-            for v in range(v_range):
+            # For first chunk (v_start=0), skip v=0 since we already loaded it
+            # For subsequent chunks, process all values
+            start_v = 1 if v_start == 0 else 0
+            for v in range(start_v, v_range):
                 val = tl.load(logits_ptr + logits_offset + v * logits_stride_v)
                 if val > max_val:
                     max_val = val
@@ -136,5 +145,9 @@ def verify_prefix_triton(
         accepted_mask_stride_k,
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+    # CRITICAL FIX: Synchronize to catch kernel errors early
+    # This ensures any dtype mismatch or other errors are caught before returning
+    torch.cuda.synchronize()
 
     return accept_len, accepted_mask
