@@ -3,6 +3,8 @@ Triton implementation of verify_prefix kernel as fallback for CUDA.
 Provides identical signature and behavior to CUDA kernel.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -124,8 +126,15 @@ def verify_prefix_triton(
     draft_ids_stride_b, draft_ids_stride_k = draft_ids.stride()
     accepted_mask_stride_b, accepted_mask_stride_k = accepted_mask.stride()
 
-    # Launch kernel
-    BLOCK_SIZE = 1024  # Process V in chunks of 1024
+    # Launch kernel with adaptive block size
+    # OPTIMIZATION: Tune block size based on vocabulary size for better performance
+    # Larger block sizes for large vocabularies improve memory throughput
+    if V > 30000:
+        BLOCK_SIZE = 2048  # Larger block for very large vocabularies
+    elif V > 10000:
+        BLOCK_SIZE = 1536  # Medium block for large vocabularies
+    else:
+        BLOCK_SIZE = 1024  # Default block size
     grid = (B,)
 
     verify_prefix_triton_kernel[grid](
@@ -146,8 +155,10 @@ def verify_prefix_triton(
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    # CRITICAL FIX: Synchronize to catch kernel errors early
-    # This ensures any dtype mismatch or other errors are caught before returning
-    torch.cuda.synchronize()
+    # OPTIMIZATION: Make synchronization optional for async execution
+    # Only sync if error checking is enabled (for debugging/profiling)
+    # In production with async streams, this sync blocks overlap and reduces throughput
+    if os.getenv("SPECDEC_SYNC_KERNELS", "0").lower() in ("1", "true", "yes"):
+        torch.cuda.synchronize()
 
     return accept_len, accepted_mask

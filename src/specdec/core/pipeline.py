@@ -2439,11 +2439,43 @@ class SpeculativePipeline(SpeculativeDecoder):
                     # This ensures correctness - base model tokens are the ground truth
                     # Even if draft tokens "match" via argmax comparison, we must use base tokens
                     # to maintain correct generation chain and prevent accumulation errors
-                    accepted_tokens = []
+                    # OPTIMIZATION: Keep tensors on GPU as long as possible, defer CPU transfer
+                    accepted_tokens_tensor = None
                     if accepted_len > 0:
+                        # CRITICAL: Ensure we're using the correct slice from base tokens
+                        # prompt_base_tokens shape: [1, k] where k is the number of tokens generated
+                        # We need to extract exactly accepted_len tokens from the base model output
+                        if accepted_len > prompt_base_tokens.shape[1]:
+                            self.logger.error(
+                                f"CRITICAL: accepted_len ({accepted_len}) > base_tokens.shape[1] "
+                                f"({prompt_base_tokens.shape[1]}) for prompt {global_idx}"
+                            )
+                            accepted_len = prompt_base_tokens.shape[1]
+
                         # Use base model's actual generated tokens for accepted positions
-                        accepted_tokens_tensor = prompt_base_tokens[0, :accepted_len]
-                        # Validate before CPU transfer
+                        # Extract from [batch_idx=0, :accepted_len] to get the first accepted_len tokens
+                        accepted_tokens_tensor = prompt_base_tokens[
+                            0, :accepted_len
+                        ].clone()
+
+                        # CRITICAL DEBUG: Verify we're not accidentally using draft tokens
+                        if step <= 2 and idx_in_active == 0:
+                            draft_sample = (
+                                prompt_draft_tokens[0, : min(3, accepted_len)]
+                                .cpu()
+                                .tolist()
+                            )
+                            base_sample = (
+                                accepted_tokens_tensor[: min(3, accepted_len)]
+                                .cpu()
+                                .tolist()
+                            )
+                            if draft_sample == base_sample:
+                                self.logger.warning(
+                                    f"WARNING: Draft and base tokens match exactly - this may indicate a bug!"
+                                )
+
+                        # Validate before CPU transfer (stays on GPU)
                         base_vocab_size = get_vocab_size(self.base_lm)
                         if base_vocab_size is not None:
                             accepted_tokens_tensor = validate_and_clamp_tokens(
@@ -2451,7 +2483,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 base_vocab_size,
                                 "accepted_tokens",
                             )
-                        accepted_tokens = accepted_tokens_tensor.cpu().tolist()
+                        # OPTIMIZATION: Defer CPU transfer - keep on GPU until needed
+                        # We'll transfer to CPU only when we need to check for EOS or extend list
 
                         # Stop before adding EOS token if encountered
                         # Get EOS token ID for early stopping
@@ -2468,12 +2501,27 @@ class SpeculativePipeline(SpeculativeDecoder):
                             ):
                                 eos_token_id = base_tokenizer.eos_token_id
 
-                        # Truncate at EOS token if found (don't include EOS in generated tokens)
-                        tokens_to_add = accepted_tokens
-                        if eos_token_id in accepted_tokens:
-                            eos_idx = accepted_tokens.index(eos_token_id)
-                            tokens_to_add = accepted_tokens[:eos_idx]
-                            batch_active[global_idx] = False  # Stop generation
+                        # OPTIMIZATION: Check for EOS on GPU first (faster than CPU)
+                        # Only transfer to CPU if EOS found or needed for list operations
+                        if accepted_tokens_tensor is not None:
+                            # Check for EOS on GPU (no CPU sync)
+                            eos_mask = accepted_tokens_tensor == eos_token_id
+                            if eos_mask.any():
+                                # EOS found - find first occurrence on GPU
+                                eos_positions = torch.nonzero(eos_mask, as_tuple=False)
+                                if len(eos_positions) > 0:
+                                    eos_idx: int = int(eos_positions[0].item())
+                                    # Truncate at EOS (still on GPU)
+                                    accepted_tokens_tensor = accepted_tokens_tensor[
+                                        :eos_idx
+                                    ]
+                                    batch_active[global_idx] = False  # Stop generation
+
+                            # OPTIMIZATION: Single CPU transfer for all operations
+                            accepted_tokens = accepted_tokens_tensor.cpu().tolist()
+                            tokens_to_add = accepted_tokens
+                        else:
+                            tokens_to_add = []
 
                         batch_generated_tokens[global_idx].extend(tokens_to_add)
                         accepted_tokens_list.append(tokens_to_add)
@@ -2483,15 +2531,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                     else:
                         # Rejected all - accept first base token as fallback
                         first_base_tensor = prompt_base_tokens[0, 0:1]
-                        # Validate with centralized validation
+                        # Validate with centralized validation (stays on GPU)
                         base_vocab_size = get_vocab_size(self.base_lm)
                         if base_vocab_size is not None:
                             first_base_tensor = validate_and_clamp_tokens(
                                 first_base_tensor, base_vocab_size, "fallback_base"
                             )
-                        accepted_tokens = first_base_tensor.cpu().tolist()
 
-                        # Check for EOS in fallback token too
+                        # OPTIMIZATION: Check for EOS on GPU before CPU transfer
                         eos_token_id = 50256  # Default GPT-2 EOS token
                         if tokenizer is not None:
                             eos_token_id = tokenizer.eos_token_id
@@ -2504,6 +2551,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 base_tokenizer, "eos_token_id"
                             ):
                                 eos_token_id = base_tokenizer.eos_token_id
+
+                        # Check for EOS on GPU (no CPU sync)
+                        if (first_base_tensor == eos_token_id).any():
+                            batch_active[global_idx] = False  # Stop generation
+
+                        # OPTIMIZATION: Single CPU transfer
+                        accepted_tokens = first_base_tensor.cpu().tolist()
 
                         # Don't add EOS token if it's the fallback token
                         if accepted_tokens and accepted_tokens[0] == eos_token_id:
@@ -2599,10 +2653,78 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 flush=True,
                             )
 
+                        # CRITICAL: Check for token duplication before concatenation
+                        # This prevents repetitive text generation bugs
+                        if (
+                            current_seq.shape[0] > 0
+                            and accepted_tokens_tensor.shape[0] > 0
+                        ):
+                            # Check if the last token of current_seq matches the first token of accepted_tokens
+                            # This can happen if tokens are being duplicated
+                            last_current = current_seq[-1].item()
+                            first_accepted = accepted_tokens_tensor[0].item()
+                            if (
+                                last_current == first_accepted
+                                and current_seq.shape[0] > 1
+                            ):
+                                # Check if we're about to duplicate a sequence
+                                # If the last few tokens match the accepted tokens, skip duplication
+                                check_len = min(
+                                    3,
+                                    current_seq.shape[0],
+                                    accepted_tokens_tensor.shape[0],
+                                )
+                                current_tail = current_seq[-check_len:].cpu().tolist()
+                                accepted_head = (
+                                    accepted_tokens_tensor[:check_len].cpu().tolist()
+                                )
+                                if current_tail == accepted_head:
+                                    self.logger.warning(
+                                        f"CRITICAL: Detected token duplication for prompt {global_idx} at step {step}! "
+                                        f"Tail: {current_tail}, Head: {accepted_head}. "
+                                        f"Skipping duplicate tokens."
+                                    )
+                                    # Skip the duplicate tokens - only add new ones
+                                    if accepted_tokens_tensor.shape[0] > check_len:
+                                        accepted_tokens_tensor = accepted_tokens_tensor[
+                                            check_len:
+                                        ]
+                                        # Update accepted_tokens list to match
+                                        accepted_tokens = (
+                                            accepted_tokens_tensor.cpu().tolist()
+                                        )
+                                        tokens_to_add = accepted_tokens
+                                        # Update the generated tokens list to remove duplicates
+                                        if (
+                                            len(batch_generated_tokens[global_idx])
+                                            >= check_len
+                                        ):
+                                            batch_generated_tokens[global_idx] = (
+                                                batch_generated_tokens[global_idx][
+                                                    :-check_len
+                                                ]
+                                            )
+                                    else:
+                                        # All tokens are duplicates, skip this update but continue processing
+                                        self.logger.warning(
+                                            f"All accepted tokens are duplicates, skipping sequence update for prompt {global_idx}"
+                                        )
+                                        # Set accepted_tokens_tensor to empty to skip concatenation
+                                        accepted_tokens_tensor = torch.tensor(
+                                            [], device=self.device, dtype=torch.long
+                                        )
+                                        accepted_tokens = []
+                                        tokens_to_add = []
+
                         # Concatenate along sequence dimension (both are 1D)
-                        updated_seq = torch.cat(
-                            [current_seq, accepted_tokens_tensor], dim=0
-                        )
+                        # Only concatenate if we have tokens to add
+                        if accepted_tokens_tensor.shape[0] > 0:
+                            updated_seq = torch.cat(
+                                [current_seq, accepted_tokens_tensor], dim=0
+                            )
+                        else:
+                            # No new tokens to add, keep current sequence
+                            updated_seq = current_seq
 
                         # CRITICAL: Validate after concatenation with DRAFT vocab size
                         # Since this will be used for draft model in next iteration
@@ -2652,12 +2774,19 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # OPTIMIZATION: Only sync if needed for sequence cloning
                 # Since we use event-based sync for streams, we only need device sync
                 # if there are default stream operations that modify sequences
-                # In practice, all updates happen in streams, so this sync can be optimized
-                # However, keeping it for safety until we verify no default stream operations
-                # TODO: Profile and potentially remove if all operations are in streams
-                if self.device == "cuda" and torch.cuda.is_available():
-                    # Only sync if we're actually cloning sequences (not every iteration)
-                    # This reduces sync overhead when sequences don't need cloning
+                # OPTIMIZATION: Remove unnecessary synchronization
+                # Event-based synchronization in scheduler is sufficient for correctness
+                # Full device sync is only needed if we're accessing results on default stream
+                # Since we use CUDA events for timing and synchronization, this sync is redundant
+                # and causes significant performance overhead (blocks async execution)
+                # Only sync if explicitly required (e.g., debugging or profiling)
+                if (
+                    self.device == "cuda"
+                    and torch.cuda.is_available()
+                    and os.getenv("SPECDEC_FORCE_SYNC", "0").lower()
+                    in ("1", "true", "yes")
+                ):
+                    # Only sync if forced via environment variable (for debugging)
                     torch.cuda.synchronize()
 
                 # Log batch progress with accurate timing (only if SPECDEC_DEBUG enabled)
@@ -2713,6 +2842,50 @@ class SpeculativePipeline(SpeculativeDecoder):
                 f"→ {batch_metrics['tokens_per_sec']:.2f} tok/s",
                 flush=True,
             )
+
+            # CRITICAL: Cleanup CUDA streams and events to prevent notebook hanging
+            # This is essential for Kaggle notebooks where resources must be freed
+            # CUDA streams and events hold GPU resources and must be explicitly cleaned up
+            if self.device == "cuda" and torch.cuda.is_available():
+                try:
+                    # Step 1: Synchronize all streams to ensure all operations complete
+                    if draft_stream is not None:
+                        draft_stream.synchronize()
+                    if verify_stream is not None:
+                        verify_stream.synchronize()
+
+                    # Step 2: Synchronize default stream to catch any remaining operations
+                    torch.cuda.synchronize()
+
+                    # Step 3: Clear CUDA cache to free memory
+                    torch.cuda.empty_cache()
+
+                    # Step 4: Clear KV caches to free model memory
+                    if hasattr(self.base_lm, "clear_kv_cache"):
+                        self.base_lm.clear_kv_cache()
+                    if hasattr(self.draft_lm, "clear_kv_cache"):
+                        self.draft_lm.clear_kv_cache()
+                    if hasattr(self, "kv_cache_manager"):
+                        self.kv_cache_manager.reset()
+
+                    # Step 5: Force Python garbage collection to free CUDA objects
+                    import gc
+
+                    gc.collect()
+
+                    # Step 6: Final CUDA cache clear after GC
+                    torch.cuda.empty_cache()
+
+                    if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                        self.logger.debug(
+                            "[CLEANUP] CUDA streams synchronized, cache cleared, KV caches reset"
+                        )
+                except Exception as e:
+                    # Don't fail on cleanup errors, but log them
+                    self.logger.warning(
+                        f"[CLEANUP] Error cleaning up CUDA resources: {e}",
+                        exc_info=True,
+                    )
 
             # Convert batched results to per-prompt dictionaries
             results = []

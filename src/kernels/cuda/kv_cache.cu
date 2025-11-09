@@ -5,60 +5,91 @@
 // Appends K accepted key/value blocks from draft KV to base KV at target offset
 // Optimized for coalesced loads/stores
 
+// OPTIMIZED KV cache append kernel
+// OPTIMIZATIONS APPLIED:
+// 1. Improved grid configuration for better GPU occupancy
+// 2. Coalesced memory access patterns
+// 3. Read-only cache hints (__ldg) for input data
+// 4. Reduced branch divergence in accepted mask processing
 template<typename T>
 __global__ void kv_append_kernel(
-    const T* base_k,           // [B][H][L][D] - base key cache
-    const T* base_v,           // [B][H][L][D] - base value cache
-    const T* draft_k,          // [B][H][K][D] - draft key cache
-    const T* draft_v,          // [B][H][K][D] - draft value cache
-    T* output_k,               // [B][H][L+K][D] - output key cache
-    T* output_v,               // [B][H][L+K][D] - output value cache
-    const uint8_t* accepted_mask, // [B][K] - which draft positions to append
-    const int32_t* accept_len,    // [B] - how many to append per batch
+    const T* __restrict__ base_k,           // [B][H][L][D] - base key cache
+    const T* __restrict__ base_v,           // [B][H][L][D] - base value cache
+    const T* __restrict__ draft_k,          // [B][H][K][D] - draft key cache
+    const T* __restrict__ draft_v,          // [B][H][K][D] - draft value cache
+    T* __restrict__ output_k,               // [B][H][L+K][D] - output key cache
+    T* __restrict__ output_v,               // [B][H][L+K][D] - output value cache
+    const uint8_t* __restrict__ accepted_mask, // [B][K] - which draft positions to append
+    const int32_t* __restrict__ accept_len,    // [B] - how many to append per batch
     int B, int H, int L, int K, int D,
     int offset                 // where to start appending in base cache
 ) {
-    int batch_idx = blockIdx.y;
-    int head_idx = blockIdx.x;
-    int tid = threadIdx.x;
+    // OPTIMIZATION: Use 1D grid for better occupancy
+    // Calculate batch and head indices from linear block index
+    int linear_idx = blockIdx.x;
+    int batch_idx = linear_idx / H;
+    int head_idx = linear_idx % H;
     
     if (batch_idx >= B || head_idx >= H) return;
     
-    int num_accepted = accept_len[batch_idx];
+    int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    
+    // Use read-only cache for accept_len
+    int num_accepted = __ldg(&accept_len[batch_idx]);
     if (num_accepted == 0) return;
     
-    // Copy base cache first
-    int base_size = L * D;
-    int base_offset = batch_idx * H * L * D + head_idx * L * D;
-    int output_base_offset = batch_idx * H * (L + K) * D + head_idx * (L + K) * D;
+    // Copy base cache first (coalesced access)
+    const int base_size = L * D;
+    const int base_offset = batch_idx * H * L * D + head_idx * L * D;
+    const int output_base_offset = batch_idx * H * (L + K) * D + head_idx * (L + K) * D;
     
-    // Copy base keys and values
-    for (int i = tid; i < base_size; i += blockDim.x) {
+    // OPTIMIZATION: Coalesced copy of base keys and values
+    // Use read-only cache for base cache (input data)
+    for (int i = tid; i < base_size; i += block_size) {
         int src_idx = base_offset + i;
         int dst_idx = output_base_offset + i;
-        output_k[dst_idx] = base_k[src_idx];
-        output_v[dst_idx] = base_v[src_idx];
+        // Use __ldg for read-only cache optimization
+        output_k[dst_idx] = __ldg(&base_k[src_idx]);
+        output_v[dst_idx] = __ldg(&base_v[src_idx]);
     }
     
+    // OPTIMIZATION: Only sync if we need to ensure base copy completes
+    // before draft append (they're independent, so sync may not be needed)
+    // However, keeping it for correctness in case of memory dependencies
     __syncthreads();
     
-    // Append accepted draft positions
-    int draft_offset = batch_idx * H * K * D + head_idx * K * D;
-    int output_draft_offset = output_base_offset + L * D;
+    // OPTIMIZATION: Pre-compute accepted indices to reduce branch divergence
+    // Use shared memory to store accepted positions
+    __shared__ int accepted_indices[32];  // Max K typically <= 8, but allow up to 32
+    __shared__ int num_accepted_shared;
     
-    int accepted_count = 0;
-    for (int k = 0; k < K && accepted_count < num_accepted; k++) {
-        int mask_idx = batch_idx * K + k;
-        if (accepted_mask[mask_idx]) {
-            int src_offset = draft_offset + k * D;
-            int dst_offset = output_draft_offset + accepted_count * D;
-            
-            // Copy this position's key and value
-            for (int d = tid; d < D; d += blockDim.x) {
-                output_k[dst_offset + d] = draft_k[src_offset + d];
-                output_v[dst_offset + d] = draft_v[src_offset + d];
+    if (tid == 0) {
+        num_accepted_shared = 0;
+        // Pre-compute accepted indices (sequential, but only done once per block)
+        for (int k = 0; k < K && num_accepted_shared < num_accepted; k++) {
+            int mask_idx = batch_idx * K + k;
+            if (__ldg(&accepted_mask[mask_idx])) {
+                accepted_indices[num_accepted_shared++] = k;
             }
-            accepted_count++;
+        }
+    }
+    __syncthreads();
+    
+    // Append accepted draft positions (now with reduced branch divergence)
+    const int draft_offset = batch_idx * H * K * D + head_idx * K * D;
+    const int output_draft_offset = output_base_offset + L * D;
+    
+    // Copy accepted positions (no branching in inner loop)
+    for (int accepted_idx = 0; accepted_idx < num_accepted_shared; accepted_idx++) {
+        int k = accepted_indices[accepted_idx];
+        int src_offset = draft_offset + k * D;
+        int dst_offset = output_draft_offset + accepted_idx * D;
+        
+        // OPTIMIZATION: Coalesced copy with read-only cache
+        for (int d = tid; d < D; d += block_size) {
+            output_k[dst_offset + d] = __ldg(&draft_k[src_offset + d]);
+            output_v[dst_offset + d] = __ldg(&draft_v[src_offset + d]);
         }
     }
 }
@@ -96,9 +127,13 @@ std::vector<torch::Tensor> kv_append_cuda(
     auto output_k = torch::zeros({B, H, L + K, D}, base_k.options());
     auto output_v = torch::zeros({B, H, L + K, D}, base_v.options());
     
-    // Launch kernel
-    dim3 block(256);
-    dim3 grid(H, B);
+    // Launch kernel with optimized grid configuration
+    // OPTIMIZATION: Use 1D grid for better GPU occupancy
+    // This allows better work distribution across SMs
+    const int threads_per_block = 256;
+    dim3 block(threads_per_block);
+    // 1D grid: One block per (batch, head) pair
+    dim3 grid(B * H);
     
     if (base_k.dtype() == torch::kFloat32) {
         kv_append_kernel<float><<<grid, block>>>(
