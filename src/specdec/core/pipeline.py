@@ -35,27 +35,27 @@ logger = logging.getLogger(__name__)
 
 # Import optimization modules (conditional to avoid import errors during development)
 try:
-    from benchmarks.profiler import create_profiler
-    from metrics.structured_profiler import create_structured_profiler
-    from optimization import (
+    from src.benchmarks.profiler import create_profiler
+    from src.metrics.structured_profiler import create_structured_profiler
+    from src.optimization import (
         amp_context,
         create_optimization_manager,
         create_optimized_tokenizer,
         select_device_dtype,
     )
-    from scheduler import create_speculative_scheduler
+    from src.scheduler import create_speculative_scheduler
 except ImportError:
     # Fallback for development - create dummy functions
-    def create_optimization_manager(*args, **kwargs):
+    def create_optimization_manager(*args, **kwargs):  # type: ignore[misc]
         return None
 
-    def create_optimized_tokenizer(*args, **kwargs):
+    def create_optimized_tokenizer(*args, **kwargs):  # type: ignore[misc]
         return None
 
-    def create_profiler(*args, **kwargs):
+    def create_profiler(*args, **kwargs):  # type: ignore[misc]
         return None
 
-    def create_structured_profiler(*args, **kwargs):
+    def create_structured_profiler(*args, **kwargs):  # type: ignore[misc]
         # Return dummy structured profiler for development
         class DummyProfiler:
             enable_profiling = False
@@ -68,13 +68,13 @@ except ImportError:
 
         return DummyProfiler()
 
-    def create_speculative_scheduler(*args, **kwargs):
+    def create_speculative_scheduler(*args, **kwargs):  # type: ignore[misc]
         return None
 
-    def select_device_dtype(device="auto"):
+    def select_device_dtype(device="auto"):  # type: ignore[misc]
         return device, torch.float32, False
 
-    def amp_context(device, dtype):
+    def amp_context(device, dtype):  # type: ignore[misc]
         return torch.no_grad()
 
 
@@ -1729,15 +1729,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                         active_attention_mask[i, orig_len:] = 0
 
                 # Debug: validate input_ids are not all padding (GPU-only, defer CPU sync)
-                # Only sync to CPU if needed for debug logging (gated by SPECDEC_DEBUG)
-                non_pad_tokens_tensor = (active_input_ids != pad_value).sum()
-                total_tokens = active_input_ids.numel()
-                # Only compute .item() if debug logging is enabled
-                non_pad_tokens = (
-                    non_pad_tokens_tensor.item()
-                    if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes")
-                    else non_pad_tokens_tensor
-                )
+                # OPTIMIZATION: Avoid CPU transfer for debug logging unless needed
+                # Keep calculations on GPU to reduce CPU-GPU overhead
+                if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                    non_pad_tokens_tensor = (active_input_ids != pad_value).sum()
+                    total_tokens = active_input_ids.numel()
+                    non_pad_tokens = non_pad_tokens_tensor.item()
+                else:
+                    # Skip calculation entirely if not debugging
+                    non_pad_tokens = 0
+                    total_tokens = 0
 
                 if step == 1 and os.getenv("SPECDEC_DEBUG", "0").lower() in (
                     "1",
@@ -2089,10 +2090,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if verify_end_event is not None:
                         verify_end_event.synchronize()
 
-                    # OPTIMIZATION: Event synchronization is sufficient for stream operations
-                    # Full device sync only needed if default stream operations exist
-                    # Since we use event-based sync, we can avoid full device sync here
-                    # This reduces CPU-GPU synchronization overhead and improves GPU utilization
+                    # CRITICAL FIX: Always sync device after event sync to ensure clean GPU state
+                    # Event sync ensures streams are synchronized, but device sync ensures
+                    # all operations complete before we access results. This is essential
+                    # for Kaggle notebooks to prevent unresponsiveness.
+                    if self.device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
 
                     # Calculate verify time using CUDA events if available
                     if verify_start_event is not None and verify_end_event is not None:
@@ -2192,10 +2195,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if verify_end_event is not None:
                         verify_end_event.synchronize()
 
-                    # OPTIMIZATION: Event synchronization is sufficient for stream operations
-                    # Full device sync only needed if default stream operations exist
-                    # Since we use event-based sync, we can avoid full device sync here
-                    # This reduces CPU-GPU synchronization overhead and improves GPU utilization
+                    # CRITICAL FIX: Always sync device after event sync to ensure clean GPU state
+                    # Event sync ensures streams are synchronized, but device sync ensures
+                    # all operations complete before we access results. This is essential
+                    # for Kaggle notebooks to prevent unresponsiveness.
+                    if self.device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
 
                     # Calculate verify time using CUDA events if available
                     if verify_start_event is not None and verify_end_event is not None:
@@ -2459,21 +2464,31 @@ class SpeculativePipeline(SpeculativeDecoder):
                         ].clone()
 
                         # CRITICAL DEBUG: Verify we're not accidentally using draft tokens
-                        if step <= 2 and idx_in_active == 0:
-                            draft_sample = (
-                                prompt_draft_tokens[0, : min(3, accepted_len)]
-                                .cpu()
-                                .tolist()
+                        # OPTIMIZATION: Only do this check if debug mode is enabled to avoid CPU transfers
+                        if (
+                            step <= 2
+                            and idx_in_active == 0
+                            and os.getenv("SPECDEC_DEBUG", "0").lower()
+                            in ("1", "true", "yes")
+                        ):
+                            # Compare on GPU first to avoid unnecessary CPU transfer
+                            max_cmp_len = min(
+                                3, accepted_len, prompt_draft_tokens.shape[1]
                             )
-                            base_sample = (
-                                accepted_tokens_tensor[: min(3, accepted_len)]
-                                .cpu()
-                                .tolist()
-                            )
-                            if draft_sample == base_sample:
-                                self.logger.warning(
-                                    f"WARNING: Draft and base tokens match exactly - this may indicate a bug!"
+                            if max_cmp_len > 0:
+                                draft_sample_gpu = prompt_draft_tokens[0, :max_cmp_len]
+                                base_sample_gpu = accepted_tokens_tensor[:max_cmp_len]
+                                # Check on GPU
+                                tokens_match = torch.all(
+                                    draft_sample_gpu == base_sample_gpu
                                 )
+                                if tokens_match:
+                                    # Only transfer to CPU if there's a potential issue
+                                    draft_sample = draft_sample_gpu.cpu().tolist()
+                                    base_sample = base_sample_gpu.cpu().tolist()
+                                    self.logger.warning(
+                                        f"WARNING: Draft and base tokens match exactly - draft: {draft_sample}, base: {base_sample}"
+                                    )
 
                         # Validate before CPU transfer (stays on GPU)
                         base_vocab_size = get_vocab_size(self.base_lm)
@@ -2510,6 +2525,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 # EOS found - find first occurrence on GPU
                                 eos_positions = torch.nonzero(eos_mask, as_tuple=False)
                                 if len(eos_positions) > 0:
+                                    # Use GPU-only operation to get index, only .item() when necessary
                                     eos_idx: int = int(eos_positions[0].item())
                                     # Truncate at EOS (still on GPU)
                                     accepted_tokens_tensor = accepted_tokens_tensor[
@@ -2518,12 +2534,50 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     batch_active[global_idx] = False  # Stop generation
 
                             # OPTIMIZATION: Single CPU transfer for all operations
+                            # Convert to list ONCE at the end
                             accepted_tokens = accepted_tokens_tensor.cpu().tolist()
+
+                            # CRITICAL: Check for duplication BEFORE adding to batch_generated_tokens
+                            # This prevents repetitive text patterns like "TheTheTheTheThe"
+                            # OPTIMIZATION: Simplify duplication detection - only check for direct overlap
+                            # This reduces CPU overhead while still catching most duplication issues
+                            if (
+                                len(batch_generated_tokens[global_idx]) > 0
+                                and len(accepted_tokens) > 0
+                            ):
+                                generated_so_far = batch_generated_tokens[global_idx]
+
+                                # Only check for phrase repetition (covers single token repetition too)
+                                # Check if last N tokens of generated match first N tokens of accepted
+                                for check_len in range(
+                                    min(5, len(generated_so_far), len(accepted_tokens)),
+                                    0,
+                                    -1,
+                                ):
+                                    generated_tail = generated_so_far[-check_len:]
+                                    accepted_head = accepted_tokens[:check_len]
+                                    if generated_tail == accepted_head:
+                                        # Found duplication - skip the duplicate tokens
+                                        if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                                            "1",
+                                            "true",
+                                            "yes",
+                                        ):
+                                            self.logger.warning(
+                                                f"CRITICAL: Detected {check_len}-token overlap "
+                                                f"for prompt {global_idx} at step {step}. Skipping duplicates."
+                                            )
+                                        # Skip the duplicate tokens
+                                        accepted_tokens = accepted_tokens[check_len:]
+                                        break
+
                             tokens_to_add = accepted_tokens
                         else:
                             tokens_to_add = []
 
-                        batch_generated_tokens[global_idx].extend(tokens_to_add)
+                        # Only add non-empty tokens
+                        if tokens_to_add:
+                            batch_generated_tokens[global_idx].extend(tokens_to_add)
                         accepted_tokens_list.append(tokens_to_add)
                         # Update accepted_tokens for use in sequence update below
                         accepted_tokens = tokens_to_add
@@ -2564,10 +2618,24 @@ class SpeculativePipeline(SpeculativeDecoder):
                             accepted_tokens = []
                             batch_active[global_idx] = False
 
+                        # CRITICAL: Check for duplication in fallback case too
                         if accepted_tokens:
-                            batch_generated_tokens[global_idx].extend(accepted_tokens)
+                            # Check for duplication before adding
+                            generated_so_far = batch_generated_tokens[global_idx]
+                            if len(generated_so_far) > 0 and len(accepted_tokens) > 0:
+                                if generated_so_far[-1] == accepted_tokens[0]:
+                                    self.logger.warning(
+                                        f"CRITICAL: Detected token duplication in fallback for prompt {global_idx} at step {step}. "
+                                        f"Skipping duplicate token {accepted_tokens[0]}"
+                                    )
+                                    accepted_tokens = []
+
+                            if accepted_tokens:
+                                batch_generated_tokens[global_idx].extend(
+                                    accepted_tokens
+                                )
                             accepted_tokens_list.append(accepted_tokens)
-                            accepted_len = 1
+                            accepted_len = len(accepted_tokens)
                         else:
                             accepted_len = 0
                         if step <= 3 or idx_in_active == 0:
@@ -2653,37 +2721,41 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 flush=True,
                             )
 
-                        # CRITICAL: Check for token duplication before concatenation
+                        # CRITICAL: Check for token duplication before concatenation on GPU
                         # This prevents repetitive text generation bugs
+                        # OPTIMIZATION: Do all comparisons on GPU, only transfer to CPU if issue detected
                         if (
                             current_seq.shape[0] > 0
                             and accepted_tokens_tensor.shape[0] > 0
                         ):
-                            # Check if the last token of current_seq matches the first token of accepted_tokens
-                            # This can happen if tokens are being duplicated
-                            last_current = current_seq[-1].item()
-                            first_accepted = accepted_tokens_tensor[0].item()
-                            if (
-                                last_current == first_accepted
-                                and current_seq.shape[0] > 1
-                            ):
-                                # Check if we're about to duplicate a sequence
-                                # If the last few tokens match the accepted tokens, skip duplication
-                                check_len = min(
-                                    3,
-                                    current_seq.shape[0],
-                                    accepted_tokens_tensor.shape[0],
-                                )
-                                current_tail = current_seq[-check_len:].cpu().tolist()
-                                accepted_head = (
-                                    accepted_tokens_tensor[:check_len].cpu().tolist()
-                                )
-                                if current_tail == accepted_head:
-                                    self.logger.warning(
-                                        f"CRITICAL: Detected token duplication for prompt {global_idx} at step {step}! "
-                                        f"Tail: {current_tail}, Head: {accepted_head}. "
-                                        f"Skipping duplicate tokens."
-                                    )
+                            # Check on GPU first - avoid unnecessary CPU transfers
+                            check_len = min(
+                                5,  # Check up to 5 tokens for overlap
+                                current_seq.shape[0],
+                                accepted_tokens_tensor.shape[0],
+                            )
+                            if check_len > 0:
+                                # Compare tensors on GPU
+                                current_tail = current_seq[-check_len:]
+                                accepted_head = accepted_tokens_tensor[:check_len]
+                                tokens_match = torch.all(current_tail == accepted_head)
+
+                                if tokens_match:
+                                    # Only log and transfer to CPU if duplication detected
+                                    if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                                        "1",
+                                        "true",
+                                        "yes",
+                                    ):
+                                        current_tail_list = current_tail.cpu().tolist()
+                                        accepted_head_list = (
+                                            accepted_head.cpu().tolist()
+                                        )
+                                        self.logger.warning(
+                                            f"CRITICAL: Detected {check_len}-token duplication for prompt {global_idx} at step {step}! "
+                                            f"Tail: {current_tail_list}, Head: {accepted_head_list}. Skipping duplicates."
+                                        )
+
                                     # Skip the duplicate tokens - only add new ones
                                     if accepted_tokens_tensor.shape[0] > check_len:
                                         accepted_tokens_tensor = accepted_tokens_tensor[
@@ -2705,11 +2777,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                                                 ]
                                             )
                                     else:
-                                        # All tokens are duplicates, skip this update but continue processing
-                                        self.logger.warning(
-                                            f"All accepted tokens are duplicates, skipping sequence update for prompt {global_idx}"
-                                        )
-                                        # Set accepted_tokens_tensor to empty to skip concatenation
+                                        # All tokens are duplicates, skip this update
+                                        if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                                            "1",
+                                            "true",
+                                            "yes",
+                                        ):
+                                            self.logger.warning(
+                                                f"All accepted tokens are duplicates, skipping sequence update for prompt {global_idx}"
+                                            )
                                         accepted_tokens_tensor = torch.tensor(
                                             [], device=self.device, dtype=torch.long
                                         )
@@ -2741,9 +2817,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # Same pattern as KV cache updates: detach().contiguous() for safety
                         updated_seq = updated_seq.detach().clone().contiguous()
 
+                        # CRITICAL FIX: Ensure GPU operations complete before updating sequence
+                        # This prevents race conditions where sequence update happens before
+                        # GPU operations (concatenation, cloning) complete, which can cause
+                        # token duplication and notebook unresponsiveness
+                        if self.device == "cuda" and torch.cuda.is_available():
+                            # Quick sync to ensure concatenation and cloning are complete
+                            torch.cuda.synchronize()
+
                         # Update sequence (keep as 1D list item, no padding)
-                        # Note: We synchronize ONCE after all updates (at end of loop)
-                        # to match KV cache pattern: batch updates, then sync
                         current_input_ids[global_idx] = updated_seq
                     else:
                         # No tokens accepted - log warning but continue with next base token
@@ -2771,23 +2853,26 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if hasattr(self.draft_lm, "clear_kv_cache"):
                         self.draft_lm.clear_kv_cache()
 
-                # OPTIMIZATION: Only sync if needed for sequence cloning
-                # Since we use event-based sync for streams, we only need device sync
-                # if there are default stream operations that modify sequences
-                # OPTIMIZATION: Remove unnecessary synchronization
-                # Event-based synchronization in scheduler is sufficient for correctness
-                # Full device sync is only needed if we're accessing results on default stream
-                # Since we use CUDA events for timing and synchronization, this sync is redundant
-                # and causes significant performance overhead (blocks async execution)
-                # Only sync if explicitly required (e.g., debugging or profiling)
-                if (
-                    self.device == "cuda"
-                    and torch.cuda.is_available()
-                    and os.getenv("SPECDEC_FORCE_SYNC", "0").lower()
-                    in ("1", "true", "yes")
-                ):
-                    # Only sync if forced via environment variable (for debugging)
-                    torch.cuda.synchronize()
+                # OPTIMIZATION: Only synchronize periodically, not every iteration
+                # Excessive synchronization causes high CPU usage (100%) and slow performance
+                # Use CUDA events for async execution instead of barrier synchronization
+                # Only synchronize when necessary to reduce CPU-GPU overhead
+                if self.device == "cuda" and torch.cuda.is_available():
+                    # Only synchronize every 10 steps or on last step to reduce CPU overhead
+                    # Event-based sync in scheduler handles async correctness
+                    if step % 10 == 0 or not any(batch_active):
+                        torch.cuda.synchronize()
+
+                    # OPTIMIZATION: Clear CUDA cache periodically to prevent memory leak
+                    # Clear every 20 steps to prevent gradual GPU memory accumulation
+                    if step % 20 == 0:
+                        torch.cuda.empty_cache()
+                        # Also clear KV caches periodically if they exist
+                        if not kv_cache_reset_needed:  # Don't double-clear
+                            if hasattr(self.base_lm, "clear_kv_cache"):
+                                self.base_lm.clear_kv_cache()
+                            if hasattr(self.draft_lm, "clear_kv_cache"):
+                                self.draft_lm.clear_kv_cache()
 
                 # Log batch progress with accurate timing (only if SPECDEC_DEBUG enabled)
                 if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
@@ -2843,24 +2928,20 @@ class SpeculativePipeline(SpeculativeDecoder):
                 flush=True,
             )
 
-            # CRITICAL: Cleanup CUDA streams and events to prevent notebook hanging
-            # This is essential for Kaggle notebooks where resources must be freed
-            # CUDA streams and events hold GPU resources and must be explicitly cleaned up
+            # OPTIMIZATION: Cleanup CUDA resources efficiently without excessive synchronization
+            # Excessive synchronization can cause notebook hanging, so we minimize it
+            # Clear memory and KV caches, but avoid redundant synchronization
             if self.device == "cuda" and torch.cuda.is_available():
                 try:
-                    # Step 1: Synchronize all streams to ensure all operations complete
+                    # Step 1: Wait for streams to complete (event-based, not barrier sync)
+                    # Streams should already be synchronized from event-based approach
+                    # Only do explicit sync if streams still exist
                     if draft_stream is not None:
                         draft_stream.synchronize()
                     if verify_stream is not None:
                         verify_stream.synchronize()
 
-                    # Step 2: Synchronize default stream to catch any remaining operations
-                    torch.cuda.synchronize()
-
-                    # Step 3: Clear CUDA cache to free memory
-                    torch.cuda.empty_cache()
-
-                    # Step 4: Clear KV caches to free model memory
+                    # Step 2: Clear KV caches to free model memory (no sync needed)
                     if hasattr(self.base_lm, "clear_kv_cache"):
                         self.base_lm.clear_kv_cache()
                     if hasattr(self.draft_lm, "clear_kv_cache"):
@@ -2868,13 +2949,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if hasattr(self, "kv_cache_manager"):
                         self.kv_cache_manager.reset()
 
-                    # Step 5: Force Python garbage collection to free CUDA objects
+                    # Step 3: Force Python garbage collection to free CUDA objects
                     import gc
 
                     gc.collect()
 
-                    # Step 6: Final CUDA cache clear after GC
+                    # Step 4: Clear CUDA cache once after GC (no sync needed)
                     torch.cuda.empty_cache()
+
+                    # Step 5: Single final synchronization to ensure clean state
+                    # Only one sync instead of multiple to prevent notebook hanging
+                    torch.cuda.synchronize()
 
                     if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
                         self.logger.debug(
@@ -2931,6 +3016,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                     else 0.0
                 )
 
+                # Get kernel backend info for KV append status
+                # NOTE: KV append is intentionally disabled for batch processing
+                # due to complexity of per-prompt sequence state tracking
+                try:
+                    from kernels import get_kernel_info
+
+                    kernel_info = get_kernel_info()
+                    kv_append_backend = kernel_info.get("kv_append_backend", "unknown")
+                except ImportError:
+                    kv_append_backend = "unavailable"
+
                 results.append(
                     {
                         "prompt": prompt,
@@ -2954,6 +3050,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                         "draft_avg_ms": avg_draft_time,
                         "verify_avg_ms": avg_verify_time,
                         "batch_metrics": batch_metrics,
+                        # KV append status (disabled for batch mode by design)
+                        "kv_append_enabled": False,  # Batch mode doesn't use KV append
+                        "kv_append_backend": kv_append_backend,
+                        "kv_appended_tokens": 0,  # No KV append in batch mode
+                        "kv_append_time_ms": 0.0,
                     }
                 )
 
