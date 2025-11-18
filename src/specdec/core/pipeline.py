@@ -26,11 +26,125 @@ from ..policies.policies import AcceptancePolicy, create_policy
 from ..utils.deterministic import ensure_deterministic
 from ..utils.interfaces import LanguageModel, SpeculativeDecoder
 from ..utils.token_validation import get_vocab_size, validate_and_clamp_tokens
+from .kv_cache_verification import (
+    compute_kv_checksum,
+    debug_verify_kv_cache_step,
+    verify_kv_cache_alignment,
+)
+from .sequence_pool import SequencePool
+from .sequence_utils import (
+    create_position_ids,
+    pad_sequences,
+    unpad_append_repad,
+    unpad_sequences,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # filter_kv_cache_safe removed - use SafeKVCacheManager instead
+
+
+def sample_bonus_token_from_logits(
+    logits: torch.Tensor,
+    temperature: float,
+    do_sample: bool,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    vocab_size: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Sample a bonus token from target model logits with proper sampling settings.
+
+    This implements EQSPEC bonus token sampling: after accepting draft tokens,
+    we sample exactly one token from the target model distribution at the
+    mismatch position.
+
+    Args:
+        logits: [vocab_size] or [1, vocab_size] logits from target model
+        temperature: Sampling temperature
+        do_sample: Whether to use sampling (True) or greedy (False)
+        top_p: Top-p (nucleus) sampling parameter (optional)
+        top_k: Top-k sampling parameter (optional)
+        vocab_size: Vocabulary size for validation (optional)
+
+    Returns:
+        bonus_token: [1] tensor with sampled token ID
+    """
+    # Ensure logits are 2D [1, vocab_size]
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)  # [1, vocab_size]
+
+    # Validate logits shape
+    if logits.shape[0] != 1:
+        raise ValueError(f"Expected logits shape [1, vocab_size], got {logits.shape}")
+
+    # Validate vocab size if provided
+    if vocab_size is not None:
+        if logits.shape[1] != vocab_size:
+            logger.warning(
+                f"Logits vocab size {logits.shape[1]} != expected {vocab_size}, "
+                "clamping tokens to valid range"
+            )
+
+    # Apply temperature
+    if temperature > 0 and temperature != 1.0:
+        logits = logits / temperature
+
+    # Apply top-k filtering if specified
+    if top_k is not None and top_k > 0:
+        # Get top-k logits, set others to -inf
+        top_k_logits, top_k_indices = torch.topk(
+            logits, min(top_k, logits.shape[1]), dim=-1
+        )
+        filtered_logits = torch.full_like(logits, float("-inf"))
+        filtered_logits.scatter_(-1, top_k_indices, top_k_logits)
+        logits = filtered_logits
+
+    # Apply top-p (nucleus) filtering if specified
+    if top_p is not None and top_p < 1.0:
+        # Sort logits in descending order
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        # Compute cumulative probabilities
+        probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(probs, dim=-1)
+
+        # Find cutoff point
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # Keep at least one token
+        sorted_indices_to_remove[..., 0] = False
+
+        # Create mask for tokens to keep
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            -1, sorted_indices, sorted_indices_to_remove
+        )
+        logits = logits.masked_fill(indices_to_remove, float("-inf"))
+
+    # Sample or use argmax
+    if do_sample:
+        # Compute probabilities
+        probs = torch.softmax(logits, dim=-1)
+
+        # Safety check for invalid probabilities
+        if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any():
+            logger.warning("Invalid probabilities detected, falling back to argmax")
+            bonus_token = logits.argmax(dim=-1, keepdim=True)
+        else:
+            # Sample from distribution
+            bonus_token = torch.multinomial(probs, num_samples=1)  # [1, 1]
+    else:
+        # Greedy: use argmax
+        bonus_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
+
+    # Ensure dtype is long
+    bonus_token = bonus_token.long()
+
+    # Validate token is in valid range
+    if vocab_size is not None:
+        bonus_token = bonus_token.clamp(min=0, max=vocab_size - 1)
+
+    # Return as [1] tensor (squeeze batch dimension)
+    return bonus_token.squeeze(0)  # [1]
 
 
 # Import optimization modules (conditional to avoid import errors during development)
@@ -1134,10 +1248,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                     f"max_tokens={max_tokens}, proposed={self.metrics['total_proposed']}, "
                     f"accepted={self.metrics['total_accepted']}"
                 )
-                print(
-                    f"[WARNING] No tokens generated for prompt after {step} steps",
-                    flush=True,
-                )
+                # Warning is logged via logger, print only if debug enabled
+                if os.getenv("SPECDEC_DEBUG_PRINTS", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    print(
+                        f"[WARNING] No tokens generated for prompt after {step} steps",
+                        flush=True,
+                    )
 
             # Decode generated text
             if isinstance(generated_tokens, list):
@@ -1501,6 +1621,56 @@ class SpeculativePipeline(SpeculativeDecoder):
         # Keep KV manager batch metadata in sync with the current workload
         self.kv_cache_manager.set_batch_size(batch_size)
 
+        # Configuration flags for performance and stability
+        enable_debug_prints = os.getenv("SPECDEC_DEBUG_PRINTS", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        enable_periodic_sync = os.getenv("SPECDEC_PERIODIC_SYNC", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        enable_periodic_cache_clear = os.getenv(
+            "SPECDEC_PERIODIC_CACHE_CLEAR", "0"
+        ).lower() in ("1", "true", "yes")
+
+        # Initialize sequence pool if enabled
+        enable_sequence_pool = os.getenv(
+            "SPECDEC_ENABLE_SEQUENCE_POOL", "0"
+        ).lower() in ("1", "true", "yes")
+        max_group_size = None
+        min_group_size = 1
+        if enable_sequence_pool:
+            max_group_size_str = os.getenv("SPECDEC_SEQUENCE_POOL_MAX_GROUP_SIZE", "")
+            if max_group_size_str:
+                try:
+                    max_group_size = int(max_group_size_str)
+                except ValueError:
+                    max_group_size = None
+
+            min_group_size_str = os.getenv("SPECDEC_SEQUENCE_POOL_MIN_GROUP_SIZE", "1")
+            try:
+                min_group_size = int(min_group_size_str)
+            except ValueError:
+                min_group_size = 1
+
+            if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+                self.logger.debug(
+                    f"[SEQUENCE_POOL] Enabled: max_group_size={max_group_size}, "
+                    f"min_group_size={min_group_size}"
+                )
+
+        sequence_pool = (
+            SequencePool(
+                max_group_size=max_group_size,
+                min_group_size=min_group_size,
+            )
+            if enable_sequence_pool
+            else None
+        )
+
         # Reset metrics for batch
         batch_metrics = {
             "total_proposed": 0,
@@ -1526,6 +1696,23 @@ class SpeculativePipeline(SpeculativeDecoder):
             # Track per-prompt proposed/accepted for accurate metrics
             per_prompt_proposed_counts = [0] * batch_size
             per_prompt_accepted_counts = [0] * batch_size
+
+            # Track global sequence IDs and lengths for KV cache alignment
+            # Global sequence IDs are just 0 to batch_size-1 (one per prompt)
+            global_sequence_ids = list(range(batch_size))
+
+            # Initialize sequence lengths from initial tokenization
+            initial_sequence_lengths = [seq.shape[0] for seq in current_input_ids]
+            if kv_cache_enabled:
+                self.kv_cache_manager.set_sequence_metadata(
+                    global_sequence_ids=global_sequence_ids,
+                    sequence_lengths=initial_sequence_lengths,
+                )
+
+            # Initialize sequence pool with all sequences
+            if sequence_pool is not None:
+                for global_id, seq in zip(global_sequence_ids, current_input_ids):
+                    sequence_pool.add_sequence(global_id, seq, is_active=True)
 
             step = 0
             generation_start = time.time()
@@ -1600,7 +1787,72 @@ class SpeculativePipeline(SpeculativeDecoder):
                 if not active_indices:
                     break
 
-                # Update KV cache manager with active indices
+                # Update sequence pool with current sequences if enabled
+                if sequence_pool is not None:
+                    for i in active_indices:
+                        global_id = global_sequence_ids[i]
+                        seq = current_input_ids[i]
+                        is_active = batch_active[i]
+                        sequence_pool.add_sequence(global_id, seq, is_active=is_active)
+
+                # Get batches from pool if enabled, otherwise use all active sequences
+                if sequence_pool is not None:
+                    # Process same-length groups first, then mixed batches
+                    batches_to_process = []
+
+                    # Get same-length groups until none available
+                    while True:
+                        same_length_batch = sequence_pool.get_same_length_group()
+                        if same_length_batch is None:
+                            break
+                        global_ids, sequences, length = same_length_batch
+                        batches_to_process.append((global_ids, sequences, length, True))
+
+                    # Get mixed-length batch for remaining sequences
+                    mixed_batch = sequence_pool.get_mixed_length_batch()
+                    if mixed_batch is not None:
+                        global_ids, sequences = mixed_batch
+                        batches_to_process.append((global_ids, sequences, None, False))
+
+                    if not batches_to_process:
+                        break
+
+                    # Process each batch (for now, process first batch only to maintain structure)
+                    # TODO: Refactor to process all batches per step
+                    if batches_to_process:
+                        (
+                            batch_global_ids,
+                            batch_sequences,
+                            batch_length,
+                            batch_is_same_length,
+                        ) = batches_to_process[0]
+                        # Map global IDs back to active indices
+                        global_to_active = {
+                            gid: i for i, gid in enumerate(global_sequence_ids)
+                        }
+                        active_indices = [
+                            global_to_active[gid]
+                            for gid in batch_global_ids
+                            if gid in global_to_active
+                        ]
+                        active_seqs = [
+                            seq.detach().clone().contiguous() for seq in batch_sequences
+                        ]
+                        _is_same_length_batch = batch_is_same_length
+                    else:
+                        break
+                else:
+                    # Original behavior: use all active sequences
+                    active_seqs = [
+                        current_input_ids[i].detach().clone().contiguous()
+                        for i in active_indices
+                    ]
+                    _is_same_length_batch = False
+
+                if len(active_seqs) == 0:
+                    break
+
+                # Update KV cache manager with active indices and sequence metadata
                 # Use relative indices (0 to len-1) for KV cache, not absolute batch indices
                 relative_indices = list(range(len(active_indices)))
                 self.kv_cache_manager.set_active_indices(relative_indices)
@@ -1608,22 +1860,22 @@ class SpeculativePipeline(SpeculativeDecoder):
                     relative_indices, dtype=torch.long, device=self.device
                 )
 
-                # CRITICAL ROOT CAUSE FIX: Clone sequences with detach() for complete independence
-                # Use detach().clone() to break computation graph and prevent shared memory issues
-                # This ensures tensors are completely independent before entering CUDA streams
-                # Best practice: Prepare all tensors synchronously BEFORE async operations
-                # OPTIMIZATION: Only sync if absolutely necessary for correctness
-                # For batch processing, we can rely on CUDA event synchronization
-                # which is more efficient than full device synchronization
-                # Note: This sync ensures previous iteration completes, but we minimize
-                # CPU-GPU transfers by using GPU-only operations where possible
-
-                active_seqs = [
-                    current_input_ids[i].detach().clone().contiguous()
-                    for i in active_indices
+                # Get global sequence IDs and current lengths for active sequences
+                active_global_ids = [global_sequence_ids[i] for i in active_indices]
+                active_sequence_lengths = [
+                    current_input_ids[i].shape[0] for i in active_indices
                 ]
-                if len(active_seqs) == 0:
-                    break
+
+                # Update KV cache manager with current sequence metadata
+                if kv_cache_enabled:
+                    self.kv_cache_manager.set_sequence_metadata(
+                        global_sequence_ids=active_global_ids,
+                        sequence_lengths=active_sequence_lengths,
+                        batch_to_global_map={
+                            i: global_id
+                            for i, global_id in enumerate(active_global_ids)
+                        },
+                    )
 
                 # CRITICAL: Validate immediately after extraction to catch corruption early
                 # Use GPU-only validation to avoid CPU-GPU sync overhead
@@ -1666,15 +1918,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             seq, vocab_size, f"seq_{i}"
                         )
 
-                # Find max sequence length in active batch (optimized: single pass)
-                original_lengths = []
-                max_seq_len = 0
-                for seq in active_seqs:
-                    seq_len = seq.shape[0]
-                    original_lengths.append(seq_len)
-                    max_seq_len = max(max_seq_len, seq_len)
-
-                # Pad all sequences to max length for batching
+                # Pad sequences using utility function
                 # CRITICAL: Ensure pad_value is valid for both base and draft models
                 pad_value = (
                     tokenizer.pad_token_id
@@ -1687,27 +1931,27 @@ class SpeculativePipeline(SpeculativeDecoder):
                 ):
                     pad_value = 0  # Use 0 as safe default (always valid for GPT models)
 
-                # Optimized padding: Use torch.nn.functional.pad for better performance
-                # Only pad sequences that need it, then stack efficiently
-                padded_seqs: List[torch.Tensor] = []
-                for seq in active_seqs:
-                    if seq.shape[0] < max_seq_len:
-                        # Use torch.nn.functional.pad for efficient padding (faster than manual cat)
-                        pad_length = max_seq_len - seq.shape[0]
-                        # Pad on the right: (left, right) for 1D tensor
-                        seq_padded = torch.nn.functional.pad(
-                            seq,
-                            (0, pad_length),
-                            value=pad_value,
-                            mode="constant",
+                # Use sequence utility to pad sequences
+                # For same-length groups from pool, no padding needed
+                if sequence_pool is not None and _is_same_length_batch:
+                    # All sequences have same length, just stack them
+                    active_input_ids = torch.stack(active_seqs, dim=0).contiguous()
+                    seq_length = active_seqs[0].shape[0]
+                    active_attention_mask = torch.ones(
+                        (len(active_seqs), seq_length),
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    original_lengths = [seq_length] * len(active_seqs)
+                else:
+                    # Mixed lengths or pool disabled: pad as usual
+                    active_input_ids, active_attention_mask, original_lengths = (
+                        pad_sequences(
+                            sequences=active_seqs,
+                            pad_token_id=pad_value,
+                            device=torch.device(self.device),
                         )
-                        padded_seqs.append(seq_padded)
-                    else:
-                        padded_seqs.append(seq)
-
-                # Stack sequences efficiently (torch.stack is already optimized)
-                # Clone only once after stacking to ensure independence
-                active_input_ids = torch.stack(padded_seqs, dim=0).contiguous()
+                    )
 
                 # CRITICAL: Final validation with draft vocab size before passing to draft model
                 # This is the last safety check before embedding layer
@@ -1717,16 +1961,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                         active_input_ids, draft_vocab_size, "batch_input_draft"
                     )
 
-                # Create attention mask to ignore padding tokens
-                active_attention_mask = torch.ones(
-                    (len(active_indices), max_seq_len),
-                    dtype=torch.long,
-                    device=self.device,
+                # Create explicit position IDs starting from 0 for each sequence
+                max_seq_len = (
+                    active_input_ids.shape[1] if active_input_ids.shape[0] > 0 else 0
                 )
-                for i, orig_len in enumerate(original_lengths):
-                    if orig_len < max_seq_len:
-                        # Mask out padding tokens
-                        active_attention_mask[i, orig_len:] = 0
+                active_position_ids = create_position_ids(
+                    sequence_lengths=original_lengths,
+                    max_length=max_seq_len,
+                    device=torch.device(self.device),
+                )
 
                 # Debug: validate input_ids are not all padding (GPU-only, defer CPU sync)
                 # OPTIMIZATION: Avoid CPU transfer for debug logging unless needed
@@ -1891,6 +2134,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 stream=draft_stream,
                                 past_key_values=draft_past_kv,
                                 attention_mask=active_attention_mask,  # Pass attention mask to skip padding
+                                position_ids=active_position_ids,  # Pass explicit position IDs
                                 **kwargs,
                             )
                         except RuntimeError as e:
@@ -1945,6 +2189,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         do_sample=False,  # Use greedy for draft to maximize acceptance
                         past_key_values=draft_past_kv,
                         attention_mask=active_attention_mask,  # Pass attention mask to skip padding
+                        position_ids=active_position_ids,  # Pass explicit position IDs
                         **kwargs,
                     )
 
@@ -2076,6 +2321,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 temperature=temperature,
                                 do_sample=do_sample,
                                 attention_mask=active_attention_mask,  # Pass attention mask to skip padding
+                                position_ids=active_position_ids,  # Pass explicit position IDs
                                 **kwargs,
                             )
                         )
@@ -2090,11 +2336,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if verify_end_event is not None:
                         verify_end_event.synchronize()
 
-                    # CRITICAL FIX: Always sync device after event sync to ensure clean GPU state
-                    # Event sync ensures streams are synchronized, but device sync ensures
-                    # all operations complete before we access results. This is essential
-                    # for Kaggle notebooks to prevent unresponsiveness.
-                    if self.device == "cuda" and torch.cuda.is_available():
+                    # CRITICAL FIX: Sync device after event sync only if periodic sync enabled
+                    # Event sync ensures streams are synchronized. Full device sync is only needed
+                    # for timing accuracy or when explicitly requested to prevent unresponsiveness.
+                    # For long runs, minimize syncs to reduce CPU overhead.
+                    if (
+                        enable_periodic_sync
+                        and self.device == "cuda"
+                        and torch.cuda.is_available()
+                    ):
                         torch.cuda.synchronize()
 
                     # Calculate verify time using CUDA events if available
@@ -2129,6 +2379,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 stream=verify_stream,
                                 past_key_values=base_past_kv,
                                 attention_mask=active_attention_mask,  # Pass attention mask to skip padding
+                                position_ids=active_position_ids,  # Pass explicit position IDs
                                 **kwargs,
                             )
                         except RuntimeError as e:
@@ -2178,15 +2429,19 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 base_new_kv = self.base_lm._last_generated_kv
 
                         # Update using centralized manager
+                        # Note: We append KV for all K generated tokens, but will realign
+                        # after acceptance to only keep accepted positions
                         if base_new_kv is not None:
                             if isinstance(base_new_kv, tuple):
                                 self.kv_cache_manager.update_base_cache(
-                                    base_new_kv, active_indices
+                                    base_new_kv, active_indices, tokens_appended=None
                                 )
                             else:
                                 if len(base_new_kv) > 0:
                                     self.kv_cache_manager.update_base_cache(
-                                        tuple(base_new_kv), active_indices
+                                        tuple(base_new_kv),
+                                        active_indices,
+                                        tokens_appended=None,
                                     )
 
                     # Synchronize both streams
@@ -2239,6 +2494,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         do_sample=False,  # Always use greedy for verification
                         past_key_values=base_past_kv,
                         attention_mask=active_attention_mask,  # Pass attention mask to skip padding
+                        position_ids=active_position_ids,  # Pass explicit position IDs
                         **kwargs,
                     )
 
@@ -2266,12 +2522,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                         if base_new_kv is not None:
                             if isinstance(base_new_kv, tuple):
                                 self.kv_cache_manager.update_base_cache(
-                                    base_new_kv, active_indices
+                                    base_new_kv, active_indices, tokens_appended=None
                                 )
                             else:
                                 if len(base_new_kv) > 0:
                                     self.kv_cache_manager.update_base_cache(
-                                        tuple(base_new_kv), active_indices
+                                        tuple(base_new_kv),
+                                        active_indices,
+                                        tokens_appended=None,
                                     )
 
                     # Use wall-clock time for fallback
@@ -2291,7 +2549,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                     max_time = max(draft_time_cuda, verify_time_cuda)
                     sequential_time = draft_time_cuda + verify_time_cuda
                     overlap_saved_ms = sequential_time - max_time
-                    if overlap_saved_ms > 1.0:  # Only log if significant overlap
+                    if (
+                        overlap_saved_ms > 1.0 and enable_debug_prints
+                    ):  # Only log if significant overlap and debug enabled
                         print(
                             f"[BATCH] Stream overlap: saved {overlap_saved_ms:.1f}ms "
                             f"(draft={draft_time_cuda:.1f}ms, verify={verify_time_cuda:.1f}ms)",
@@ -2317,8 +2577,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                         draft_tokens, draft_vocab_size, "draft_output"
                     )
 
-                # Debug: log batch metrics after each step (reduced frequency to reduce CPU overhead)
-                if step == 1 or step % 16 == 0:
+                # Debug: log batch metrics after each step (gated behind debug flag)
+                if enable_debug_prints and (step == 1 or step % 16 == 0):
                     print(
                         f"[DEBUG] Step {step} metrics - "
                         f"proposed: {batch_metrics['total_proposed']}, "
@@ -2328,19 +2588,89 @@ class SpeculativePipeline(SpeculativeDecoder):
                         flush=True,
                     )
 
+                # Debug: Verify KV cache alignment (first step only, small batches)
+                debug_kv_verification = (
+                    os.getenv("SPECDEC_DEBUG_KV_VERIFY", "0").lower()
+                    in ("1", "true", "yes")
+                    and step == 1
+                    and batch_size <= 3
+                    and kv_cache_enabled
+                )
+
+                if debug_kv_verification:
+                    try:
+                        # Get KV cache from speculative decoding
+                        speculative_kv = self.kv_cache_manager.get_base_past_kv(
+                            relative_indices_tensor
+                        )
+
+                        # Run target-only decoding for comparison
+                        target_only_kv = debug_verify_kv_cache_step(
+                            base_model=self.base_lm,
+                            input_ids=active_input_ids,
+                            attention_mask=active_attention_mask,
+                            position_ids=active_position_ids,
+                            num_tokens=k,
+                            temperature=temperature,
+                            do_sample=do_sample,
+                            device=torch.device(self.device),
+                        )
+
+                        # Compare KV caches
+                        matches, errors = verify_kv_cache_alignment(
+                            target_only_kv=target_only_kv,
+                            speculative_kv=speculative_kv,
+                        )
+
+                        if enable_debug_prints:
+                            if matches:
+                                print(
+                                    "[KV VERIFY] ✅ KV cache alignment verified: "
+                                    "target-only and speculative match",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"[KV VERIFY] ❌ KV cache alignment failed: {len(errors)} errors",
+                                    flush=True,
+                                )
+                                for error in errors[:5]:  # Show first 5 errors
+                                    print(f"  - {error}", flush=True)
+
+                            # Print checksums for debugging
+                            target_checksum = compute_kv_checksum(target_only_kv)
+                            spec_checksum = compute_kv_checksum(speculative_kv)
+                            print(
+                                f"[KV VERIFY] Target-only checksum: {target_checksum}",
+                                flush=True,
+                            )
+                            print(
+                                f"[KV VERIFY] Speculative checksum: {spec_checksum}",
+                                flush=True,
+                            )
+                    except Exception as e:
+                        if enable_debug_prints:
+                            print(
+                                f"[KV VERIFY] Error during verification: {e}",
+                                flush=True,
+                            )
+                            import traceback
+
+                            traceback.print_exc()
+
                 # Step 3: Apply acceptance policy in batch
                 accepted_lengths = []
                 accepted_tokens_list = []
 
-                # Debug: log verify outputs shape (only first step and every 16 steps to reduce CPU overhead)
-                if step == 1 or step % 16 == 0:
+                # Debug: log verify outputs shape (gated behind debug flag)
+                if enable_debug_prints and (step == 1 or step % 16 == 0):
                     print(
                         f"[DEBUG] Verify execution - base_tokens shape: {base_tokens.shape}, "
                         f"base_logits shape: {base_logits.shape}, "
                         f"verify_time: {verify_time_ms:.2f}ms",
                         flush=True,
                     )
-                if step == 1:
+                if enable_debug_prints and step == 1:
                     # Decode verify tokens (only first step)
                     if tokenizer is not None:
                         try:
@@ -2369,9 +2699,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                     prompt_base_logits = base_logits[idx_in_active : idx_in_active + 1]
 
                     # Apply policy
-                    # Debug: log tokens before policy (with argmax for verification)
+                    # Debug: log tokens before policy (gated behind debug flag)
                     # Minimize CPU transfers - only when debugging
-                    if step <= 2 and idx_in_active == 0:
+                    if enable_debug_prints and step <= 2 and idx_in_active == 0:
                         # Get base predicted tokens from logits for comparison
                         # Keep operations on GPU, only transfer minimal data to CPU
                         max_debug_len = min(3, prompt_base_logits.shape[1])
@@ -2395,7 +2725,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             len(draft_tokens_sample) > 0
                             and len(base_pred_from_logits) > 0
                         ):
-                            matches = sum(
+                            match_count: int = sum(
                                 1
                                 for i in range(
                                     min(
@@ -2405,7 +2735,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 )
                                 if draft_tokens_sample[i] == base_pred_from_logits[i]
                             )
-                            overlap_ratio = matches / max(
+                            overlap_ratio = match_count / max(
                                 len(draft_tokens_sample), len(base_pred_from_logits)
                             )
                             min_len = min(
@@ -2413,7 +2743,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                             )
                             print(
                                 f"[DEBUG] Token overlap ratio: {overlap_ratio:.2f} "
-                                f"({matches}/{min_len} match)",
+                                f"({match_count}/{min_len} match)",
                                 flush=True,
                             )
 
@@ -2428,9 +2758,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                     if policy_accept_len < prompt_draft_tokens.shape[1]:
                         kv_cache_reset_needed = True
 
-                    # Debug: log policy result (reduced frequency unless debug mode enabled)
-                    debug_accept = os.getenv("SPECDEC_DEBUG_ACCEPT", "0") == "1"
-                    if (step <= 2 or debug_accept) and (step % 8 == 0 or step <= 2):
+                    # Debug: log policy result (gated behind debug flag)
+                    if enable_debug_prints and (step <= 2 or step % 8 == 0):
                         proposed_count = prompt_draft_tokens.shape[1]
                         accept_rate = accepted_len / max(proposed_count, 1)
                         print(
@@ -2533,6 +2862,165 @@ class SpeculativePipeline(SpeculativeDecoder):
                                     ]
                                     batch_active[global_idx] = False  # Stop generation
 
+                            # EQSPEC BONUS TOKEN: Sample exactly one token from target model distribution
+                            # at the mismatch position (after accepted draft tokens)
+                            bonus_token_tensor = None
+                            k = prompt_draft_tokens.shape[
+                                1
+                            ]  # Number of draft tokens generated
+
+                            if accepted_len < k:
+                                # We have logits at the mismatch position from verification
+                                # Use prompt_base_logits[0, accepted_len, :] for bonus token
+                                bonus_logits = prompt_base_logits[
+                                    0, accepted_len, :
+                                ]  # [vocab_size]
+
+                                # Get generation parameters from kwargs or config
+                                top_p = kwargs.get(
+                                    "top_p", self.config.get("top_p", None)
+                                )
+                                top_k = kwargs.get(
+                                    "top_k", self.config.get("top_k", None)
+                                )
+
+                                # Sample bonus token from target model distribution
+                                bonus_token_tensor = sample_bonus_token_from_logits(
+                                    logits=bonus_logits,
+                                    temperature=temperature,
+                                    do_sample=do_sample,
+                                    top_p=top_p,
+                                    top_k=top_k,
+                                    vocab_size=base_vocab_size,
+                                )  # [1]
+
+                                if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                                    "1",
+                                    "true",
+                                    "yes",
+                                ):
+                                    self.logger.debug(
+                                        f"EQSPEC: Sampled bonus token {bonus_token_tensor.item()} "
+                                        f"from existing logits at position {accepted_len}"
+                                    )
+                            elif accepted_len == k:
+                                # All draft tokens accepted - need forward pass for bonus token
+                                # Construct input with accepted tokens
+                                current_seq = current_input_ids[
+                                    global_idx
+                                ]  # Unpadded sequence
+                                bonus_input = torch.cat(
+                                    [current_seq, accepted_tokens_tensor], dim=0
+                                ).unsqueeze(
+                                    0
+                                )  # [1, seq_len + accepted_len]
+
+                                # Forward pass on target model to get bonus token logits
+                                with torch.no_grad():
+                                    # Get past_key_values if KV cache is enabled
+                                    bonus_past_kv = None
+                                    if kv_cache_enabled:
+                                        # Get KV cache for this specific sequence
+                                        # Note: We need to get KV cache up to current_seq + accepted_tokens
+                                        # For now, we'll do a fresh forward pass
+                                        # TODO: Optimize to reuse KV cache if possible
+                                        pass
+
+                                    # Forward pass to get logits at the last position
+                                    if hasattr(self.base_lm, "_model"):
+                                        model_outputs = self.base_lm._model(
+                                            input_ids=bonus_input,
+                                            past_key_values=bonus_past_kv,
+                                            use_cache=False,
+                                        )
+                                        bonus_logits = model_outputs.logits[
+                                            0, -1, :
+                                        ]  # [vocab_size]
+                                    else:
+                                        # Fallback: use generate_tokens with max_new_tokens=1
+                                        # but we only need the logits, not the token
+                                        # This is less efficient but works as fallback
+                                        _, bonus_logits_full = (
+                                            self.base_lm.generate_tokens(
+                                                bonus_input,
+                                                max_new_tokens=1,
+                                                temperature=temperature,
+                                                do_sample=False,  # We'll sample ourselves
+                                            )
+                                        )
+                                        # bonus_logits_full is [1, 1, vocab_size], extract [vocab_size]
+                                        bonus_logits = bonus_logits_full[0, 0, :]
+
+                                # Get generation parameters
+                                top_p = kwargs.get(
+                                    "top_p", self.config.get("top_p", None)
+                                )
+                                top_k = kwargs.get(
+                                    "top_k", self.config.get("top_k", None)
+                                )
+
+                                # Sample bonus token
+                                bonus_token_tensor = sample_bonus_token_from_logits(
+                                    logits=bonus_logits,
+                                    temperature=temperature,
+                                    do_sample=do_sample,
+                                    top_p=top_p,
+                                    top_k=top_k,
+                                    vocab_size=base_vocab_size,
+                                )  # [1]
+
+                                if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                                    "1",
+                                    "true",
+                                    "yes",
+                                ):
+                                    self.logger.debug(
+                                        f"EQSPEC: Sampled bonus token {bonus_token_tensor.item()} "
+                                        f"from forward pass (all {k} draft tokens accepted)"
+                                    )
+
+                            # Append bonus token to accepted tokens if we have one
+                            if bonus_token_tensor is not None:
+                                # Validate bonus token
+                                if base_vocab_size is not None:
+                                    bonus_token_tensor = validate_and_clamp_tokens(
+                                        bonus_token_tensor,
+                                        base_vocab_size,
+                                        "bonus_token",
+                                    )
+
+                                # Check for EOS
+                                eos_token_id = 50256  # Default GPT-2 EOS token
+                                if tokenizer is not None:
+                                    eos_token_id = tokenizer.eos_token_id
+                                elif (
+                                    hasattr(self.base_lm, "_tokenizer")
+                                    and self.base_lm._tokenizer is not None
+                                ):
+                                    base_tokenizer = self.base_lm._tokenizer
+                                    if base_tokenizer is not None and hasattr(
+                                        base_tokenizer, "eos_token_id"
+                                    ):
+                                        eos_token_id = base_tokenizer.eos_token_id
+
+                                if bonus_token_tensor.item() == eos_token_id:
+                                    batch_active[global_idx] = False
+
+                                # Append bonus token to accepted tokens tensor
+                                accepted_tokens_tensor = torch.cat(
+                                    [accepted_tokens_tensor, bonus_token_tensor], dim=0
+                                )  # [accepted_len + 1]
+
+                                if os.getenv("SPECDEC_DEBUG", "0").lower() in (
+                                    "1",
+                                    "true",
+                                    "yes",
+                                ):
+                                    self.logger.debug(
+                                        f"EQSPEC: Appended bonus token to accepted tokens. "
+                                        f"Total accepted tokens: {accepted_tokens_tensor.shape[0]}"
+                                    )
+
                             # OPTIMIZATION: Single CPU transfer for all operations
                             # Convert to list ONCE at the end
                             accepted_tokens = accepted_tokens_tensor.cpu().tolist()
@@ -2583,10 +3071,29 @@ class SpeculativePipeline(SpeculativeDecoder):
                         accepted_tokens = tokens_to_add
                         accepted_len = len(tokens_to_add)
                     else:
-                        # Rejected all - accept first base token as fallback
-                        first_base_tensor = prompt_base_tokens[0, 0:1]
-                        # Validate with centralized validation (stays on GPU)
+                        # Rejected all draft tokens - sample from first base token distribution
+                        # EQSPEC: When no draft tokens are accepted, we still need to advance
+                        # by sampling from the target model distribution at position 0
                         base_vocab_size = get_vocab_size(self.base_lm)
+
+                        # Get logits at position 0 from verification
+                        first_base_logits = prompt_base_logits[0, 0, :]  # [vocab_size]
+
+                        # Get generation parameters
+                        top_p = kwargs.get("top_p", self.config.get("top_p", None))
+                        top_k = kwargs.get("top_k", self.config.get("top_k", None))
+
+                        # Sample token from target model distribution
+                        first_base_tensor = sample_bonus_token_from_logits(
+                            logits=first_base_logits,
+                            temperature=temperature,
+                            do_sample=do_sample,
+                            top_p=top_p,
+                            top_k=top_k,
+                            vocab_size=base_vocab_size,
+                        )  # [1]
+
+                        # Validate with centralized validation (stays on GPU)
                         if base_vocab_size is not None:
                             first_base_tensor = validate_and_clamp_tokens(
                                 first_base_tensor, base_vocab_size, "fallback_base"
@@ -2638,15 +3145,14 @@ class SpeculativePipeline(SpeculativeDecoder):
                             accepted_len = len(accepted_tokens)
                         else:
                             accepted_len = 0
-                        if step <= 3 or idx_in_active == 0:
+                        if enable_debug_prints and (step <= 3 or idx_in_active == 0):
                             print(
                                 f"[DEBUG] No draft tokens accepted - accepting first base token: {accepted_tokens}",
                                 flush=True,
                             )
 
-                    # Debug: log acceptance per prompt (reduced frequency to reduce CPU overhead)
-                    debug_accept = os.getenv("SPECDEC_DEBUG_ACCEPT", "0") == "1"
-                    if (step <= 2 or debug_accept) and (step % 8 == 0 or step <= 2):
+                    # Debug: log acceptance per prompt (gated behind debug flag)
+                    if enable_debug_prints and (step <= 2 or step % 8 == 0):
                         print(
                             f"[DEBUG] Acceptance - prompt {global_idx}, "
                             f"proposed={prompt_draft_tokens.shape[1]}, "
@@ -2711,8 +3217,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 f"current_seq_{global_idx}",
                             )
 
-                        # Debug: log before/after append (only first step to reduce CPU overhead)
-                        if step == 1:
+                        # Debug: log before/after append (gated behind debug flag)
+                        if enable_debug_prints and step == 1:
                             print(
                                 f"[DEBUG] Sequence update - prompt {global_idx}: "
                                 f"before_len={current_seq.shape[0]}, "
@@ -2820,8 +3326,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # CRITICAL FIX: Ensure GPU operations complete before updating sequence
                         # This prevents race conditions where sequence update happens before
                         # GPU operations (concatenation, cloning) complete, which can cause
-                        # token duplication and notebook unresponsiveness
-                        if self.device == "cuda" and torch.cuda.is_available():
+                        # token duplication and notebook unresponsiveness.
+                        # Only sync if periodic sync enabled - detach().clone() is usually sufficient.
+                        if (
+                            enable_periodic_sync
+                            and self.device == "cuda"
+                            and torch.cuda.is_available()
+                        ):
                             # Quick sync to ensure concatenation and cloning are complete
                             torch.cuda.synchronize()
 
@@ -2829,23 +3340,67 @@ class SpeculativePipeline(SpeculativeDecoder):
                         current_input_ids[global_idx] = updated_seq
                     else:
                         # No tokens accepted - log warning but continue with next base token
-                        print(
-                            f"[WARNING] Step {step}, prompt {global_idx}: No tokens to append!",
-                            flush=True,
-                        )
+                        if enable_debug_prints:
+                            print(
+                                f"[WARNING] Step {step}, prompt {global_idx}: No tokens to append!",
+                                flush=True,
+                            )
 
                     # Check if this prompt is done (additional check for max_tokens)
                     # EOS handling is already done above when adding tokens
                     if len(batch_generated_tokens[global_idx]) >= max_tokens:
                         batch_active[global_idx] = False
 
+                # Realign KV cache after all sequence updates to match new lengths
+                if kv_cache_enabled:
+                    # Collect updated sequence lengths for all active sequences
+                    updated_global_ids = []
+                    updated_sequence_lengths = []
+                    for idx_in_active, global_idx in enumerate(active_indices):
+                        if batch_active[global_idx]:  # Only realign active sequences
+                            updated_global_ids.append(global_sequence_ids[global_idx])
+                            updated_sequence_lengths.append(
+                                current_input_ids[global_idx].shape[0]
+                            )
+
+                    if updated_global_ids:
+                        # Realign base cache
+                        self.kv_cache_manager.realign_kv_cache(
+                            global_sequence_ids=updated_global_ids,
+                            new_sequence_lengths=updated_sequence_lengths,
+                            cache_type="base",
+                        )
+                        # Realign draft cache
+                        self.kv_cache_manager.realign_kv_cache(
+                            global_sequence_ids=updated_global_ids,
+                            new_sequence_lengths=updated_sequence_lengths,
+                            cache_type="draft",
+                        )
+
                 batch_metrics["total_steps"] += 1
 
-                if kv_cache_reset_needed and kv_cache_enabled:
+                # Log sequence pool statistics periodically (gated behind debug flag)
+                if (
+                    enable_debug_prints
+                    and sequence_pool is not None
+                    and (step == 1 or step % 10 == 0)
+                ):
+                    pool_stats = sequence_pool.get_statistics()
                     print(
-                        "[BATCH] Disabling KV cache reuse after partial acceptance to maintain consistency",
+                        f"[SEQUENCE_POOL] Step {step}: "
+                        f"groups={pool_stats['total_groups_formed']}, "
+                        f"same_length={pool_stats['same_length_percentage']:.1f}%, "
+                        f"mixed_length={pool_stats['mixed_length_percentage']:.1f}%, "
+                        f"avg_group_size={pool_stats['avg_group_size']:.1f}",
                         flush=True,
                     )
+
+                if kv_cache_reset_needed and kv_cache_enabled:
+                    if enable_debug_prints:
+                        print(
+                            "[BATCH] Disabling KV cache reuse after partial acceptance to maintain consistency",
+                            flush=True,
+                        )
                     self.kv_cache_manager.reset()
                     kv_cache_enabled = False
                     if hasattr(self.base_lm, "clear_kv_cache"):
@@ -2857,14 +3412,24 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Excessive synchronization causes high CPU usage (100%) and slow performance
                 # Use CUDA events for async execution instead of barrier synchronization
                 # Only synchronize when necessary to reduce CPU-GPU overhead
-                if self.device == "cuda" and torch.cuda.is_available():
+                if (
+                    enable_periodic_sync
+                    and self.device == "cuda"
+                    and torch.cuda.is_available()
+                ):
                     # Only synchronize every 10 steps or on last step to reduce CPU overhead
                     # Event-based sync in scheduler handles async correctness
                     if step % 10 == 0 or not any(batch_active):
                         torch.cuda.synchronize()
 
-                    # OPTIMIZATION: Clear CUDA cache periodically to prevent memory leak
-                    # Clear every 20 steps to prevent gradual GPU memory accumulation
+                # OPTIMIZATION: Clear CUDA cache periodically to prevent memory leak
+                # Clear every 20 steps to prevent gradual GPU memory accumulation
+                # WARNING: This can cause stalls - only enable if memory is an issue
+                if (
+                    enable_periodic_cache_clear
+                    and self.device == "cuda"
+                    and torch.cuda.is_available()
+                ):
                     if step % 20 == 0:
                         torch.cuda.empty_cache()
                         # Also clear KV caches periodically if they exist
@@ -2971,6 +3536,19 @@ class SpeculativePipeline(SpeculativeDecoder):
                         f"[CLEANUP] Error cleaning up CUDA resources: {e}",
                         exc_info=True,
                     )
+
+            # Log final sequence pool statistics if enabled (gated behind debug flag)
+            if enable_debug_prints and sequence_pool is not None:
+                pool_stats = sequence_pool.get_statistics()
+                print(
+                    f"[SEQUENCE_POOL] Final stats: "
+                    f"total_groups={pool_stats['total_groups_formed']}, "
+                    f"same_length_tokens={pool_stats['same_length_tokens']}, "
+                    f"mixed_length_tokens={pool_stats['mixed_length_tokens']}, "
+                    f"same_length_pct={pool_stats['same_length_percentage']:.1f}%, "
+                    f"avg_group_size={pool_stats['avg_group_size']:.1f}",
+                    flush=True,
+                )
 
             # Convert batched results to per-prompt dictionaries
             results = []

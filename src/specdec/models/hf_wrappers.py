@@ -212,19 +212,30 @@ class HFWrapper(LanguageModel):
                 if attention_mask is None:
                     attention_mask = torch.ones_like(input_ids)
 
+                # Extract position_ids from kwargs if provided
+                position_ids = kwargs.pop("position_ids", None)
+
                 # Generate tokens
-                outputs = self._model.generate(  # type: ignore
-                    input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    pad_token_id=self._tokenizer.eos_token_id,  # type: ignore
-                    eos_token_id=self._tokenizer.eos_token_id,  # type: ignore
-                    return_dict_in_generate=True,
-                    output_scores=True,
-                    **kwargs,
-                )
+                generate_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": temperature,
+                    "do_sample": do_sample,
+                    "pad_token_id": self._tokenizer.eos_token_id,  # type: ignore
+                    "eos_token_id": self._tokenizer.eos_token_id,  # type: ignore
+                    "return_dict_in_generate": True,
+                    "output_scores": True,
+                }
+
+                # Add position_ids if provided (some models support explicit position IDs)
+                if position_ids is not None:
+                    generate_kwargs["position_ids"] = position_ids
+
+                # Add any remaining kwargs
+                generate_kwargs.update(kwargs)
+
+                outputs = self._model.generate(**generate_kwargs)  # type: ignore
 
                 # Extract generated token IDs (excluding input)
                 generated_ids = outputs.sequences[  # type: ignore[union-attr]
