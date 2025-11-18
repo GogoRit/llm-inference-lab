@@ -357,7 +357,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                     logger.info("Base model optimization completed")
                 # Note: Base model optimization handled via optimize() method above
 
-                if hasattr(self.draft_lm, "optimize"):
+                if (
+                    self.speculative_enabled
+                    and self.draft_lm is not None
+                    and hasattr(self.draft_lm, "optimize")
+                ):
                     logger.info("Optimizing draft model...")
                     self.draft_lm.optimize(self.optimization_manager)
                     logger.info("Draft model optimization completed")
@@ -559,6 +563,16 @@ class SpeculativePipeline(SpeculativeDecoder):
     def _check_compatibility(self) -> None:
         """Check tokenizer compatibility between draft and base models."""
         base_info = self.base_lm.get_tokenizer_info()
+
+        # Baseline mode: no draft model, skip cross-model checks
+        if self.draft_lm is None or not getattr(self, "speculative_enabled", True):
+            # In baseline mode, just use base model tokenizer info
+            if hasattr(self, "tokenizer_info"):
+                self.tokenizer_info = base_info
+            self.logger.debug("Baseline mode: skipping draft model compatibility check")
+            return
+
+        # Existing speculative path: requires draft_lm
         draft_info = self.draft_lm.get_tokenizer_info()
 
         # Check if tokenizers are compatible
@@ -577,6 +591,10 @@ class SpeculativePipeline(SpeculativeDecoder):
                 "Different tokenizer families detected. This may reduce "
                 "acceptance rates."
             )
+
+        # Store tokenizer info (use base as canonical)
+        if hasattr(self, "tokenizer_info"):
+            self.tokenizer_info = base_info
 
     def _generate_medusa_tokens(
         self,
