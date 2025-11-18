@@ -1971,57 +1971,89 @@ class SpeculativePipeline(SpeculativeDecoder):
                     device=torch.device(self.device),
                 )
 
-                # Debug: validate input_ids are not all padding (GPU-only, defer CPU sync)
-                # OPTIMIZATION: Avoid CPU transfer for debug logging unless needed
-                # Keep calculations on GPU to reduce CPU-GPU overhead
+                # CRITICAL: Always compute non_pad_tokens for padding check
+                # This check is required for correctness, not just debugging
+                non_pad_tokens_tensor = (active_input_ids != pad_value).sum()
+                total_tokens = active_input_ids.numel()
+                # Only sync to CPU if debug logging is enabled (optimization)
                 if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
-                    non_pad_tokens_tensor = (active_input_ids != pad_value).sum()
-                    total_tokens = active_input_ids.numel()
                     non_pad_tokens = non_pad_tokens_tensor.item()
                 else:
-                    # Skip calculation entirely if not debugging
-                    non_pad_tokens = 0
-                    total_tokens = 0
+                    # For the check, we can use tensor comparison directly (no CPU sync)
+                    # But we need to handle both tensor and scalar cases
+                    non_pad_tokens = (
+                        non_pad_tokens_tensor  # Keep as tensor for GPU comparison
+                    )
 
+                # Debug instrumentation for batch input (gated by SPECDEC_DEBUG_BATCH_INPUT)
+                if step == 1 and os.getenv(
+                    "SPECDEC_DEBUG_BATCH_INPUT", "0"
+                ).lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    non_pad_count = (
+                        non_pad_tokens.item()
+                        if isinstance(non_pad_tokens, torch.Tensor)
+                        else non_pad_tokens
+                    )
+                    self.logger.info(
+                        f"[BATCH_INPUT_DEBUG] Step 1 - active_input_ids shape: {active_input_ids.shape}, "
+                        f"active={len(active_indices)}, max_len={max_seq_len}, "
+                        f"original_lens={original_lengths}, "
+                        f"non_pad={non_pad_count}/{total_tokens}"
+                    )
+                    # Decode first two sequences to verify prompts are present
+                    if tokenizer is not None and active_input_ids.shape[0] > 0:
+                        for seq_idx in range(min(2, active_input_ids.shape[0])):
+                            seq_tokens = active_input_ids[seq_idx]
+                            # Remove padding before decoding
+                            seq_non_pad = seq_tokens[seq_tokens != pad_value]
+                            if len(seq_non_pad) > 0:
+                                try:
+                                    decoded_text = tokenizer.decode(seq_non_pad)
+                                    self.logger.info(
+                                        f"[BATCH_INPUT_DEBUG] Sequence {seq_idx} decoded: {decoded_text[:100]}..."
+                                    )
+                                except Exception as e:
+                                    self.logger.warning(
+                                        f"[BATCH_INPUT_DEBUG] Failed to decode sequence {seq_idx}: {e}"
+                                    )
+                            else:
+                                self.logger.warning(
+                                    f"[BATCH_INPUT_DEBUG] Sequence {seq_idx} has no non-padding tokens!"
+                                )
+
+                # Also log in regular debug mode (less verbose)
                 if step == 1 and os.getenv("SPECDEC_DEBUG", "0").lower() in (
                     "1",
                     "true",
                     "yes",
                 ):
+                    non_pad_count = (
+                        non_pad_tokens.item()
+                        if isinstance(non_pad_tokens, torch.Tensor)
+                        else non_pad_tokens
+                    )
                     self.logger.debug(
                         f"[BATCH] Batched active_input_ids shape: {active_input_ids.shape} "
                         f"(active={len(active_indices)}, max_len={max_seq_len}, "
                         f"original_lens={original_lengths}, "
-                        f"non_pad={non_pad_tokens}/{total_tokens})"
+                        f"non_pad={non_pad_count}/{total_tokens})"
                     )
-                    # Decode and log first prompt for verification (debug only)
-                    if tokenizer is not None and active_input_ids.shape[0] > 0:
-                        first_prompt_tokens = active_input_ids[0]
-                        # Remove padding before decoding
-                        first_prompt_non_pad = first_prompt_tokens[
-                            first_prompt_tokens != pad_value
-                        ]
-                        if len(first_prompt_non_pad) > 0:
-                            try:
-                                decoded_text = tokenizer.decode(first_prompt_non_pad)
-                                self.logger.debug(
-                                    f"[DEBUG] First prompt decoded: {decoded_text[:100]}..."
-                                )
-                            except Exception as e:
-                                self.logger.debug(
-                                    f"[DEBUG] Failed to decode first prompt: {e}"
-                                )
 
                 # Check if all tokens are padding (GPU-only comparison, no CPU sync)
+                # Use tensor comparison to avoid CPU sync when debug is disabled
                 if isinstance(non_pad_tokens, torch.Tensor):
                     # GPU tensor comparison (no CPU sync)
-                    if non_pad_tokens == 0:
+                    if non_pad_tokens.item() == 0:
                         self.logger.warning(
                             f"Step {step}: All tokens are padding, skipping generation"
                         )
                         break
                 elif non_pad_tokens == 0:
-                    # CPU scalar (only when debug enabled)
+                    # CPU scalar (when debug enabled and already synced)
                     self.logger.warning(
                         f"Step {step}: All tokens are padding, skipping generation"
                     )

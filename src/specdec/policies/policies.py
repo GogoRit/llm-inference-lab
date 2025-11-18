@@ -6,6 +6,7 @@ proposed tokens from the draft model should be accepted by the base model.
 """
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
 
@@ -91,9 +92,15 @@ class LongestPrefixPolicy(AcceptancePolicy):
         **kwargs: Any,
     ) -> Tuple[int, Dict[str, Any]]:
         """Accept the longest matching prefix of tokens."""
-        # Try to use kernel if available and on CUDA
+        # Try to use kernel if available and on CUDA (unless forced to PyTorch)
+        force_pytorch = os.getenv("SPECDEC_FORCE_PYTORCH_BACKEND", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         if (
-            self.kernels_available
+            not force_pytorch
+            and self.kernels_available
             and base_logits is not None
             and base_logits.device.type == "cuda"
         ):
