@@ -14,7 +14,7 @@ The long-term goal is to provide open, reproducible baselines for speculative de
 
 ## Current Status Snapshot
 
-**As of 2025-11-05**
+**As of 2025-11-18**
 
 | Phase | Status | Key Deliverable | Completion Date |
 |-------|--------|----------------|-----------------|
@@ -36,9 +36,10 @@ The long-term goal is to provide open, reproducible baselines for speculative de
 
 **Summary Metrics**:
 - Total Lines of Code: ~3,200+
-- Test Coverage: 127 tests (122 passing, 1 skipped, 4 deselected)
+- Test Coverage: 174 tests passing, 8 skipped, 4 deselected
 - Code Quality: 0 linting errors (Black, isort, flake8, mypy)
-- Average Throughput: ~11.5 tok/s (MPS), ~17.4 tok/s (CUDA T4)
+- Phase 3D GPT2/DistilGPT2 (historical baseline): ~17.4 tok/s (CUDA T4, 32 tokens)
+- Phase 4A Llama 3.2 T4 small-batch sweep: BS=1: 8.45 tok/s, BS=2: 4.98 tok/s, BS=4: 4.68 tok/s (K=1, Llama 3.2 3B+1B, Tesla T4)
 - Success Rate: 100% across all validation runs
 
 ---
@@ -539,11 +540,15 @@ With custom kernels and KV cache integration complete on MPS, Phase 3D focuses o
 
 | Hardware | Configuration | Throughput (tok/s) | Acceptance (%) | Notes |
 |----------|--------------|-------------------|----------------|-------|
-| **MPS (M-series)** | Phase 3C.4, 32 tok | 9.50±2.21 (K=1) | 18.1±11.7% | Baseline |
-| **MPS (M-series)** | Phase 3D, 32 tok | ~11.5 avg | ~17% | All features enabled |
-| **CUDA (T4)** | Phase 3D, 32 tok | 17.24±4.96 (K=1) | 21.38±12.43% | 1.8× vs MPS |
-| **CUDA (T4)** | Phase 3D, 64 tok | 5.97±0.13 (K=4) | 39.8±0.0% | Production K-sweep (baseline) |
-| **CUDA (T4)** | Phase 4A, 64 tok | 5.88±0.14 (overall) | 39.8±0.0% | Phase 4A optimized (stable) |
+| **MPS (M-series)** | Phase 3C.4, GPT2+DistilGPT2, 32 tok | 9.50±2.21 (K=1) | 18.1±11.7% | Baseline |
+| **MPS (M-series)** | Phase 3D, GPT2+DistilGPT2, 32 tok | ~11.5 avg | ~17% | All features enabled |
+| **CUDA (T4)** | Phase 3D, GPT2+DistilGPT2, 32 tok | 17.24±4.96 (K=1) | 21.38±12.43% | 1.8× vs MPS |
+| **CUDA (T4)** | Phase 3D, GPT2+DistilGPT2, 64 tok | 5.97±0.13 (K=4) | 39.8±0.0% | Production K-sweep (baseline) |
+| **CUDA (T4)** | Phase 4A, GPT2+DistilGPT2, 64 tok | 5.88±0.14 (overall) | 39.8±0.0% | Phase 4A optimized (stable) |
+| **CUDA (T4)** | Phase 4A, Llama3.2 3B+1B, 64 tok, BS=1 | 8.45±1.68 (K=1) | 85.8±17.9% | Best throughput, high acceptance |
+| **CUDA (T4)** | Phase 4A, Llama3.2 3B+1B, 64 tok, BS=2 | 4.98±0.81 (K=1) | 64.9±7.2% | Throughput drops |
+| **CUDA (T4)** | Phase 4A, Llama3.2 3B+1B, 32 tok, BS=4 | 4.68±0.77 (K=1) | 61.8±12.9% | Reduced max_tokens for memory |
+| **CUDA (T4)** | Phase 4A, Llama3.2 3B baseline, 64 tok, BS=1 | 16.99±0.27 (non-spec) | N/A | ~2× faster than speculative |
 | **CUDA (A100)** | Planned | ~60 (target) | TBD | Expected 3.4× vs MPS |
 | **CUDA (H100)** | Planned | ~100+ (target) | TBD | Expected 5.7× vs MPS |
 
@@ -554,11 +559,13 @@ Phase 1A (OPT-125M baseline):     41.6 tok/s (MPS, single model)
 Phase 3C (GPT2 + DistilGPT2):      9.5 tok/s (MPS, speculative decoding)
 Phase 3D (GPT2 + DistilGPT2):     11.5 tok/s (MPS, all optimizations)
 Phase 3D (GPT2 + DistilGPT2):     17.4 tok/s (CUDA T4, baseline validation)
+Phase 4A (Llama 3.2 3B+1B):       8.45 tok/s (CUDA T4, BS=1, K=1, speculative)
+Phase 4A (Llama 3.2 3B baseline): 16.99 tok/s (CUDA T4, BS=1, non-speculative)
 Phase 3D (Expected A100):         ~60 tok/s (CUDA A100, target)
 Phase 3D (Expected H100):        ~100 tok/s (CUDA H100, target)
 ```
 
-> **Note**: Phase 1A and Phase 3 use different pipelines (single-model vs two-model speculative decoding) and are not directly comparable. Phase 3 throughput growth reflects optimization of the speculative decoding pipeline specifically.
+> **Note**: Phase 1A and Phase 3 use different pipelines (single-model vs two-model speculative decoding) and are not directly comparable. Phase 3 throughput growth reflects optimization of the speculative decoding pipeline specifically. Phase 4A introduces Llama 3.2 experiments, which show different acceptance behavior (62-86%) compared to GPT2/DistilGPT2 (~40%).
 
 ---
 
@@ -594,6 +601,38 @@ Phase 3D (Expected H100):        ~100 tok/s (CUDA H100, target)
 - Automatic fallback chain for kernels and device detection
 - Comprehensive logging with kernel backend status
 - YAML-driven configuration with CLI overrides
+
+---
+
+## Known Findings and Limitations (as of 2025-11-18)
+
+### Llama 3.2 T4 Behavior
+
+- **Best throughput at batch size 1**: On Tesla T4, speculative decoding with Llama 3.2 achieves optimal throughput (8.45 tok/s) at batch size 1 with high acceptance rate (~86%).
+
+- **Throughput and acceptance degradation at larger batch sizes**: Both throughput and acceptance rate drop significantly at batch sizes 2 and 4 (throughput: ~5.0 and ~4.7 tok/s; acceptance: ~62-65%). This highlights that speculative decoding does not trivially benefit from larger batches on small GPUs like T4.
+
+- **KV append disabled in current runs**: All new Llama 3.2 T4 runs used `SPECDEC_ENABLE_KV_APPEND=0`. These represent "pure" speculative results without KV cache reuse optimizations. Future work will test KV append on CUDA for Llama 3.2 to measure potential improvements.
+
+### Baseline Mode Bug
+
+- **Status: FIXED (2025-11-18)**: The baseline mode bug has been resolved. `SpeculativePipeline._check_compatibility()` now properly handles `draft_lm=None` by checking for baseline mode and skipping draft model compatibility checks. The fix is in `src/specdec/core/pipeline.py` lines 567-573.
+
+- **Baseline results available**: Non-speculative baseline runs are now functional. See Phase 4A baseline results below for Llama 3.2 3B baseline performance.
+
+### Hardware Limitations
+
+- **All new Llama 3.2 results are T4-only**: All Phase 4A Llama 3.2 experiments were conducted on Tesla T4 (Kaggle). No A100/H100 runs have been performed yet for Llama 3.2; they remain part of future work.
+
+- **T4 memory constraints**: Batch size 4 experiments required reducing `max_tokens` from 64 to 32 to avoid OOM errors, limiting direct comparison with smaller batch sizes.
+
+### Acceptance Sensitivity
+
+- **Model-specific acceptance behavior**: Speculative decoding effectiveness is very sensitive to acceptance rate, which varies significantly by model pairing:
+  - GPT2 + DistilGPT2 (Phase 3D): ~39.8% acceptance
+  - Llama 3.2 3B + Llama 3.2 1B (Phase 4A): 62-86% acceptance (depending on batch size)
+
+- **Batch size impact on acceptance**: The Llama 3.2 pairing shows acceptance rate degradation from ~86% (BS=1) to ~62% (BS=4), directly impacting speculative speedup. This suggests that batch processing may not be the optimal strategy for speculative decoding on memory-constrained GPUs.
 
 ---
 
@@ -729,6 +768,117 @@ Phase 3D (Expected H100):        ~100 tok/s (CUDA H100, target)
 
 ---
 
+### Phase 4A: Kaggle Tesla T4 – Llama 3.2 Batch Scaling (2025-11-18)
+
+**Objective**: Validate speculative decoding with larger models (Llama 3.2) on Tesla T4 hardware, measuring batch size scaling behavior.
+
+**Configuration**:
+- Base model: `meta-llama/Llama-3.2-3B`
+- Draft model: `meta-llama/Llama-3.2-1B`
+- K: 1 (single speculative token)
+- Device: CUDA (Tesla T4, Kaggle)
+- Max tokens: 64 for batch size 1 and 2, 32 for batch size 4 (to avoid OOM)
+- Prompt suite: 10 prompts (built-in suite)
+- Iterations: 3 for BS=1 (30 samples), 1 for BS=2 and BS=4 (10 samples each)
+
+**Environment Variables**:
+```
+export SPECDEC_FORCE_PYTORCH_BACKEND=1
+export SPECDEC_BATCH_SIZE=<1|2|4>
+export SPECDEC_PARALLEL_STREAMS=1
+export SPECDEC_DTYPE=float16
+export SPECDEC_ENABLE_KV_APPEND=0      # KV append disabled for these runs
+export SPECDEC_CUDA_GRAPH=0
+```
+
+**Results Summary**:
+
+| Batch size | Max tokens | Throughput (tok/s) | Acceptance | Samples | Notes |
+|------------|------------|-------------------|------------|---------|-------|
+| 1 | 64 | 8.45 ± 1.68 | 0.858 ± 0.179 | 30 | Highest throughput, high acceptance |
+| 2 | 64 | 4.98 ± 0.81 | 0.649 ± 0.072 | 10 | Throughput drops, acceptance lower |
+| 4 | 32 | 4.68 ± 0.77 | 0.618 ± 0.129 | 10 | Needs max_tokens=32 to fit in memory |
+
+**Baseline (Non-speculative, Llama 3.2 3B only)**:
+
+| Batch size | Max tokens | Throughput (tok/s) | Acceptance | Samples | Notes |
+|------------|------------|-------------------|------------|---------|-------|
+| 1 | 64 | 16.99 ± 0.27 | 1.0 (N/A) | 10 | Non-speculative baseline, ~2× faster than speculative |
+
+**Detailed Metrics**:
+
+**Batch Size 1** (64 tokens, 30 samples):
+- Throughput: 8.45 ± 1.68 tok/s
+- Acceptance rate: 0.858 ± 0.179 (≈85.8%)
+- Latency: 194.5 ± 425.3 ms (skewed by slow outliers)
+- Proposed tokens: 72.5 ± 38.8
+- Accepted tokens: 56.3 ± 16.7
+- GPU peak memory: ~9.66 GB / 14.74 GB
+- GPU utilization: ~64% (memory-based)
+- Success: 30/30 (100%)
+
+**Batch Size 2** (64 tokens, 10 samples):
+- Throughput: 4.98 ± 0.81 tok/s
+- Acceptance rate: 0.649 ± 0.072 (≈64.9%)
+- Latency: 207.6 ± 43.9 ms
+- Proposed tokens: 96.0 ± 32.0
+- Accepted tokens: 61.8 ± 8.3
+- Success: 10/10 (100%)
+
+**Batch Size 4** (32 tokens, 10 samples):
+- Throughput: 4.68 ± 0.77 tok/s
+- Acceptance rate: 0.618 ± 0.129 (≈61.8%)
+- Latency: 218.6 ± 29.8 ms
+- Proposed tokens: 56.4 ± 16.0
+- Accepted tokens: 33.8 ± 1.2
+- GPU peak memory: 8838.08 MB / 14.74 GB
+- GPU utilization: ~58.5% (memory-based)
+- Success: 10/10 (100%)
+
+**Interpretation**:
+
+On a Tesla T4, speculative decoding for Llama 3.2 shows distinct batch scaling behavior:
+
+1. **Best throughput at batch size 1**: 8.45 tok/s per sequence, with high acceptance rate (~86%). This represents the optimal single-sequence performance on T4 hardware.
+
+2. **Throughput degradation with larger batches**: At batch sizes 2 and 4, throughput drops to ~5.0 and ~4.7 tok/s respectively. This is counterintuitive compared to standard autoregressive decoding, where larger batches typically improve GPU utilization.
+
+3. **Acceptance rate degradation**: Acceptance rate falls from ~86% (BS=1) to ~62-65% (BS=2-4). This directly impacts speculative speedup, as lower acceptance means fewer draft tokens are reused.
+
+4. **Sequential verify bottleneck**: The verify step remains sequential in speculative decoding. Batching increases memory and compute overhead without corresponding gains, as each sequence's verification must complete before moving to the next speculative step.
+
+5. **KV append disabled**: These runs used `SPECDEC_ENABLE_KV_APPEND=0`, so they represent "pure" speculative results without KV cache reuse optimizations. Future work will test KV append on CUDA for Llama 3.2.
+
+6. **Model-specific behavior**: The Llama 3.2 pairing (3B + 1B) behaves very differently than the earlier GPT2+DistilGPT2 pairing. Phase 3D GPT2 runs showed ~39.8% acceptance, while Llama 3.2 shows 62-86% acceptance depending on batch size.
+
+**Comparison with Phase 3D GPT2 Results**:
+- Phase 3D GPT2/DistilGPT2 (T4, 64 tokens): ~5.97 tok/s at K=4, 39.8% acceptance
+- Phase 4A Llama 3.2 (T4, 64 tokens, BS=1): 8.45 tok/s at K=1, 85.8% acceptance
+- The Llama 3.2 pairing shows higher acceptance but similar or slightly better throughput, highlighting model-specific characteristics of speculative decoding.
+
+**Baseline Comparison** (Non-speculative, Llama 3.2 3B only, T4, 64 tokens, BS=1):
+- **Baseline throughput**: 16.99 ± 0.27 tok/s (10 samples, 100% success)
+- **Speculative throughput**: 8.45 ± 1.68 tok/s (30 samples, BS=1, K=1)
+- **Finding**: On T4, the non-speculative baseline is approximately 2× faster than speculative decoding for Llama 3.2 at batch size 1. This suggests that the overhead of running both base and draft models, plus the verification step, outweighs the benefits of speculative decoding at this batch size and model pairing on T4 hardware. The sequential verify loop and memory bandwidth limitations on T4 likely contribute to this result.
+
+**Next Steps** (based on 2025-11-18 results):
+
+1. ~~**Fix non-speculative baseline**~~: **COMPLETE** - Baseline mode now works correctly.
+
+2. **Re-run Llama 3.2 on T4 with**:
+   - Valid baseline vs speculative comparison (baseline mode now working).
+   - K sweep (K=1-4) to measure acceptance and throughput across different speculative depths.
+
+3. **Plan A100 / H100 runs**:
+   - Reuse the same prompt suite and configuration to get proper scaling curves across GPUs.
+   - Measure whether batch size scaling behavior differs on larger GPUs with more memory bandwidth.
+
+4. **Explore enabling KV append for Llama 3.2**:
+   - Run the same batch size experiments with `SPECDEC_ENABLE_KV_APPEND=1`.
+   - Measure any change in throughput and acceptance rate with KV cache reuse enabled.
+
+---
+
 ### Phase 4B: Advanced Quantization (Planned)
 
 **Objective**: Implement INT8/INT4 quantization techniques for memory-constrained deployments.
@@ -843,6 +993,6 @@ speculative decoding experiments. https://github.com/GogoRit/llm-inference-lab
 
 ---
 
-**Last Updated**: 2025-11-05  
-**Current Status**: Phase 4A In Progress – Batch Processing Profiling Complete, GPU Compute Optimization Next  
-**Next Milestone**: GPU Compute Optimization (Verify-Loop Kernel) → Dynamic Batching → Phase 4B (Quantization)
+**Last Updated**: 2025-11-18  
+**Current Status**: Phase 4A In Progress – Llama 3.2 T4 Batch Scaling Experiments Complete  
+**Next Milestone**: Fix Baseline Mode → Llama 3.2 K-Sweep → A100/H100 Validation → Phase 4B (Quantization)

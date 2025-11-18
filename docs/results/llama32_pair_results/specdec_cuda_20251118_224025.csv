@@ -1,0 +1,2 @@
+k,n_samples,n_failures,success_rate,latency_ms_mean,latency_ms_std,tokens_per_sec_mean,tokens_per_sec_std,acceptance_rate_mean,acceptance_rate_std,kv_appended_tokens_mean,kv_appended_tokens_std,kv_append_time_ms_mean,kv_append_time_ms_std,proposed_mean,proposed_std,accepted_mean,accepted_std,device,dtype
+1,30,0,1.0,194.46955857899894,425.2969903786161,8.451639572732244,1.6819063082982832,0.8579287361867348,0.17873519370567711,0.0,0.0,0.0,0.0,72.5,38.75198919625503,56.333333333333336,16.719914938645935,cuda,float16
