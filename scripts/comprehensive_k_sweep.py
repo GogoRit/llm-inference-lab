@@ -214,6 +214,7 @@ def run_comprehensive_k_sweep(
     device="auto",
     deterministic: bool = False,
     verbose: bool = False,
+    max_k: int = 4,
 ):
     """Run comprehensive K-sweep test with 10-prompt suite."""
 
@@ -335,8 +336,8 @@ def run_comprehensive_k_sweep(
     # Cache pipelines per K to avoid reloading models
     pipeline_cache = {}
 
-    for k in range(1, 5):  # K = 1, 2, 3, 4
-        logger.info(f"Testing K={k}...")
+    for k in range(1, max_k + 1):  # K = 1, 2, ..., max_k
+        logger.info(f"Testing K={k} (max_k={max_k})...")
 
         # Create pipeline once per K (cached)
         if k not in pipeline_cache:
@@ -375,6 +376,66 @@ def run_comprehensive_k_sweep(
                 logger.error(f"  Failed to create pipeline for K={k}: {e}")
                 logger.error(f"  Traceback: {traceback.format_exc()}")
                 pipeline_cache[k] = None
+
+                # Skip this K entirely - record failure summary and continue to next K
+                total_attempts = iterations * len(PROMPT_SUITE)
+                error_msg = f"Pipeline creation failed for K={k}: {str(e)}"
+
+                # Add summary row for this failed K
+                results.append(
+                    {
+                        "k": k,
+                        "n_samples": 0,
+                        "n_failures": total_attempts,
+                        "success_rate": 0.0,
+                        "latency_ms_mean": float("nan"),
+                        "latency_ms_std": float("nan"),
+                        "tokens_per_sec_mean": float("nan"),
+                        "tokens_per_sec_std": float("nan"),
+                        "acceptance_rate_mean": float("nan"),
+                        "acceptance_rate_std": float("nan"),
+                        "proposed_mean": float("nan"),
+                        "proposed_std": float("nan"),
+                        "accepted_mean": float("nan"),
+                        "accepted_std": float("nan"),
+                        "device": resolved_device,
+                        "dtype": (
+                            "float16"
+                            if resolved_device in ["cuda", "mps"]
+                            else "float32"
+                        ),
+                    }
+                )
+
+                # Add one detailed_results entry per prompt (not per iteration)
+                for prompt_idx, prompt in enumerate(PROMPT_SUITE):
+                    detailed_result = {
+                        "k": k,
+                        "iteration": 1,  # Use iteration=1 for pipeline init failures
+                        "prompt_idx": prompt_idx + 1,
+                        "prompt_name": prompt,
+                        "prompt": prompt,
+                        "prompt_text": prompt,
+                        "completion_text": "",
+                        "full_text": "",
+                        "completion_token_count": 0,
+                        "error": error_msg,
+                        "error_type": "pipeline_init",
+                        "success": False,
+                        "device": resolved_device,
+                        "dtype": (
+                            "float16"
+                            if resolved_device in ["cuda", "mps"]
+                            else "float32"
+                        ),
+                    }
+                    detailed_results.append(detailed_result)
+
+                logger.warning(
+                    f"  Skipping K={k} entirely due to pipeline creation failure. "
+                    f"Recorded {len(PROMPT_SUITE)} failure entries."
+                )
+                continue  # Skip to next K without running iterations
 
         k_results = []
         k_failures = 0
@@ -456,9 +517,9 @@ def run_comprehensive_k_sweep(
 
                 try:
                     # Use cached pipeline
+                    # Note: pipeline_cache[k] should never be None here because
+                    # we skip K entirely if pipeline creation fails (see above)
                     pipeline = pipeline_cache[k]
-                    if pipeline is None:
-                        raise Exception("Pipeline creation failed for this K")
 
                     # GPU sync before batch to ensure clean state
                     if resolved_device == "cuda" and torch.cuda.is_available():
@@ -584,6 +645,7 @@ def run_comprehensive_k_sweep(
                             "prompt_text": prompt_text,  # Full prompt text
                             "completion_text": completion_text,  # Only the generated continuation
                             "full_text": full_text,  # Full sequence for debugging
+                            "completion_token_count": generated_tokens_count,  # Number of generated tokens
                             "latency_ms": latency_ms,
                             "tokens_per_sec": tokens_per_sec,
                             "acceptance_rate": acceptance_rate,
@@ -756,6 +818,13 @@ def run_comprehensive_k_sweep(
             kv_appended_counts = [r["kv_appended_tokens"] for r in valid_results]
             kv_append_times = [r["kv_append_time_ms"] for r in valid_results]
 
+            # Clamp acceptance rate mean to [0.0, 1.0] for human readability
+            # (raw values in detailed_results remain unclamped for debugging)
+            acceptance_rate_mean = (
+                float(np.mean(acceptance_rates)) if acceptance_rates else 0.0
+            )
+            acceptance_rate_mean = max(0.0, min(1.0, acceptance_rate_mean))
+
             results.append(
                 {
                     "k": k,
@@ -766,7 +835,7 @@ def run_comprehensive_k_sweep(
                     "latency_ms_std": np.std(latencies),
                     "tokens_per_sec_mean": np.mean(throughputs),
                     "tokens_per_sec_std": np.std(throughputs),
-                    "acceptance_rate_mean": np.mean(acceptance_rates),
+                    "acceptance_rate_mean": acceptance_rate_mean,
                     "acceptance_rate_std": np.std(acceptance_rates),
                     "kv_appended_tokens_mean": np.mean(kv_appended_counts),
                     "kv_appended_tokens_std": np.std(kv_appended_counts),
@@ -1141,6 +1210,12 @@ def main():
             "(seeds, cudnn.deterministic, disable experimental draftors)"
         ),
     )
+    parser.add_argument(
+        "--max-k",
+        type=int,
+        default=4,
+        help="Maximum K value to sweep (1..max_k)",
+    )
 
     args = parser.parse_args()
 
@@ -1158,7 +1233,9 @@ def main():
         f"Starting comprehensive K-sweep test: {args.base_model} + {args.draft_model}"
     )
     logger.info(f"Device: {resolved_device} (requested: {args.device})")
-    logger.info(f"Max tokens: {args.max_tokens}, Iterations: {args.iterations}")
+    logger.info(
+        f"Max tokens: {args.max_tokens}, Iterations: {args.iterations}, Max K: {args.max_k}"
+    )
     logger.info(f"Prompt suite: {len(PROMPT_SUITE)} prompts")
 
     # Get system info (add kernel info + deterministic)
@@ -1177,6 +1254,7 @@ def main():
         device=args.device,
         deterministic=args.deterministic,
         verbose=args.verbose,
+        max_k=args.max_k,
     )
 
     # Save results
