@@ -516,10 +516,10 @@ def run_comprehensive_k_sweep(
                         acceptance_rate = result.get("acceptance_rate", 0.0)
                         proposed = result.get("proposed", 0)
                         accepted = result.get("accepted", 0)
-                        generated_tokens_count = result.get("generated_tokens", 0)
-                        if isinstance(generated_tokens_count, list):
-                            generated_tokens_count = len(generated_tokens_count)
-                        text = result.get("text", "")
+                        generated_tokens_list = result.get("generated_tokens", [])
+                        if not isinstance(generated_tokens_list, list):
+                            generated_tokens_list = []
+                        generated_tokens_count = len(generated_tokens_list)
                         kv_appended = result.get("kv_appended_tokens_total", 0)
                         kv_append_time = result.get("kv_append_time_ms", 0.0)
                         kv_append_enabled = result.get("kv_append_enabled", False)
@@ -533,6 +533,37 @@ def run_comprehensive_k_sweep(
                         if np.isnan(acceptance_rate) or np.isinf(acceptance_rate):
                             acceptance_rate = 0.0
 
+                        # Separate prompt and completion text
+                        # Get tokenizer from pipeline
+                        tokenizer = pipeline.base_lm.tokenizer
+
+                        # Tokenize the prompt exactly as it was done before calling the model
+                        # For a single string, input_ids is a list of token IDs
+                        prompt_encoded = tokenizer(prompt, add_special_tokens=False)
+                        prompt_ids = prompt_encoded.input_ids
+                        # Ensure prompt_ids is a flat list (handle case where it might be nested)
+                        if prompt_ids and isinstance(prompt_ids[0], list):
+                            prompt_ids = prompt_ids[0]
+
+                        # generated_tokens_list contains only the generated tokens (no prompt)
+                        completion_ids = generated_tokens_list
+
+                        # Decode separately
+                        prompt_text = prompt  # The actual prompt text
+                        completion_text = (
+                            tokenizer.decode(completion_ids, skip_special_tokens=True)
+                            if completion_ids
+                            else ""
+                        )
+
+                        # Also decode full sequence for debugging (optional)
+                        full_ids = prompt_ids + completion_ids
+                        full_text = (
+                            tokenizer.decode(full_ids, skip_special_tokens=True)
+                            if full_ids
+                            else ""
+                        )
+
                         # Log progress for each prompt (only if verbose)
                         if verbose:
                             print(
@@ -543,12 +574,16 @@ def run_comprehensive_k_sweep(
                                 flush=True,
                             )
 
-                        # Store detailed result (minimal logging during generation)
+                        # Store detailed result with separate prompt and completion fields
                         detailed_result = {
                             "k": k,
                             "iteration": iteration + 1,
                             "prompt_idx": prompt_idx + 1,
-                            "prompt": prompt,
+                            "prompt_name": prompt,  # Short label (kept for backward compatibility)
+                            "prompt": prompt,  # Keep for backward compatibility
+                            "prompt_text": prompt_text,  # Full prompt text
+                            "completion_text": completion_text,  # Only the generated continuation
+                            "full_text": full_text,  # Full sequence for debugging
                             "latency_ms": latency_ms,
                             "tokens_per_sec": tokens_per_sec,
                             "acceptance_rate": acceptance_rate,
@@ -558,7 +593,12 @@ def run_comprehensive_k_sweep(
                             "kv_append_time_ms": kv_append_time,
                             "kv_append_enabled": kv_append_enabled,
                             "kv_append_backend": kv_append_backend,
-                            "text": text[:100] + "..." if len(text) > 100 else text,
+                            # For backward compatibility, `text` mirrors the generated completion (truncated).
+                            "text": (
+                                completion_text[:100] + "..."
+                                if len(completion_text) > 100
+                                else completion_text
+                            ),
                             "success": True,
                             "device": resolved_device,
                             "dtype": (
