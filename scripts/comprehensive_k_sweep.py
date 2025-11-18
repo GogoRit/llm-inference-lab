@@ -1229,9 +1229,16 @@ def main():
     # Resolve device
     resolved_device = resolve_device(args.device)
 
-    logger.info(
-        f"Starting comprehensive K-sweep test: {args.base_model} + {args.draft_model}"
-    )
+    # Check if baseline mode (no draft model)
+    is_baseline = args.draft_model.lower() in ("none", "")
+    if is_baseline:
+        logger.info(
+            f"Running non-speculative baseline (no draft model): {args.base_model}"
+        )
+    else:
+        logger.info(
+            f"Starting comprehensive K-sweep test: {args.base_model} + {args.draft_model}"
+        )
     logger.info(f"Device: {resolved_device} (requested: {args.device})")
     logger.info(
         f"Max tokens: {args.max_tokens}, Iterations: {args.iterations}, Max K: {args.max_k}"

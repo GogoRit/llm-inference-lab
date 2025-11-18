@@ -309,9 +309,23 @@ class SpeculativePipeline(SpeculativeDecoder):
         self.base_lm = base_lm or self._create_base_model()
         self.draft_lm = draft_lm or self._create_draft_model()
 
-        # Initialize policy and controller
-        self.policy = self._create_policy(policy, policy_params)
-        self.controller = self._create_controller(controller, controller_params)
+        # Check if baseline mode (no speculative decoding)
+        self.speculative_enabled = self.draft_lm is not None
+        if not self.speculative_enabled:
+            self.logger.info(
+                "Non-speculative baseline mode enabled: using only base model "
+                "for standard autoregressive decoding"
+            )
+
+        # Initialize policy and controller (only needed for speculative mode)
+        if self.speculative_enabled:
+            self.policy = self._create_policy(policy, policy_params)
+            self.controller = self._create_controller(controller, controller_params)
+        else:
+            # Create dummy policy/controller to avoid AttributeError
+            # (they won't be used in baseline mode)
+            self.policy = self._create_policy(policy, policy_params)
+            self.controller = self._create_controller(controller, controller_params)
 
         # Initialize speculative scheduler
         self.scheduler = self._create_scheduler()
@@ -463,8 +477,14 @@ class SpeculativePipeline(SpeculativeDecoder):
         else:
             raise ValueError(f"Unknown implementation: {self.implementation}")
 
-    def _create_draft_model(self) -> LanguageModel:
+    def _create_draft_model(self) -> Optional[LanguageModel]:
         """Create the draft language model based on implementation."""
+        # Check if baseline mode is requested (no draft model)
+        draft_model_name = self.config.get("draft_model", "")
+        if draft_model_name in (None, "", "none", "NONE"):
+            self.logger.info("Baseline mode: No draft model will be loaded")
+            return None
+
         if self.implementation == "fake":
             return create_fake_lm(
                 model_name=f"fake-draft-{self.config['draft_model']}",
@@ -1374,6 +1394,196 @@ class SpeculativePipeline(SpeculativeDecoder):
             self.logger.error(f"Speculative decoding failed: {e}")
             raise
 
+    def _generate_batch_baseline(
+        self,
+        prompts: List[str],
+        max_tokens: int,
+        temperature: float,
+        do_sample: bool,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Baseline generation path: standard autoregressive decoding using only base model.
+
+        This method runs non-speculative generation for all prompts and returns
+        results in the same format as the speculative path for compatibility.
+
+        Args:
+            prompts: List of input prompt strings
+            max_tokens: Maximum tokens to generate per prompt
+            temperature: Sampling temperature
+            do_sample: Whether to use sampling
+            **kwargs: Additional generation parameters
+
+        Returns:
+            List of result dictionaries, one per prompt
+        """
+        batch_size = len(prompts)
+        self.logger.info(
+            f"[BASELINE] Running non-speculative generation for {batch_size} prompts"
+        )
+
+        # Track memory before batch
+        mem_before = (
+            torch.cuda.memory_allocated()
+            if self.device == "cuda" and torch.cuda.is_available()
+            else 0
+        )
+
+        # Tokenize all prompts
+        tokenizer = (
+            self.base_lm._tokenizer if hasattr(self.base_lm, "_tokenizer") else None
+        )
+        if tokenizer is None:
+            raise ValueError("Base model must have a tokenizer for baseline mode")
+
+        encoded = tokenizer(
+            prompts,
+            padding=True,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+
+        # Move to device
+        if self.device == "cuda" and torch.cuda.is_available():
+            batch_input_ids = (
+                encoded["input_ids"].pin_memory().to(self.device, non_blocking=True)
+            )
+            batch_attention_mask = (
+                encoded["attention_mask"]
+                .pin_memory()
+                .to(self.device, non_blocking=True)
+            )
+        else:
+            batch_input_ids = encoded["input_ids"].to(self.device)
+            batch_attention_mask = encoded["attention_mask"].to(self.device)
+
+        # Track time
+        batch_start_time = time.time()
+
+        # Generate using base model only (standard autoregressive)
+        with torch.no_grad():
+            outputs = self.base_lm._model.generate(  # type: ignore
+                input_ids=batch_input_ids,
+                attention_mask=batch_attention_mask,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=do_sample,
+                pad_token_id=tokenizer.eos_token_id,  # type: ignore
+                eos_token_id=tokenizer.eos_token_id,  # type: ignore
+                return_dict_in_generate=True,
+                **kwargs,
+            )
+
+        # GPU sync if CUDA
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        batch_end_time = time.time()
+        total_time_ms = (batch_end_time - batch_start_time) * 1000
+
+        # Extract generated tokens for each prompt
+        batch_generated_tokens = []
+        initial_lengths = batch_input_ids.shape[1]
+
+        for i in range(batch_size):
+            # Extract generated tokens (excluding prompt)
+            generated_ids = outputs.sequences[i, initial_lengths:]  # type: ignore
+            # Convert to list and filter out padding/EOS
+            generated_list = generated_ids.cpu().tolist()
+            # Filter out EOS tokens that appear after generation
+            eos_token_id = tokenizer.eos_token_id  # type: ignore
+            filtered_tokens = []
+            for tok in generated_list:
+                if tok == eos_token_id:
+                    break
+                filtered_tokens.append(tok)
+            batch_generated_tokens.append(filtered_tokens)
+
+        # Get kernel backend info for compatibility
+        try:
+            from kernels import get_kernel_info
+
+            kernel_info = get_kernel_info()
+            kv_append_backend = kernel_info.get("kv_append_backend", "unknown")
+        except ImportError:
+            kv_append_backend = "unavailable"
+
+        # Build result dictionaries compatible with speculative path
+        results = []
+        for i, (prompt, generated_tokens) in enumerate(
+            zip(prompts, batch_generated_tokens)
+        ):
+            # Decode generated tokens
+            if generated_tokens:
+                generated_text = self.base_lm.decode(generated_tokens)
+            else:
+                generated_text = ""
+
+            # Calculate metrics
+            num_tokens = len(generated_tokens)
+            prompt_throughput = (
+                num_tokens / (total_time_ms / 1000.0) if total_time_ms > 0 else 0.0
+            )
+            prompt_latency_ms = total_time_ms / num_tokens if num_tokens > 0 else 0.0
+
+            # For baseline mode, all tokens are "proposed" and "accepted"
+            # (compatibility with speculative path metrics)
+            results.append(
+                {
+                    "prompt": prompt,
+                    "text": generated_text,
+                    "generated_text": generated_text,
+                    "generated_tokens": generated_tokens,
+                    "num_generated": num_tokens,
+                    "batch_index": i,
+                    "batch_size": batch_size,
+                    "latency_ms": prompt_latency_ms,
+                    "total_time_ms": total_time_ms,
+                    "tokens_per_sec": prompt_throughput,
+                    "throughput_tokens_per_sec": prompt_throughput,
+                    "acceptance_rate": 1.0,  # All tokens accepted in baseline
+                    "proposed": num_tokens,  # All generated tokens
+                    "accepted": num_tokens,  # All generated tokens
+                    "draft_avg_ms": 0.0,  # No draft model
+                    "verify_avg_ms": 0.0,  # No verification
+                    "batch_metrics": {
+                        "total_steps": 1,  # Single generation step
+                        "total_proposed": num_tokens,
+                        "total_accepted": num_tokens,
+                        "total_draft_time_ms": 0.0,
+                        "total_verification_time_ms": 0.0,
+                        "total_generation_time_ms": total_time_ms,
+                    },
+                    "kv_append_enabled": False,
+                    "kv_append_backend": kv_append_backend,
+                    "kv_appended_tokens": 0,
+                    "kv_append_time_ms": 0.0,
+                }
+            )
+
+        # Track memory after batch
+        mem_after = (
+            torch.cuda.memory_allocated()
+            if self.device == "cuda" and torch.cuda.is_available()
+            else 0
+        )
+        mem_used_mb = (mem_after - mem_before) / (1024 * 1024)
+
+        if mem_after > 0:
+            print(
+                f"[BASELINE] GPU memory after: {mem_after / (1024**2):.2f} MB | "
+                f"Delta: {mem_used_mb:.2f} MB",
+                flush=True,
+            )
+
+        self.logger.info(
+            f"Baseline batch generation complete: {batch_size} prompts, "
+            f"GPU memory used: {mem_used_mb:.2f} MB"
+        )
+
+        return results
+
     def generate_batch(
         self,
         prompts: List[str],
@@ -1423,6 +1633,12 @@ class SpeculativePipeline(SpeculativeDecoder):
         temperature = temperature or self.config["temperature"]
         do_sample = do_sample if do_sample is not None else self.config["do_sample"]
 
+        # Baseline mode: non-speculative generation using only base model
+        if not self.speculative_enabled:
+            return self._generate_batch_baseline(
+                prompts, max_tokens, temperature, do_sample, **kwargs
+            )
+
         # Model init diagnostics (only print once, gated with SPECDEC_DEBUG)
         if not hasattr(self, "_batch_init_printed"):
             if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
@@ -1454,8 +1670,10 @@ class SpeculativePipeline(SpeculativeDecoder):
             ]
 
         # Tokenizer alignment check - ensure both models use same tokenizer
+        # (only if draft model exists)
         if (
-            hasattr(self.draft_lm, "_tokenizer")
+            self.speculative_enabled
+            and hasattr(self.draft_lm, "_tokenizer")
             and self.draft_lm._tokenizer is not None
         ):
             draft_tokenizer = self.draft_lm._tokenizer
