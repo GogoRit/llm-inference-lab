@@ -78,20 +78,20 @@ def verify_prefix_triton_kernel(
         tl.store(accepted_mask_ptr + mask_offset, is_match.to(tl.uint8))
 
     # Compute prefix length (sequential check)
-    # CRITICAL: Triton doesn't support break statements, use flag-based termination
+    # CRITICAL: Triton doesn't support break or continue statements, use conditional checks only
     prefix_len = 0
     found_mismatch = False
     for k in range(K):
-        if found_mismatch:
-            # Skip remaining positions after first mismatch
-            continue
         mask_offset = batch_idx * accepted_mask_stride_b + k * accepted_mask_stride_k
         is_accepted = tl.load(accepted_mask_ptr + mask_offset)
 
-        if is_accepted:
+        if not found_mismatch and is_accepted:
             prefix_len += 1
-        else:
+        elif not found_mismatch and not is_accepted:
             found_mismatch = True
+        else:
+            # already mismatched, do nothing
+            pass
 
     # Store accept_len
     accept_len_offset = batch_idx

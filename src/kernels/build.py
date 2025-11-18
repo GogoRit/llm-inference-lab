@@ -149,21 +149,31 @@ def load_kernels():
     except Exception as e:
         logger.warning(f"CUDA kernels failed: {e}")
 
-    # Try Triton fallback
-    try:
-        # import triton  # Unused import
+    # Try Triton fallback (skip if forced to PyTorch)
+    force_pytorch = os.getenv("SPECDEC_FORCE_PYTORCH_BACKEND", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not force_pytorch:
+        try:
+            # import triton  # Unused import
 
-        from .triton.verify import verify_prefix_triton
+            from .triton.verify import verify_prefix_triton
 
-        kernels["verify_prefix"] = verify_prefix_triton
-        kernels["verify_backend"] = "triton"
-        kernels["kv_append_backend"] = "noop"  # Triton doesn't have KV append
-        logger.info("Using Triton kernels (verify only)")
-        return kernels
-    except ImportError:
-        logger.info("Triton not available, falling back to Python")
-    except Exception as e:
-        logger.warning(f"Triton kernels failed: {e}")
+            kernels["verify_prefix"] = verify_prefix_triton
+            kernels["verify_backend"] = "triton"
+            kernels["kv_append_backend"] = "noop"  # Triton doesn't have KV append
+            logger.info("Using Triton kernels (verify only)")
+            return kernels
+        except ImportError:
+            logger.info("Triton not available, falling back to Python")
+        except Exception as e:
+            logger.warning(f"Triton kernels failed: {e}")
+    else:
+        logger.info(
+            "SPECDEC_FORCE_PYTORCH_BACKEND is set, skipping Triton kernel loading"
+        )
 
     # Fall back to Python reference implementation
     from . import reference

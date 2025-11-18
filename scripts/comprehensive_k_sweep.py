@@ -300,19 +300,33 @@ def run_comprehensive_k_sweep(
     else:
         logger.info("Deterministic mode: OFF")
 
-    # Kernel backend audit (single line)
+    # Kernel backend audit - log which verify backend is active
     kinfo = get_kernel_info()
     dtype_str = "float16" if resolved_device in ["cuda", "mps"] else "float32"
+    verify_backend = kinfo.get("verify_backend", "unknown")
+    logger.info(f"Using verify backend: {verify_backend}")
     logger.info(
         "Kernel backends: "
-        f"verify={kinfo.get('verify_backend')}, "
+        f"verify={verify_backend}, "
         f"kv_append={kinfo.get('kv_append_backend')}, "
         f"device={resolved_device}, dtype={dtype_str}"
     )
-    if resolved_device == "cuda" and kinfo.get("verify_backend") != "cuda":
+
+    # Check if forced to PyTorch
+    force_pytorch = os.getenv("SPECDEC_FORCE_PYTORCH_BACKEND", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if force_pytorch:
+        logger.info(
+            "SPECDEC_FORCE_PYTORCH_BACKEND is set - Triton verify kernel disabled"
+        )
+
+    if resolved_device == "cuda" and verify_backend not in ("cuda", "triton", "torch"):
         logger.warning(
-            "CUDA requested but verify kernel backend is not CUDA; falling back to "
-            f"{kinfo.get('verify_backend')}"
+            f"CUDA requested but verify kernel backend is {verify_backend}; "
+            "this may indicate a configuration issue"
         )
 
     results = []

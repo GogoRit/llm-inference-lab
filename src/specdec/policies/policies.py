@@ -82,6 +82,21 @@ class LongestPrefixPolicy(AcceptancePolicy):
         self.kernel_info = (
             get_kernel_info() if KERNELS_AVAILABLE else {"verify_backend": "fallback"}
         )
+        # Log which backend is active at initialization
+        force_pytorch = os.getenv("SPECDEC_FORCE_PYTORCH_BACKEND", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if force_pytorch:
+            logger.info(
+                "Using verify backend: torch (SPECDEC_FORCE_PYTORCH_BACKEND is set)"
+            )
+        elif KERNELS_AVAILABLE:
+            backend = self.kernel_info.get("verify_backend", "unknown")
+            logger.info(f"Using verify backend: {backend}")
+        else:
+            logger.info("Using verify backend: torch (kernels not available)")
 
     def accept_tokens(
         self,
@@ -98,13 +113,16 @@ class LongestPrefixPolicy(AcceptancePolicy):
             "true",
             "yes",
         )
-        if (
-            not force_pytorch
-            and self.kernels_available
+
+        # If forced to PyTorch, skip kernel entirely
+        if force_pytorch:
+            # Fall through to PyTorch implementation below
+            pass
+        elif (
+            self.kernels_available
             and base_logits is not None
             and base_logits.device.type == "cuda"
         ):
-
             try:
                 # Get kernel for current device
                 verify_kernel = get_verify_prefix(base_logits.device.type)
@@ -123,9 +141,14 @@ class LongestPrefixPolicy(AcceptancePolicy):
                         "verify_backend": self.kernel_info["verify_backend"],
                     }
             except Exception as e:
-                logger.warning(
-                    f"Kernel verification failed, falling back to PyTorch: {e}"
-                )
+                # Only log once per process to avoid spam
+                import sys
+
+                if not hasattr(sys, "_triton_fallback_warned_policy"):  # type: ignore[attr-defined]
+                    logger.warning(
+                        f"Kernel verification failed, falling back to PyTorch: {e}"
+                    )
+                    sys._triton_fallback_warned_policy = True  # type: ignore[attr-defined]
 
         # Fallback to PyTorch implementation
         # Use base_logits.argmax() for consistent verification (matches kernel path)
