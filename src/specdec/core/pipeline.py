@@ -1717,6 +1717,12 @@ class SpeculativePipeline(SpeculativeDecoder):
         if not prompts:
             return []
 
+        # CRITICAL: Reset KV cache manager state at the start of each batch
+        # This prevents state leakage from previous batches in K-sweep benchmarks
+        self.kv_cache_manager.reset()
+        if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+            self.logger.debug("[BATCH] Reset KV cache manager state for fresh batch")
+
         batch_size = len(prompts)
         self.logger.info(f"Starting batched generation for {batch_size} prompts")
         if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
@@ -2664,6 +2670,25 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # Use CUDA events for accurate verify timing (same as draft)
                 verify_start_wall = time.time()
 
+                # CRITICAL: Initialize base_current_seq_lens_for_model before all code paths
+                # to prevent UnboundLocalError in fallback/non-KV-cache scenarios
+                base_past_kv = None
+                base_current_seq_lens_for_model: Optional[List[int]] = None
+                if kv_cache_enabled:
+                    # Use relative indices for KV cache retrieval (0 to active_count-1)
+                    base_past_kv = self.kv_cache_manager.get_base_past_kv(
+                        relative_indices_tensor
+                    )
+                    # Extract current_seq_lens for active sequences (for attention mask construction)
+                    base_current_seq_lens_for_model = [
+                        (
+                            self.kv_cache_manager.base_current_seq_lens[i]
+                            if i < len(self.kv_cache_manager.base_current_seq_lens)
+                            else current_seq_lens[active_indices[i]]
+                        )
+                        for i in range(len(active_indices))
+                    ]
+
                 # Use scheduler's multi-stream verification if available for proper stream management
                 # Create dummy draft tokens tensor for scheduler API (it needs draft_tokens shape)
                 # Note: We use actual draft_tokens shape but scheduler doesn't use the values
@@ -2731,13 +2756,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         verify_time_ms = (time.time() - verify_start_wall) * 1000
                 elif verify_stream is not None and draft_stream is not None:
                     # Manual stream management if scheduler not available
-                    # Prepare past_key_values for base model using centralized manager
-                    base_past_kv = None
-                    if kv_cache_enabled:
-                        # Use relative indices for KV cache retrieval (0 to active_count-1)
-                        base_past_kv = self.kv_cache_manager.get_base_past_kv(
-                            relative_indices_tensor
-                        )
+                    # base_past_kv and base_current_seq_lens_for_model already initialized above
 
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
@@ -2847,24 +2866,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # OPTIMIZATION: Event sync is sufficient, no need for full device sync
                         # This reduces CPU-GPU synchronization overhead
 
-                    # Prepare past_key_values for base model using centralized manager
-                    # ZERO-COPY: Pass current_seq_lens to model for proper attention masking
-                    base_past_kv = None
-                    base_current_seq_lens_for_model: Optional[List[int]] = None
-                    if kv_cache_enabled:
-                        # Use relative indices for KV cache retrieval (0 to active_count-1)
-                        base_past_kv = self.kv_cache_manager.get_base_past_kv(
-                            relative_indices_tensor
-                        )
-                        # Extract current_seq_lens for active sequences (for attention mask construction)
-                        base_current_seq_lens_for_model = [
-                            (
-                                self.kv_cache_manager.base_current_seq_lens[i]
-                                if i < len(self.kv_cache_manager.base_current_seq_lens)
-                                else current_seq_lens[active_indices[i]]
-                            )
-                            for i in range(len(active_indices))
-                        ]
+                    # base_past_kv and base_current_seq_lens_for_model already initialized above
 
                     # Single validation point before model call
                     base_vocab_size = get_vocab_size(self.base_lm)
