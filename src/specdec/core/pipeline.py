@@ -1158,7 +1158,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # The draft tokens will be processed in parallel during prefill, and we only need
                 # to generate 1 additional token (the bonus token) for verification
                 # Handle the case where draft_tokens might be empty (k=0 or generation failure)
-                if draft_tokens is not None and draft_tokens.numel() > 0 and draft_tokens.shape[1] > 0:
+                if (
+                    draft_tokens is not None
+                    and draft_tokens.numel() > 0
+                    and draft_tokens.shape[1] > 0
+                ):
                     verify_input_ids = torch.cat([current_input, draft_tokens], dim=1)
                 else:
                     # Fallback: if no draft tokens, use original input (K=0 case)
@@ -2734,21 +2738,27 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # The draft tokens will be processed in parallel during prefill, and we only need
                 # to generate 1 additional token (the bonus token) for verification
                 # Handle the case where draft_tokens might be empty (k=0 or generation failure)
-                
+
                 # Wait for draft to complete before appending (we need draft_tokens)
                 if draft_end_event is not None:
                     draft_end_event.synchronize()
-                
+
                 # Initialize verify_input_ids - use active_input_ids_prepared if available, else active_input_ids
                 # Check if active_input_ids_prepared exists in the current scope
                 try:
                     base_input_for_verify = active_input_ids_prepared
                 except NameError:
                     base_input_for_verify = active_input_ids
-                
+
                 # Append draft tokens if they exist and are not empty
-                if draft_tokens is not None and draft_tokens.numel() > 0 and draft_tokens.shape[1] > 0:
-                    verify_input_ids = torch.cat([base_input_for_verify, draft_tokens], dim=1)
+                if (
+                    draft_tokens is not None
+                    and draft_tokens.numel() > 0
+                    and draft_tokens.shape[1] > 0
+                ):
+                    verify_input_ids = torch.cat(
+                        [base_input_for_verify, draft_tokens], dim=1
+                    )
                 else:
                     # Fallback: if no draft tokens, use original input (K=0 case)
                     verify_input_ids = base_input_for_verify
@@ -2756,41 +2766,59 @@ class SpeculativePipeline(SpeculativeDecoder):
                         self.logger.debug(
                             f"Step {step}: No draft tokens available, using original input for verification"
                         )
-                
+
                 # Update attention mask to include draft tokens (all are valid tokens)
                 verify_attention_mask = None
                 if active_attention_mask is not None:
-                    if draft_tokens is not None and draft_tokens.numel() > 0 and draft_tokens.shape[1] > 0:
+                    if (
+                        draft_tokens is not None
+                        and draft_tokens.numel() > 0
+                        and draft_tokens.shape[1] > 0
+                    ):
                         # Create attention mask for draft tokens (all ones)
                         draft_attention_mask = torch.ones(
                             (active_attention_mask.shape[0], k),
                             dtype=active_attention_mask.dtype,
                             device=active_attention_mask.device,
                         )
-                        verify_attention_mask = torch.cat([active_attention_mask, draft_attention_mask], dim=1)
+                        verify_attention_mask = torch.cat(
+                            [active_attention_mask, draft_attention_mask], dim=1
+                        )
                     else:
                         # No draft tokens, use original attention mask
                         verify_attention_mask = active_attention_mask
-                
+
                 # Update position IDs to account for appended draft tokens
                 verify_position_ids = None
                 if active_position_ids is not None:
-                    if draft_tokens is not None and draft_tokens.numel() > 0 and draft_tokens.shape[1] > 0:
+                    if (
+                        draft_tokens is not None
+                        and draft_tokens.numel() > 0
+                        and draft_tokens.shape[1] > 0
+                    ):
                         # Get the last position for each sequence
-                        last_positions = active_position_ids.max(dim=1, keepdim=True)[0]  # [batch_size, 1]
+                        last_positions = active_position_ids.max(dim=1, keepdim=True)[
+                            0
+                        ]  # [batch_size, 1]
                         # Create position IDs for draft tokens (incrementing from last position)
-                        draft_position_ids = last_positions + torch.arange(1, k + 1, device=self.device).unsqueeze(0)
-                        verify_position_ids = torch.cat([active_position_ids, draft_position_ids], dim=1)
+                        draft_position_ids = last_positions + torch.arange(
+                            1, k + 1, device=self.device
+                        ).unsqueeze(0)
+                        verify_position_ids = torch.cat(
+                            [active_position_ids, draft_position_ids], dim=1
+                        )
                     else:
                         # No draft tokens, use original position IDs
                         verify_position_ids = active_position_ids
                 else:
                     # If no position_ids provided, create them from scratch
                     seq_len = verify_input_ids.shape[1]
-                    verify_position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0).expand(
-                        verify_input_ids.shape[0], -1
+                    verify_position_ids = (
+                        torch.arange(seq_len, device=self.device)
+                        .unsqueeze(0)
+                        .expand(verify_input_ids.shape[0], -1)
                     )
-                
+
                 # Use scheduler's multi-stream verification if available for proper stream management
                 # Try to use scheduler for verification (better stream management)
                 if (
@@ -2801,7 +2829,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                 ):
                     # TRUE OVERLAP: Scheduler handles multi-stream verification
                     # Both operations run concurrently on GPU via scheduler
-                    
+
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
                             verify_start_event.record(verify_stream)
