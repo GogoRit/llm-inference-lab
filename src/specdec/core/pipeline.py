@@ -245,6 +245,8 @@ class SpeculativePipeline(SpeculativeDecoder):
         enable_optimization: bool = True,
         enable_profiling: bool = False,
         profile_dir: Optional[str] = None,
+        max_seq_len: Optional[int] = None,
+        max_seq_len_cap: int = 4096,
     ):
         """
         Initialize the speculative decoding pipeline.
@@ -269,6 +271,8 @@ class SpeculativePipeline(SpeculativeDecoder):
             enable_optimization: Whether to enable performance optimizations
             enable_profiling: Whether to enable profiling
             profile_dir: Directory to save profiling traces
+            max_seq_len: Explicit max_seq_len for KV cache (overrides calculated value)
+            max_seq_len_cap: Hard cap on calculated max_seq_len to prevent OOM (default: 4096)
         """
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config(config_path)
@@ -338,12 +342,21 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         # CRITICAL: Initialize KV cache manager AFTER models are created
         # to get max_position_embeddings from model configs
-        max_seq_len = self._calculate_max_seq_len()
+        # Safety: Use explicit max_seq_len if provided, otherwise calculate with cap
+        if max_seq_len is not None:
+            # User explicitly provided max_seq_len - respect it
+            self.logger.info(f"Using explicit max_seq_len={max_seq_len} from parameter")
+            final_max_seq_len = max_seq_len
+        else:
+            # Calculate from model configs with VRAM safety clamp
+            final_max_seq_len = self._calculate_max_seq_len(max_allowed=max_seq_len_cap)
         self.kv_cache_manager = SafeKVCacheManager(
             device=str(self.device),
-            max_seq_len=max_seq_len,
+            max_seq_len=final_max_seq_len,
         )
-        self.logger.info(f"Initialized KV cache manager with max_seq_len={max_seq_len}")
+        self.logger.info(
+            f"Initialized KV cache manager with max_seq_len={final_max_seq_len}"
+        )
 
         # Check if baseline mode (no speculative decoding)
         self.speculative_enabled = self.draft_lm is not None
@@ -473,15 +486,19 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         return default_config
 
-    def _calculate_max_seq_len(self) -> int:
+    def _calculate_max_seq_len(self, max_allowed: int = 4096) -> int:
         """
-        Calculate maximum sequence length from model configs.
+        Calculate maximum sequence length from model configs with VRAM safety clamp.
 
         Uses max_position_embeddings from base and draft models, taking the maximum.
+        Applies a hard cap to prevent OOM on constrained hardware (e.g., T4 16GB).
         Falls back to 2048 if not available.
 
+        Args:
+            max_allowed: Hard cap on max_seq_len to prevent OOM (default: 4096)
+
         Returns:
-            Maximum sequence length for KV cache buffers
+            Maximum sequence length for KV cache buffers (clamped to max_allowed)
         """
         max_seq_lens = []
 
@@ -503,11 +520,20 @@ class SpeculativePipeline(SpeculativeDecoder):
 
         # Use maximum of both models, or fallback to 2048
         if max_seq_lens:
-            max_seq_len = max(max_seq_lens)
-            self.logger.info(f"Using max_seq_len={max_seq_len} from model configs")
+            model_max_seq_len = max(max_seq_lens)
+            # CRITICAL: Clamp to max_allowed to prevent OOM on constrained hardware
+            if model_max_seq_len > max_allowed:
+                self.logger.warning(
+                    f"Clamping max_seq_len from {model_max_seq_len} to {max_allowed} "
+                    f"to save VRAM (model config exceeds hardware limits)"
+                )
+                max_seq_len = max_allowed
+            else:
+                max_seq_len = model_max_seq_len
+                self.logger.info(f"Using max_seq_len={max_seq_len} from model configs")
         else:
-            # Fallback to safe default
-            max_seq_len = 2048
+            # Fallback to safe default (already within max_allowed)
+            max_seq_len = min(2048, max_allowed)
             self.logger.warning(
                 f"Could not determine max_position_embeddings from models. "
                 f"Using default max_seq_len={max_seq_len}"
