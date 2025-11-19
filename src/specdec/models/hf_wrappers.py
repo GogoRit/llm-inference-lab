@@ -443,12 +443,14 @@ class HFWrapper(LanguageModel):
                         step_current_seq_lens = kwargs.get("current_seq_lens", None)
 
                         # Construct attention mask for pre-allocated buffer
+                        # CRITICAL: Pass input_ids to calculate correct target_length (cache_len + input_len)
                         step_attention_mask = (
                             self._construct_attention_mask_for_preallocated_cache(
                                 past_key_values=current_past_kv,
                                 current_seq_lens=step_current_seq_lens,
                                 batch_size=current_input.shape[0],
                                 device=current_input.device,
+                                input_ids=current_input,
                             )
                         )
 
@@ -691,6 +693,8 @@ class HFWrapper(LanguageModel):
         current_seq_lens: Optional[List[int]] = None,
         batch_size: int = 1,
         device: Optional[torch.device] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        target_length: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """
         Construct attention mask for pre-allocated KV cache buffers.
@@ -699,30 +703,49 @@ class HFWrapper(LanguageModel):
         a larger buffer (Max_L) but only valid up to current_seq_len. This method
         creates an attention mask that masks out invalid positions.
 
+        CRITICAL: The mask length MUST equal past_key_values.shape[2] + input_ids.shape[1]
+        to match the actual sequence length being processed by the model.
+
         Args:
             past_key_values: KV cache tuple from cache manager (may be views)
-            current_seq_lens: List of current sequence lengths per batch entry
+            current_seq_lens: List of current sequence lengths per batch entry (cache lengths)
             batch_size: Batch size
             device: Device for mask tensor
+            input_ids: Input token IDs [batch_size, seq_len] (new tokens being added)
+            target_length: Target sequence length for mask (cache_len + input_len).
+                          If None, will be calculated from past_key_values and input_ids.
 
         Returns:
-            attention_mask: [batch_size, 1, 1, max_seq_len] mask (1 for valid, 0 for invalid)
+            attention_mask: [batch_size, 1, 1, target_length] mask (1 for valid, 0 for invalid)
                            or None if not needed
         """
         if past_key_values is None or len(past_key_values) == 0:
             return None
 
-        # Infer max_seq_len from first layer's key tensor
+        # Infer cache length from first layer's key tensor
         first_key = past_key_values[0][0]
-        max_seq_len = first_key.shape[2]  # [B, H, seq_len, D] -> seq_len dimension
+        cache_len = first_key.shape[2]  # [B, H, seq_len, D] -> seq_len dimension
 
         if device is None:
             device = first_key.device
 
+        # Calculate target_length: cache_len + input_ids.shape[1]
+        if target_length is None:
+            if input_ids is not None:
+                input_len = input_ids.shape[1]
+                target_length = cache_len + input_len
+            else:
+                # Fallback: use cache_len if no input_ids provided
+                # This is for backward compatibility but may cause issues
+                target_length = cache_len
+        else:
+            # Use provided target_length
+            pass
+
         # If current_seq_lens not provided, infer from past_key_values shape
         if current_seq_lens is None:
-            # Assume all sequences have same length (from view)
-            current_seq_lens = [max_seq_len] * batch_size
+            # Assume all sequences have same cache length
+            current_seq_lens = [cache_len] * batch_size
         elif len(current_seq_lens) != batch_size:
             # Pad or truncate to match batch_size
             if len(current_seq_lens) < batch_size:
@@ -732,18 +755,31 @@ class HFWrapper(LanguageModel):
             else:
                 current_seq_lens = current_seq_lens[:batch_size]
 
-        # Construct attention mask: [batch_size, 1, 1, max_seq_len]
-        # Shape matches what transformers expect for causal attention
+        # Calculate total sequence length for each batch entry: current_seq_lens[b] + input_len
+        # CRITICAL: Use current_seq_lens[b] (actual valid cache length) not cache_len (buffer size)
+        if input_ids is not None:
+            input_len = input_ids.shape[1]
+            total_seq_lens = [
+                current_seq_lens[b] + input_len for b in range(batch_size)
+            ]
+        else:
+            # Fallback: use current_seq_lens as total (assumes no new input)
+            total_seq_lens = current_seq_lens
+
+        # Construct attention mask: [batch_size, 1, 1, target_length]
+        # CRITICAL: target_length must equal cache_len + input_len to match tensor dimensions
+        # But we mask based on actual valid lengths (current_seq_lens[b] + input_len)
         attention_mask = torch.zeros(
-            (batch_size, 1, 1, max_seq_len),
+            (batch_size, 1, 1, target_length),
             dtype=torch.long,
             device=device,
         )
 
-        # Set mask to 1 for valid positions (0 to current_seq_len-1)
-        for b, seq_len in enumerate(current_seq_lens):
-            # Clamp seq_len to max_seq_len (safety check)
-            valid_len = min(seq_len, max_seq_len)
+        # Set mask to 1 for valid positions (0 to total_seq_len-1)
+        # total_seq_len = current_seq_lens[b] + input_len (actual valid sequence length)
+        for b, total_len in enumerate(total_seq_lens):
+            # Clamp total_len to target_length (safety check)
+            valid_len = min(total_len, target_length)
             if valid_len > 0:
                 attention_mask[b, 0, 0, :valid_len] = 1
 
@@ -845,12 +881,14 @@ class HFWrapper(LanguageModel):
 
         # CRITICAL: Construct attention mask for pre-allocated buffers
         # This masks out invalid positions in the pre-allocated buffer
+        # CRITICAL: Pass input_ids to calculate correct target_length (cache_len + input_len)
         if attention_mask is None and past_key_values is not None:
             attention_mask = self._construct_attention_mask_for_preallocated_cache(
                 past_key_values=past_key_values,
                 current_seq_lens=current_seq_lens,
                 batch_size=batch_size,
                 device=device,
+                input_ids=new_input_ids,
             )
 
         # CRITICAL: Construct position IDs based on current sequence lengths
@@ -999,12 +1037,14 @@ class HFWrapper(LanguageModel):
             # past_key_values shape: [B, H, current_seq_len, D] (view from pre-allocated buffer)
             if past_key_values is not None and len(past_key_values) > 0:
                 # Construct attention mask for updated sequence length
+                # CRITICAL: Pass input_ids (next_token) to calculate correct target_length (cache_len + 1)
                 step_attention_mask = (
                     self._construct_attention_mask_for_preallocated_cache(
                         past_key_values=past_key_values,
                         current_seq_lens=step_current_seq_lens,
                         batch_size=batch_size,
                         device=next_token.device,
+                        input_ids=next_token,
                     )
                 )
 

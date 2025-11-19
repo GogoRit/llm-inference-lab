@@ -2772,7 +2772,7 @@ class SpeculativePipeline(SpeculativeDecoder):
                     # Prepare past_key_values for base model using centralized manager
                     # ZERO-COPY: Pass current_seq_lens to model for proper attention masking
                     base_past_kv = None
-                    base_current_seq_lens_for_model = None
+                    base_current_seq_lens_for_model: Optional[List[int]] = None
                     if kv_cache_enabled:
                         # Use relative indices for KV cache retrieval (0 to active_count-1)
                         base_past_kv = self.kv_cache_manager.get_base_past_kv(
