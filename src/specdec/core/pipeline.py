@@ -1154,11 +1154,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # CUDA graph capture removed - incompatible with dynamic speculative decoding
                 # All paths use standard verification now
 
+                # CRITICAL FIX: Append draft tokens to input_ids for parallel verification
+                # The draft tokens will be processed in parallel during prefill, and we only need
+                # to generate 1 additional token (the bonus token) for verification
+                verify_input_ids = torch.cat([current_input, draft_tokens], dim=1)
+
                 # Single validation point before model call
                 base_vocab_size = get_vocab_size(self.base_lm)
                 if base_vocab_size is not None:
-                    current_input = validate_and_clamp_tokens(
-                        current_input, base_vocab_size, "base_input"
+                    verify_input_ids = validate_and_clamp_tokens(
+                        verify_input_ids, base_vocab_size, "base_input"
                     )
 
                 # Removed unnecessary sync - CUDA events handle synchronization
@@ -1168,8 +1173,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                     base_tokens, base_logits, verify_info = (
                         self.scheduler.schedule_verification(
                             self.base_lm,
-                            draft_tokens,
-                            current_input,
+                            draft_tokens,  # Pass for shape info
+                            verify_input_ids,  # Input with draft tokens appended
                             temperature=temperature,
                             do_sample=do_sample,
                             **kwargs,
@@ -1179,8 +1184,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                 else:
                     verify_start = time.time()
                     base_tokens, base_logits = self.base_lm.generate_tokens(
-                        current_input,
-                        max_new_tokens=k,
+                        verify_input_ids,  # Input with draft tokens appended
+                        max_new_tokens=1,  # Only generate 1 token (bonus token) - draft tokens processed in prefill
                         temperature=temperature,
                         do_sample=do_sample,
                         **kwargs,
@@ -2715,15 +2720,13 @@ class SpeculativePipeline(SpeculativeDecoder):
                         for i in range(len(active_indices))
                     ]
 
-                # Use scheduler's multi-stream verification if available for proper stream management
-                # Create dummy draft tokens tensor for scheduler API (it needs draft_tokens shape)
-                # Note: We use actual draft_tokens shape but scheduler doesn't use the values
-                dummy_draft_tokens = torch.zeros(
-                    (active_input_ids.shape[0], k),
-                    dtype=torch.long,
-                    device=self.device,
-                )
+                # CRITICAL FIX: Append draft tokens to input_ids for parallel verification
+                # The draft tokens will be processed in parallel during prefill, and we only need
+                # to generate 1 additional token (the bonus token) for verification
+                # We need to wait for draft to complete before we can append draft_tokens
+                # However, we can still maintain some overlap by doing the append on the verify stream
 
+                # Use scheduler's multi-stream verification if available for proper stream management
                 # Try to use scheduler for verification (better stream management)
                 if (
                     self.scheduler is not None
@@ -2733,21 +2736,67 @@ class SpeculativePipeline(SpeculativeDecoder):
                 ):
                     # TRUE OVERLAP: Scheduler handles multi-stream verification
                     # Both operations run concurrently on GPU via scheduler
+                    # Wait for draft to complete before appending (we need draft_tokens)
+                    if draft_end_event is not None:
+                        draft_end_event.synchronize()
+
+                    # Append draft tokens to input_ids for verification
+                    # This allows the base model to process draft tokens in parallel during prefill
+                    verify_input_ids = torch.cat(
+                        [active_input_ids_prepared, draft_tokens], dim=1
+                    )
+
+                    # Update attention mask to include draft tokens (all are valid tokens)
+                    verify_attention_mask = None
+                    if active_attention_mask is not None:
+                        # Create attention mask for draft tokens (all ones)
+                        draft_attention_mask = torch.ones(
+                            (active_attention_mask.shape[0], k),
+                            dtype=active_attention_mask.dtype,
+                            device=active_attention_mask.device,
+                        )
+                        verify_attention_mask = torch.cat(
+                            [active_attention_mask, draft_attention_mask], dim=1
+                        )
+
+                    # Update position IDs to account for appended draft tokens
+                    verify_position_ids = None
+                    if active_position_ids is not None:
+                        # Get the last position for each sequence
+                        last_positions = active_position_ids.max(dim=1, keepdim=True)[
+                            0
+                        ]  # [batch_size, 1]
+                        # Create position IDs for draft tokens (incrementing from last position)
+                        draft_position_ids = last_positions + torch.arange(
+                            1, k + 1, device=self.device
+                        ).unsqueeze(0)
+                        verify_position_ids = torch.cat(
+                            [active_position_ids, draft_position_ids], dim=1
+                        )
+                    else:
+                        # If no position_ids provided, create them from scratch
+                        seq_len = verify_input_ids.shape[1]
+                        verify_position_ids = (
+                            torch.arange(seq_len, device=self.device)
+                            .unsqueeze(0)
+                            .expand(verify_input_ids.shape[0], -1)
+                        )
+
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
                             verify_start_event.record(verify_stream)
                         # Use scheduler's verification (it manages streams internally)
-                        # Use prepared tensor for consistency and safety
+                        # Pass input_ids with draft tokens appended for parallel prefill processing
                         # Note: scheduler will extract attention_mask from kwargs if present
                         base_tokens, base_logits, verify_info = (
                             self.scheduler.schedule_verification(
                                 self.base_lm,
-                                dummy_draft_tokens,  # Shape only, not actual draft tokens
-                                active_input_ids_prepared,
+                                draft_tokens,  # Actual draft tokens for shape info
+                                verify_input_ids,  # Input with draft tokens appended
                                 temperature=temperature,
                                 do_sample=do_sample,
-                                attention_mask=active_attention_mask,  # Pass attention mask to skip padding
-                                position_ids=active_position_ids,  # Pass explicit position IDs
+                                attention_mask=verify_attention_mask,  # Updated attention mask
+                                position_ids=verify_position_ids,  # Updated position IDs
                                 **kwargs,
                             )
                         )
@@ -2783,6 +2832,9 @@ class SpeculativePipeline(SpeculativeDecoder):
                 elif verify_stream is not None and draft_stream is not None:
                     # Manual stream management if scheduler not available
                     # base_past_kv and base_current_seq_lens_for_model already initialized above
+                    # Wait for draft to complete before verification (we need draft_tokens)
+                    if draft_end_event is not None:
+                        draft_end_event.synchronize()
 
                     with torch.cuda.stream(verify_stream):
                         if verify_start_event is not None:
@@ -2790,16 +2842,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                         # For verification, always use greedy (argmax) to ensure deterministic matching
                         # This ensures base_logits.argmax() matches the tokens we compare
                         try:
-                            # Use prepared tensor (same as draft stream) for consistency and safety
+                            # Use input_ids with draft tokens appended for parallel prefill processing
+                            # We only need to generate 1 additional token (the bonus token)
                             base_tokens, base_logits = self.base_lm.generate_tokens(
-                                active_input_ids_prepared,
-                                max_new_tokens=k,  # Use k directly, not draft_tokens.shape[1]
+                                verify_input_ids,  # Input with draft tokens appended
+                                max_new_tokens=1,  # Only generate 1 token (bonus token) - draft tokens processed in prefill
                                 temperature=1.0,  # Temperature=1.0 for deterministic argmax
                                 do_sample=False,  # Always use greedy for verification
                                 stream=verify_stream,
                                 past_key_values=base_past_kv,
-                                attention_mask=active_attention_mask,  # Pass attention mask to skip padding
-                                position_ids=active_position_ids,  # Pass explicit position IDs
+                                attention_mask=verify_attention_mask,  # Updated attention mask
+                                position_ids=verify_position_ids,  # Updated position IDs
                                 current_seq_lens=base_current_seq_lens_for_model,  # ZERO-COPY: Pass for proper masking
                                 **kwargs,
                             )
@@ -2894,22 +2947,60 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                     # base_past_kv and base_current_seq_lens_for_model already initialized above
 
+                    # Append draft tokens to input_ids for parallel verification
+                    # Use active_input_ids (not prepared version) for fallback path
+                    verify_input_ids_fallback = torch.cat(
+                        [active_input_ids, draft_tokens], dim=1
+                    )
+
+                    # Update attention mask to include draft tokens
+                    verify_attention_mask_fallback = None
+                    if active_attention_mask is not None:
+                        draft_attention_mask = torch.ones(
+                            (active_attention_mask.shape[0], k),
+                            dtype=active_attention_mask.dtype,
+                            device=active_attention_mask.device,
+                        )
+                        verify_attention_mask_fallback = torch.cat(
+                            [active_attention_mask, draft_attention_mask], dim=1
+                        )
+
+                    # Update position IDs to account for appended draft tokens
+                    verify_position_ids_fallback = None
+                    if active_position_ids is not None:
+                        last_positions = active_position_ids.max(dim=1, keepdim=True)[0]
+                        draft_position_ids = last_positions + torch.arange(
+                            1, k + 1, device=self.device
+                        ).unsqueeze(0)
+                        verify_position_ids_fallback = torch.cat(
+                            [active_position_ids, draft_position_ids], dim=1
+                        )
+                    else:
+                        seq_len = verify_input_ids_fallback.shape[1]
+                        verify_position_ids_fallback = (
+                            torch.arange(seq_len, device=self.device)
+                            .unsqueeze(0)
+                            .expand(verify_input_ids_fallback.shape[0], -1)
+                        )
+
                     # Single validation point before model call
                     base_vocab_size = get_vocab_size(self.base_lm)
                     if base_vocab_size is not None:
-                        active_input_ids = validate_and_clamp_tokens(
-                            active_input_ids, base_vocab_size, "base_input"
+                        verify_input_ids_fallback = validate_and_clamp_tokens(
+                            verify_input_ids_fallback, base_vocab_size, "base_input"
                         )
 
                     # For verification, always use greedy (argmax) to ensure deterministic matching
+                    # Use input_ids with draft tokens appended for parallel prefill processing
+                    # We only need to generate 1 additional token (the bonus token)
                     base_tokens, base_logits = self.base_lm.generate_tokens(
-                        active_input_ids,
-                        max_new_tokens=k,
+                        verify_input_ids_fallback,  # Input with draft tokens appended
+                        max_new_tokens=1,  # Only generate 1 token (bonus token) - draft tokens processed in prefill
                         temperature=1.0,  # Temperature=1.0 for deterministic argmax
                         do_sample=False,  # Always use greedy for verification
                         past_key_values=base_past_kv,
-                        attention_mask=active_attention_mask,  # Pass attention mask to skip padding
-                        position_ids=active_position_ids,  # Pass explicit position IDs
+                        attention_mask=verify_attention_mask_fallback,  # Updated attention mask
+                        position_ids=verify_position_ids_fallback,  # Updated position IDs
                         current_seq_lens=base_current_seq_lens_for_model,  # ZERO-COPY: Pass for proper masking
                         **kwargs,
                     )
