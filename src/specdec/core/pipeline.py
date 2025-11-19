@@ -192,6 +192,36 @@ except ImportError:
         return torch.no_grad()
 
 
+def _get_max_position_embeddings(model: Any) -> Optional[int]:
+    """
+    Extract max_position_embeddings from a language model.
+
+    Args:
+        model: Language model instance (HFWrapper, FakeLM, etc.)
+
+    Returns:
+        max_position_embeddings if available, None otherwise
+    """
+    # Try to get from HF model config
+    if hasattr(model, "_model") and hasattr(model._model, "config"):
+        config = model._model.config
+        if hasattr(config, "max_position_embeddings"):
+            return getattr(config, "max_position_embeddings")
+        # Some models use n_positions instead
+        if hasattr(config, "n_positions"):
+            return getattr(config, "n_positions")
+
+    # Try direct access to model.config
+    if hasattr(model, "model") and hasattr(model.model, "config"):
+        config = model.model.config
+        if hasattr(config, "max_position_embeddings"):
+            return getattr(config, "max_position_embeddings")
+        if hasattr(config, "n_positions"):
+            return getattr(config, "n_positions")
+
+    return None
+
+
 class SpeculativePipeline(SpeculativeDecoder):
     """Main pipeline for speculative decoding with dependency injection."""
 
@@ -284,9 +314,6 @@ class SpeculativePipeline(SpeculativeDecoder):
             enable_profiling=False,
         )
 
-        # Initialize centralized KV cache manager
-        self.kv_cache_manager = SafeKVCacheManager(device=str(self.device))
-
         # CUDA graph capture removed - incompatible with dynamic speculative decoding
         # Set attributes to False to prevent AttributeError in generate()
         self.enable_cuda_graph = False
@@ -308,6 +335,15 @@ class SpeculativePipeline(SpeculativeDecoder):
         # Initialize models with dependency injection
         self.base_lm = base_lm or self._create_base_model()
         self.draft_lm = draft_lm or self._create_draft_model()
+
+        # CRITICAL: Initialize KV cache manager AFTER models are created
+        # to get max_position_embeddings from model configs
+        max_seq_len = self._calculate_max_seq_len()
+        self.kv_cache_manager = SafeKVCacheManager(
+            device=str(self.device),
+            max_seq_len=max_seq_len,
+        )
+        self.logger.info(f"Initialized KV cache manager with max_seq_len={max_seq_len}")
 
         # Check if baseline mode (no speculative decoding)
         self.speculative_enabled = self.draft_lm is not None
@@ -436,6 +472,48 @@ class SpeculativePipeline(SpeculativeDecoder):
                 self.logger.info("Using default configuration")
 
         return default_config
+
+    def _calculate_max_seq_len(self) -> int:
+        """
+        Calculate maximum sequence length from model configs.
+
+        Uses max_position_embeddings from base and draft models, taking the maximum.
+        Falls back to 2048 if not available.
+
+        Returns:
+            Maximum sequence length for KV cache buffers
+        """
+        max_seq_lens = []
+
+        # Get max_position_embeddings from base model
+        if self.base_lm is not None:
+            base_max_seq = _get_max_position_embeddings(self.base_lm)
+            if base_max_seq is not None:
+                max_seq_lens.append(base_max_seq)
+                self.logger.debug(f"Base model max_position_embeddings: {base_max_seq}")
+
+        # Get max_position_embeddings from draft model
+        if self.draft_lm is not None:
+            draft_max_seq = _get_max_position_embeddings(self.draft_lm)
+            if draft_max_seq is not None:
+                max_seq_lens.append(draft_max_seq)
+                self.logger.debug(
+                    f"Draft model max_position_embeddings: {draft_max_seq}"
+                )
+
+        # Use maximum of both models, or fallback to 2048
+        if max_seq_lens:
+            max_seq_len = max(max_seq_lens)
+            self.logger.info(f"Using max_seq_len={max_seq_len} from model configs")
+        else:
+            # Fallback to safe default
+            max_seq_len = 2048
+            self.logger.warning(
+                f"Could not determine max_position_embeddings from models. "
+                f"Using default max_seq_len={max_seq_len}"
+            )
+
+        return max_seq_len
 
     def _log_startup_config(self) -> None:
         """Log startup configuration summary."""
