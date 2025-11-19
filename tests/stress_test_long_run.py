@@ -200,7 +200,7 @@ def main():
         draft_model="your-draft-model",
         device="cuda",
     )
-    
+
     # Run stress test
     success = run_stress_test(
         pipeline=pipeline,
@@ -208,7 +208,7 @@ def main():
         num_prompts=4,
         check_interval=20,
     )
-    
+
     if not success:
         sys.exit(1)
     """

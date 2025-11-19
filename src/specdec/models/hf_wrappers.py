@@ -7,7 +7,7 @@ for tiny models only (smoke runs) and MPS memory hygiene.
 
 import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -91,12 +91,25 @@ class HFWrapper(LanguageModel):
                     )
                 self._tokenizer.padding_side = "left"  # type: ignore
 
-            # Load model with memory considerations
+            # Load model with memory considerations and SDPA enabled
             model_kwargs = {
                 "torch_dtype": self._torch_dtype,
                 "low_cpu_mem_usage": True,
-                "attn_implementation": "sdpa",
+                "attn_implementation": "sdpa",  # Enable PyTorch 2.0 SDPA
             }
+
+            # Ensure SDPA is available (PyTorch 2.0+)
+            try:
+                import torch.nn.functional as F
+
+                if not hasattr(F, "scaled_dot_product_attention"):
+                    self.logger.warning(
+                        "PyTorch 2.0+ required for SDPA. Falling back to default attention."
+                    )
+                    # Remove attn_implementation if SDPA not available
+                    model_kwargs.pop("attn_implementation", None)
+            except ImportError:
+                model_kwargs.pop("attn_implementation", None)
 
             # Only use device_map if accelerate is available
             try:
@@ -199,9 +212,21 @@ class HFWrapper(LanguageModel):
                     )
 
                 # Use KV-aware generation if supported and enabled
-                if self.supports_kv_append() and self._kv_cache is not None:
+                # Check if past_key_values are provided (from pre-allocated cache manager)
+                past_key_values = kwargs.pop("past_key_values", None)
+                current_seq_lens = kwargs.pop("current_seq_lens", None)
+
+                if self.supports_kv_append() and (
+                    self._kv_cache is not None or past_key_values is not None
+                ):
                     return self._generate_with_kv_cache(
-                        input_ids, max_new_tokens, temperature, do_sample, **kwargs
+                        input_ids,
+                        max_new_tokens,
+                        temperature,
+                        do_sample,
+                        past_key_values=past_key_values,
+                        current_seq_lens=current_seq_lens,
+                        **kwargs,
                     )
 
                 # Standard generation without KV cache
@@ -413,12 +438,46 @@ class HFWrapper(LanguageModel):
                                         f"min={min_token}, max={max_token}, vocab={vocab_size}"
                                     )
 
-                        # Assuming past_kv contains cached sequence length info
-                        outputs = self._model(  # type: ignore
-                            current_input,
-                            past_key_values=current_past_kv,
-                            use_cache=True,
+                        # Construct attention mask and position IDs for pre-allocated cache
+                        # Extract current_seq_lens from kwargs if provided
+                        step_current_seq_lens = kwargs.get("current_seq_lens", None)
+
+                        # Construct attention mask for pre-allocated buffer
+                        step_attention_mask = (
+                            self._construct_attention_mask_for_preallocated_cache(
+                                past_key_values=current_past_kv,
+                                current_seq_lens=step_current_seq_lens,
+                                batch_size=current_input.shape[0],
+                                device=current_input.device,
+                            )
                         )
+
+                        # Construct position IDs
+                        if step_current_seq_lens is not None:
+                            step_position_ids = (
+                                self._construct_position_ids_for_preallocated_cache(
+                                    current_seq_lens=step_current_seq_lens,
+                                    batch_size=current_input.shape[0],
+                                    device=current_input.device,
+                                )
+                            )
+                        else:
+                            step_position_ids = None
+
+                        # Prepare forward pass arguments
+                        forward_kwargs = {
+                            "input_ids": current_input,
+                            "past_key_values": current_past_kv,
+                            "use_cache": True,
+                        }
+
+                        if step_attention_mask is not None:
+                            forward_kwargs["attention_mask"] = step_attention_mask
+                        if step_position_ids is not None:
+                            forward_kwargs["position_ids"] = step_position_ids
+
+                        # Assuming past_kv contains cached sequence length info
+                        outputs = self._model(**forward_kwargs)  # type: ignore
                         # Update past_key_values for next step
                         if outputs.past_key_values is not None:
                             current_past_kv = outputs.past_key_values
@@ -626,37 +685,180 @@ class HFWrapper(LanguageModel):
 
                 return generated_ids, logits
 
+    def _construct_attention_mask_for_preallocated_cache(
+        self,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]],
+        current_seq_lens: Optional[List[int]] = None,
+        batch_size: int = 1,
+        device: Optional[torch.device] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Construct attention mask for pre-allocated KV cache buffers.
+
+        When using pre-allocated buffers, the past_key_values may be views from
+        a larger buffer (Max_L) but only valid up to current_seq_len. This method
+        creates an attention mask that masks out invalid positions.
+
+        Args:
+            past_key_values: KV cache tuple from cache manager (may be views)
+            current_seq_lens: List of current sequence lengths per batch entry
+            batch_size: Batch size
+            device: Device for mask tensor
+
+        Returns:
+            attention_mask: [batch_size, 1, 1, max_seq_len] mask (1 for valid, 0 for invalid)
+                           or None if not needed
+        """
+        if past_key_values is None or len(past_key_values) == 0:
+            return None
+
+        # Infer max_seq_len from first layer's key tensor
+        first_key = past_key_values[0][0]
+        max_seq_len = first_key.shape[2]  # [B, H, seq_len, D] -> seq_len dimension
+
+        if device is None:
+            device = first_key.device
+
+        # If current_seq_lens not provided, infer from past_key_values shape
+        if current_seq_lens is None:
+            # Assume all sequences have same length (from view)
+            current_seq_lens = [max_seq_len] * batch_size
+        elif len(current_seq_lens) != batch_size:
+            # Pad or truncate to match batch_size
+            if len(current_seq_lens) < batch_size:
+                current_seq_lens = current_seq_lens + [current_seq_lens[-1]] * (
+                    batch_size - len(current_seq_lens)
+                )
+            else:
+                current_seq_lens = current_seq_lens[:batch_size]
+
+        # Construct attention mask: [batch_size, 1, 1, max_seq_len]
+        # Shape matches what transformers expect for causal attention
+        attention_mask = torch.zeros(
+            (batch_size, 1, 1, max_seq_len),
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Set mask to 1 for valid positions (0 to current_seq_len-1)
+        for b, seq_len in enumerate(current_seq_lens):
+            # Clamp seq_len to max_seq_len (safety check)
+            valid_len = min(seq_len, max_seq_len)
+            if valid_len > 0:
+                attention_mask[b, 0, 0, :valid_len] = 1
+
+        return attention_mask
+
+    def _construct_position_ids_for_preallocated_cache(
+        self,
+        current_seq_lens: List[int],
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Construct position IDs for pre-allocated KV cache.
+
+        Position IDs should start from current_seq_len for each batch entry,
+        since we're decoding the next token.
+
+        Args:
+            current_seq_lens: List of current sequence lengths per batch entry
+            batch_size: Batch size
+            device: Device for position IDs tensor
+
+        Returns:
+            position_ids: [batch_size, 1] tensor with position = current_seq_len
+        """
+        if len(current_seq_lens) != batch_size:
+            # Pad or truncate
+            if len(current_seq_lens) < batch_size:
+                current_seq_lens = current_seq_lens + [current_seq_lens[-1]] * (
+                    batch_size - len(current_seq_lens)
+                )
+            else:
+                current_seq_lens = current_seq_lens[:batch_size]
+
+        # Position IDs for decoding: position = current_seq_len (next token position)
+        position_ids = torch.tensor(
+            current_seq_lens,
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(
+            1
+        )  # [batch_size, 1]
+
+        return position_ids
+
     def _generate_with_kv_cache(
         self,
         input_ids: torch.Tensor,
         max_new_tokens: int,
         temperature: float,
         do_sample: bool,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        current_seq_lens: Optional[List[int]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Generate tokens using cached KV states.
+        Generate tokens using cached KV states with support for pre-allocated buffers.
 
         Args:
-            input_ids: Input token IDs
+            input_ids: Input token IDs [batch_size, seq_len] (new tokens only)
             max_new_tokens: Number of tokens to generate
             temperature: Sampling temperature
             do_sample: Whether to use sampling
+            past_key_values: Optional KV cache from pre-allocated buffer manager
+            attention_mask: Optional attention mask (constructed if not provided)
+            position_ids: Optional position IDs (constructed if not provided)
+            current_seq_lens: Optional list of current sequence lengths per batch entry
             **kwargs: Additional generation parameters
 
         Returns:
             Tuple of (generated_ids, logits)
         """
-        # Use forward() directly to avoid generate() cache_position issues
-        # Only pass the new tokens (not cached ones) as input
-        cache_len = self._kv_cache.seq_len if self._kv_cache else 0
-        new_input_ids = input_ids[:, cache_len:]
+        # Use past_key_values from parameter if provided, otherwise fall back to internal cache
+        if past_key_values is None:
+            past_key_values = self._kv_cache.past_key_values if self._kv_cache else None
+
+        # Determine cache length from past_key_values or internal cache
+        if past_key_values is not None and len(past_key_values) > 0:
+            # Infer from first layer's key tensor shape
+            first_key = past_key_values[0][0]
+            cache_len = first_key.shape[2]  # [B, H, seq_len, D]
+        else:
+            cache_len = self._kv_cache.seq_len if self._kv_cache else 0
+
+        # Extract new tokens (skip cached portion)
+        new_input_ids = input_ids[:, cache_len:] if cache_len > 0 else input_ids
 
         if new_input_ids.shape[1] == 0:
             # No new tokens to process - shouldn't happen in normal flow
             raise ValueError(
                 f"No new tokens after cache (cache_len={cache_len}, "
                 f"input_len={input_ids.shape[1]})"
+            )
+
+        batch_size = new_input_ids.shape[0]
+        device = new_input_ids.device
+
+        # CRITICAL: Construct attention mask for pre-allocated buffers
+        # This masks out invalid positions in the pre-allocated buffer
+        if attention_mask is None and past_key_values is not None:
+            attention_mask = self._construct_attention_mask_for_preallocated_cache(
+                past_key_values=past_key_values,
+                current_seq_lens=current_seq_lens,
+                batch_size=batch_size,
+                device=device,
+            )
+
+        # CRITICAL: Construct position IDs based on current sequence lengths
+        if position_ids is None and current_seq_lens is not None:
+            position_ids = self._construct_position_ids_for_preallocated_cache(
+                current_seq_lens=current_seq_lens,
+                batch_size=batch_size,
+                device=device,
             )
 
         # CRITICAL: Validate new_input_ids before forward pass
@@ -679,18 +881,40 @@ class HFWrapper(LanguageModel):
                     # Clamp invalid tokens
                     new_input_ids = new_input_ids.clamp(min=0, max=vocab_size - 1)
 
-        # Run forward pass with cached KV
+        # Prepare forward pass arguments
+        forward_kwargs = {
+            "input_ids": new_input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": True,
+        }
+
+        # Add attention_mask if constructed or provided
+        if attention_mask is not None:
+            forward_kwargs["attention_mask"] = attention_mask
+
+        # Add position_ids if constructed or provided
+        if position_ids is not None:
+            forward_kwargs["position_ids"] = position_ids
+
+        # Run forward pass with cached KV and proper masking
         with torch.no_grad():
-            outputs = self._model(  # type: ignore
-                new_input_ids,
-                past_key_values=(
-                    self._kv_cache.past_key_values if self._kv_cache else None
-                ),
-                use_cache=True,
-            )
+            outputs = self._model(**forward_kwargs)  # type: ignore
 
         logits = outputs.logits  # [batch, seq, vocab]
         past_key_values = outputs.past_key_values
+
+        # Track current sequence lengths for attention mask construction
+        # Initialize from cache_len or current_seq_lens
+        if current_seq_lens is None:
+            # Infer from past_key_values if available
+            if past_key_values is not None and len(past_key_values) > 0:
+                first_key = past_key_values[0][0]
+                inferred_len = first_key.shape[2]  # [B, H, seq_len, D]
+                step_current_seq_lens = [inferred_len] * batch_size
+            else:
+                step_current_seq_lens = [cache_len] * batch_size
+        else:
+            step_current_seq_lens = list(current_seq_lens)  # Copy for mutation
 
         # Sample from logits for max_new_tokens
         generated_tokens = []
@@ -746,6 +970,9 @@ class HFWrapper(LanguageModel):
 
         generated_tokens.append(next_token)
 
+        # Update sequence lengths after first token
+        step_current_seq_lens = [len + 1 for len in step_current_seq_lens]
+
         # Generate remaining tokens
         for _ in range(max_new_tokens - 1):
             # CRITICAL: Validate next_token before each forward pass
@@ -768,13 +995,48 @@ class HFWrapper(LanguageModel):
                         # Clamp invalid tokens
                         next_token = next_token.clamp(min=0, max=vocab_size - 1)
 
-            with torch.no_grad():
-                outputs = self._model(  # type: ignore
-                    next_token, past_key_values=past_key_values, use_cache=True
+            # Construct attention mask and position IDs for this decoding step
+            # past_key_values shape: [B, H, current_seq_len, D] (view from pre-allocated buffer)
+            if past_key_values is not None and len(past_key_values) > 0:
+                # Construct attention mask for updated sequence length
+                step_attention_mask = (
+                    self._construct_attention_mask_for_preallocated_cache(
+                        past_key_values=past_key_values,
+                        current_seq_lens=step_current_seq_lens,
+                        batch_size=batch_size,
+                        device=next_token.device,
+                    )
                 )
+
+                # Construct position IDs (current position = current_seq_len)
+                step_position_ids = self._construct_position_ids_for_preallocated_cache(
+                    current_seq_lens=step_current_seq_lens,
+                    batch_size=batch_size,
+                    device=next_token.device,
+                )
+            else:
+                step_attention_mask = None
+                step_position_ids = None
+
+            with torch.no_grad():
+                forward_kwargs = {
+                    "input_ids": next_token,
+                    "past_key_values": past_key_values,
+                    "use_cache": True,
+                }
+
+                if step_attention_mask is not None:
+                    forward_kwargs["attention_mask"] = step_attention_mask
+                if step_position_ids is not None:
+                    forward_kwargs["position_ids"] = step_position_ids
+
+                outputs = self._model(**forward_kwargs)  # type: ignore
 
             logits = outputs.logits
             past_key_values = outputs.past_key_values
+
+            # Update sequence lengths after this token
+            step_current_seq_lens = [len + 1 for len in step_current_seq_lens]
 
             next_token_logits = logits[:, -1, :] / temperature
             all_logits.append(next_token_logits)

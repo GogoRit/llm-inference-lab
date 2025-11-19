@@ -114,7 +114,8 @@ def build_cuda_kernels():
         if cuda_arch:
             compiled_kernels = {
                 "verify_prefix": verify_ext.verify_prefix,
-                "kv_append": kv_cache_ext.kv_append,
+                "kv_append": kv_cache_ext.kv_append,  # Old kernel (for backward compatibility)
+                "kv_append_inplace": kv_cache_ext.kv_append_inplace,  # New in-place kernel
                 "cuda_arch": cuda_arch,
                 "verify_hash": verify_hash,
                 "kv_cache_hash": kv_cache_hash,
@@ -124,7 +125,8 @@ def build_cuda_kernels():
 
         return {
             "verify_prefix": verify_ext.verify_prefix,
-            "kv_append": kv_cache_ext.kv_append,
+            "kv_append": kv_cache_ext.kv_append,  # Old kernel (for backward compatibility)
+            "kv_append_inplace": kv_cache_ext.kv_append_inplace,  # New in-place kernel
             "cuda_arch": cuda_arch,
         }
 

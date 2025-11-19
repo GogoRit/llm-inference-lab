@@ -1,28 +1,24 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
-// CUDA kernel for KV cache append
-// Appends K accepted key/value blocks from draft KV to base KV at target offset
-// Optimized for coalesced loads/stores
+// CUDA kernel for in-place KV cache update
+// Writes new key/value tokens directly into pre-allocated buffer at specified position
+// Optimized for coalesced loads/stores with read-only cache hints
 
-// OPTIMIZED KV cache append kernel
+// IN-PLACE KV cache update kernel
 // OPTIMIZATIONS APPLIED:
 // 1. Improved grid configuration for better GPU occupancy
 // 2. Coalesced memory access patterns
 // 3. Read-only cache hints (__ldg) for input data
-// 4. Reduced branch divergence in accepted mask processing
+// 4. Direct in-place writes (no intermediate buffers)
 template<typename T>
-__global__ void kv_append_kernel(
-    const T* __restrict__ base_k,           // [B][H][L][D] - base key cache
-    const T* __restrict__ base_v,           // [B][H][L][D] - base value cache
-    const T* __restrict__ draft_k,          // [B][H][K][D] - draft key cache
-    const T* __restrict__ draft_v,          // [B][H][K][D] - draft value cache
-    T* __restrict__ output_k,               // [B][H][L+K][D] - output key cache
-    T* __restrict__ output_v,               // [B][H][L+K][D] - output value cache
-    const uint8_t* __restrict__ accepted_mask, // [B][K] - which draft positions to append
-    const int32_t* __restrict__ accept_len,    // [B] - how many to append per batch
-    int B, int H, int L, int K, int D,
-    int offset                 // where to start appending in base cache
+__global__ void kv_append_inplace_kernel(
+    T* __restrict__ cache_k,                // [B][H][Max_L][D] - pre-allocated key cache buffer
+    T* __restrict__ cache_v,                // [B][H][Max_L][D] - pre-allocated value cache buffer
+    const T* __restrict__ new_k,            // [B][H][New_L][D] - new key tokens to write
+    const T* __restrict__ new_v,            // [B][H][New_L][D] - new value tokens to write
+    int B, int H, int Max_L, int New_L, int D,
+    int start_pos                           // Position in sequence dimension to start writing
 ) {
     // OPTIMIZATION: Use 1D grid for better occupancy
     // Calculate batch and head indices from linear block index
@@ -35,144 +31,135 @@ __global__ void kv_append_kernel(
     int tid = threadIdx.x;
     const int block_size = blockDim.x;
     
-    // Use read-only cache for accept_len
-    int num_accepted = __ldg(&accept_len[batch_idx]);
-    if (num_accepted == 0) return;
+    // Calculate stride offsets for the pre-allocated buffer
+    // Stride formula: batch_idx * stride_B + head_idx * stride_H + seq_pos * stride_L + dim_idx
+    // Where stride_B = H * Max_L * D, stride_H = Max_L * D, stride_L = D
+    const int stride_B = H * Max_L * D;  // Stride per batch
+    const int stride_H = Max_L * D;       // Stride per head
+    const int stride_L = D;               // Stride per sequence position
     
-    // Copy base cache first (coalesced access)
-    const int base_size = L * D;
-    const int base_offset = batch_idx * H * L * D + head_idx * L * D;
-    const int output_base_offset = batch_idx * H * (L + K) * D + head_idx * (L + K) * D;
+    // Base offsets for this (batch, head) pair
+    const int cache_base_offset = batch_idx * stride_B + head_idx * stride_H;
+    const int new_base_offset = batch_idx * H * New_L * D + head_idx * New_L * D;
     
-    // OPTIMIZATION: Coalesced copy of base keys and values
-    // Use read-only cache for base cache (input data)
-    for (int i = tid; i < base_size; i += block_size) {
-        int src_idx = base_offset + i;
-        int dst_idx = output_base_offset + i;
-        // Use __ldg for read-only cache optimization
-        output_k[dst_idx] = __ldg(&base_k[src_idx]);
-        output_v[dst_idx] = __ldg(&base_v[src_idx]);
-    }
+    // Write new tokens into cache buffer at start_pos
+    // Each thread handles multiple dimensions for better coalescing
+    const int total_elements = New_L * D;
     
-    // OPTIMIZATION: Only sync if we need to ensure base copy completes
-    // before draft append (they're independent, so sync may not be needed)
-    // However, keeping it for correctness in case of memory dependencies
-    __syncthreads();
-    
-    // OPTIMIZATION: Pre-compute accepted indices to reduce branch divergence
-    // Use shared memory to store accepted positions
-    __shared__ int accepted_indices[32];  // Max K typically <= 8, but allow up to 32
-    __shared__ int num_accepted_shared;
-    
-    if (tid == 0) {
-        num_accepted_shared = 0;
-        // Pre-compute accepted indices (sequential, but only done once per block)
-        for (int k = 0; k < K && num_accepted_shared < num_accepted; k++) {
-            int mask_idx = batch_idx * K + k;
-            if (__ldg(&accepted_mask[mask_idx])) {
-                accepted_indices[num_accepted_shared++] = k;
-            }
-        }
-    }
-    __syncthreads();
-    
-    // Append accepted draft positions (now with reduced branch divergence)
-    const int draft_offset = batch_idx * H * K * D + head_idx * K * D;
-    const int output_draft_offset = output_base_offset + L * D;
-    
-    // Copy accepted positions (no branching in inner loop)
-    for (int accepted_idx = 0; accepted_idx < num_accepted_shared; accepted_idx++) {
-        int k = accepted_indices[accepted_idx];
-        int src_offset = draft_offset + k * D;
-        int dst_offset = output_draft_offset + accepted_idx * D;
+    for (int i = tid; i < total_elements; i += block_size) {
+        // Calculate sequence position and dimension within new tokens
+        int seq_idx = i / D;
+        int dim_idx = i % D;
         
-        // OPTIMIZATION: Coalesced copy with read-only cache
-        for (int d = tid; d < D; d += block_size) {
-            output_k[dst_offset + d] = __ldg(&draft_k[src_offset + d]);
-            output_v[dst_offset + d] = __ldg(&draft_v[src_offset + d]);
-        }
+        // Source: new_kv at [batch][head][seq_idx][dim_idx]
+        int src_idx = new_base_offset + seq_idx * D + dim_idx;
+        
+        // Destination: cache at [batch][head][start_pos + seq_idx][dim_idx]
+        int dst_seq_pos = start_pos + seq_idx;
+        int dst_idx = cache_base_offset + dst_seq_pos * stride_L + dim_idx;
+        
+        // OPTIMIZATION: Use __ldg for read-only cache on input data
+        // Direct write to cache (no intermediate buffer)
+        cache_k[dst_idx] = __ldg(&new_k[src_idx]);
+        cache_v[dst_idx] = __ldg(&new_v[src_idx]);
     }
 }
 
-// Wrapper function
-std::vector<torch::Tensor> kv_append_cuda(
-    torch::Tensor base_k,
-    torch::Tensor base_v,
-    torch::Tensor draft_k,
-    torch::Tensor draft_v,
-    torch::Tensor accepted_mask,
-    torch::Tensor accept_len,
-    int offset
+// In-place KV cache update wrapper function
+// Writes new tokens directly into pre-allocated cache buffer
+void kv_append_inplace_cuda(
+    torch::Tensor cache_k,      // [B][H][Max_L][D] - pre-allocated key cache buffer
+    torch::Tensor cache_v,      // [B][H][Max_L][D] - pre-allocated value cache buffer
+    torch::Tensor new_k,        // [B][H][New_L][D] - new key tokens to write
+    torch::Tensor new_v,        // [B][H][New_L][D] - new value tokens to write
+    int start_pos               // Position in sequence dimension to start writing
 ) {
     // Input validation
-    TORCH_CHECK(base_k.dim() == 4, "base_k must be 4D tensor [B][H][L][D]");
-    TORCH_CHECK(base_v.dim() == 4, "base_v must be 4D tensor [B][H][L][D]");
-    TORCH_CHECK(draft_k.dim() == 4, "draft_k must be 4D tensor [B][H][K][D]");
-    TORCH_CHECK(draft_v.dim() == 4, "draft_v must be 4D tensor [B][H][K][D]");
-    TORCH_CHECK(accepted_mask.dim() == 2, "accepted_mask must be 2D tensor [B][K]");
-    TORCH_CHECK(accept_len.dim() == 1, "accept_len must be 1D tensor [B]");
+    TORCH_CHECK(cache_k.dim() == 4, "cache_k must be 4D tensor [B][H][Max_L][D]");
+    TORCH_CHECK(cache_v.dim() == 4, "cache_v must be 4D tensor [B][H][Max_L][D]");
+    TORCH_CHECK(new_k.dim() == 4, "new_k must be 4D tensor [B][H][New_L][D]");
+    TORCH_CHECK(new_v.dim() == 4, "new_v must be 4D tensor [B][H][New_L][D]");
     
-    TORCH_CHECK(base_k.device().is_cuda(), "base_k must be on CUDA");
-    TORCH_CHECK(base_v.device().is_cuda(), "base_v must be on CUDA");
-    TORCH_CHECK(draft_k.device().is_cuda(), "draft_k must be on CUDA");
-    TORCH_CHECK(draft_v.device().is_cuda(), "draft_v must be on CUDA");
+    TORCH_CHECK(cache_k.device().is_cuda(), "cache_k must be on CUDA");
+    TORCH_CHECK(cache_v.device().is_cuda(), "cache_v must be on CUDA");
+    TORCH_CHECK(new_k.device().is_cuda(), "new_k must be on CUDA");
+    TORCH_CHECK(new_v.device().is_cuda(), "new_v must be on CUDA");
     
-    int B = base_k.size(0);
-    int H = base_k.size(1);
-    int L = base_k.size(2);
-    int K = draft_k.size(2);
-    int D = base_k.size(3);
+    // Extract dimensions
+    int B = cache_k.size(0);
+    int H = cache_k.size(1);
+    int Max_L = cache_k.size(2);
+    int D = cache_k.size(3);
     
-    // Create output tensors
-    auto output_k = torch::zeros({B, H, L + K, D}, base_k.options());
-    auto output_v = torch::zeros({B, H, L + K, D}, base_v.options());
+    int New_L = new_k.size(2);
+    
+    // Validate dimensions match
+    TORCH_CHECK(cache_v.size(0) == B, "cache_v batch size must match cache_k");
+    TORCH_CHECK(cache_v.size(1) == H, "cache_v num_heads must match cache_k");
+    TORCH_CHECK(cache_v.size(2) == Max_L, "cache_v max_seq_len must match cache_k");
+    TORCH_CHECK(cache_v.size(3) == D, "cache_v head_dim must match cache_k");
+    
+    TORCH_CHECK(new_k.size(0) == B, "new_k batch size must match cache_k");
+    TORCH_CHECK(new_k.size(1) == H, "new_k num_heads must match cache_k");
+    TORCH_CHECK(new_k.size(3) == D, "new_k head_dim must match cache_k");
+    
+    TORCH_CHECK(new_v.size(0) == B, "new_v batch size must match cache_k");
+    TORCH_CHECK(new_v.size(1) == H, "new_v num_heads must match cache_k");
+    TORCH_CHECK(new_v.size(2) == New_L, "new_v seq_len must match new_k");
+    TORCH_CHECK(new_v.size(3) == D, "new_v head_dim must match cache_k");
+    
+    // Validate start_pos and bounds
+    TORCH_CHECK(start_pos >= 0, "start_pos must be non-negative");
+    TORCH_CHECK(start_pos + New_L <= Max_L, 
+                "start_pos + New_L (" + std::to_string(start_pos + New_L) + 
+                ") exceeds Max_L (" + std::to_string(Max_L) + ")");
+    
+    // Validate dtypes match
+    TORCH_CHECK(cache_k.dtype() == cache_v.dtype(), "cache_k and cache_v must have same dtype");
+    TORCH_CHECK(new_k.dtype() == new_v.dtype(), "new_k and new_v must have same dtype");
+    TORCH_CHECK(cache_k.dtype() == new_k.dtype(), "cache and new tensors must have same dtype");
     
     // Launch kernel with optimized grid configuration
     // OPTIMIZATION: Use 1D grid for better GPU occupancy
-    // This allows better work distribution across SMs
     const int threads_per_block = 256;
     dim3 block(threads_per_block);
     // 1D grid: One block per (batch, head) pair
     dim3 grid(B * H);
     
-    if (base_k.dtype() == torch::kFloat32) {
-        kv_append_kernel<float><<<grid, block>>>(
-            base_k.data_ptr<float>(),
-            base_v.data_ptr<float>(),
-            draft_k.data_ptr<float>(),
-            draft_v.data_ptr<float>(),
-            output_k.data_ptr<float>(),
-            output_v.data_ptr<float>(),
-            accepted_mask.data_ptr<uint8_t>(),
-            accept_len.data_ptr<int32_t>(),
-            B, H, L, K, D, offset
+    // Dispatch based on dtype
+    if (cache_k.dtype() == torch::kFloat32) {
+        kv_append_inplace_kernel<float><<<grid, block>>>(
+            cache_k.data_ptr<float>(),
+            cache_v.data_ptr<float>(),
+            new_k.data_ptr<float>(),
+            new_v.data_ptr<float>(),
+            B, H, Max_L, New_L, D,
+            start_pos
         );
-    } else if (base_k.dtype() == torch::kFloat16) {
-        kv_append_kernel<half><<<grid, block>>>(
-            base_k.data_ptr<half>(),
-            base_v.data_ptr<half>(),
-            draft_k.data_ptr<half>(),
-            draft_v.data_ptr<half>(),
-            output_k.data_ptr<half>(),
-            output_v.data_ptr<half>(),
-            accepted_mask.data_ptr<uint8_t>(),
-            accept_len.data_ptr<int32_t>(),
-            B, H, L, K, D, offset
+    } else if (cache_k.dtype() == torch::kFloat16) {
+        kv_append_inplace_kernel<half><<<grid, block>>>(
+            cache_k.data_ptr<half>(),
+            cache_v.data_ptr<half>(),
+            new_k.data_ptr<half>(),
+            new_v.data_ptr<half>(),
+            B, H, Max_L, New_L, D,
+            start_pos
         );
     } else {
-        throw std::runtime_error("Unsupported dtype for KV cache append");
+        throw std::runtime_error("Unsupported dtype for KV cache append: " + 
+                                std::string(cache_k.dtype().name()));
     }
     
-    // Check for errors
+    // Check for kernel launch errors
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        throw std::runtime_error("CUDA kernel launch failed: " + std::string(cudaGetErrorString(err)));
+        throw std::runtime_error("CUDA kernel launch failed: " + 
+                                std::string(cudaGetErrorString(err)));
     }
-    
-    return {output_k, output_v};
 }
 
 // Python binding
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("kv_append", &kv_append_cuda, "Append KV cache (CUDA)");
+    m.def("kv_append_inplace", &kv_append_inplace_cuda, 
+          "In-place KV cache update (CUDA) - writes new tokens into pre-allocated buffer");
 }

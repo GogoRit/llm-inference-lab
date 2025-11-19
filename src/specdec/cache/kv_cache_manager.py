@@ -2,6 +2,7 @@
 Centralized KV Cache Manager for Speculative Decoding
 
 Manages KV cache state with proper batch tracking to prevent dimension mismatches.
+Uses pre-allocated static buffers to avoid dynamic memory reallocation overhead.
 """
 
 import logging
@@ -15,21 +16,58 @@ logger = logging.getLogger(__name__)
 
 class SafeKVCacheManager:
     """
-    Centralized KV cache manager with explicit sequence length tracking.
+    Centralized KV cache manager with pre-allocated static buffers.
+
+    Uses pre-allocated tensors of shape [batch_size, num_heads, max_seq_len, head_dim]
+    to avoid expensive torch.cat() operations. Tracks current sequence length per
+    batch position and returns sliced views for compatibility with existing code.
 
     Tracks KV cache per global sequence ID and ensures alignment with
     actual sequence lengths (excluding padding).
     """
 
-    def __init__(self, device: str):
-        """Initialize the KV cache manager."""
+    def __init__(
+        self,
+        device: str,
+        max_seq_len: Optional[int] = None,
+        num_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        num_layers: Optional[int] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """
+        Initialize the KV cache manager.
+
+        Args:
+            device: Device to allocate buffers on
+            max_seq_len: Maximum sequence length (lazy-initialized if None)
+            num_heads: Number of attention heads (lazy-initialized if None)
+            head_dim: Dimension of each attention head (lazy-initialized if None)
+            num_layers: Number of transformer layers (lazy-initialized if None)
+            dtype: Data type for cache tensors (lazy-initialized if None)
+        """
         self.device = device
+        self.max_seq_len = max_seq_len
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_layers = num_layers
+        self.dtype = dtype
+
+        # Pre-allocated static buffers: Dict[layer_idx] -> [key_buffer, value_buffer]
+        # Shape: [batch_size, num_heads, max_seq_len, head_dim]
         self.base_cache: Optional[Dict[int, List[torch.Tensor]]] = None
         self.draft_cache: Optional[Dict[int, List[torch.Tensor]]] = None
+
+        # Track current sequence length per batch position
+        # Maps batch_position -> current_seq_len
+        # Note: batch_position is the index in the current batch (0 to batch_size-1)
+        self.base_current_seq_lens: List[int] = []
+        self.draft_current_seq_lens: List[int] = []
+
         self.current_batch_size: int = 0
         self.active_indices: Optional[torch.Tensor] = None
 
-        # Track sequence lengths per global sequence ID
+        # Track sequence lengths per global sequence ID (for compatibility)
         # Maps global_sequence_id -> actual_sequence_length (excluding padding)
         self.base_sequence_lengths: Dict[int, int] = {}
         self.draft_sequence_lengths: Dict[int, int] = {}
@@ -38,21 +76,30 @@ class SafeKVCacheManager:
         # Maps batch_index -> global_sequence_id
         self.batch_to_global_map: Dict[int, int] = {}
 
+        # Flag to track if buffers are initialized
+        self._buffers_initialized = False
+
     def reset(self) -> None:
         """Reset all cache state."""
         self.base_cache = None
         self.draft_cache = None
+        self.base_current_seq_lens = []
+        self.draft_current_seq_lens = []
         self.current_batch_size = 0
         self.active_indices = None
         self.base_sequence_lengths = {}
         self.draft_sequence_lengths = {}
         self.batch_to_global_map = {}
+        self._buffers_initialized = False
 
     def set_batch_size(self, batch_size: int) -> None:
         """Set current batch size - resets cache if batch size changes."""
         if self.current_batch_size != batch_size:
             self.reset()
             self.current_batch_size = batch_size
+            # Reset sequence length tracking for new batch size
+            self.base_current_seq_lens = [0] * batch_size
+            self.draft_current_seq_lens = [0] * batch_size
 
     def set_active_indices(self, active_indices: List[int]) -> None:
         """Set active indices for current batch."""
@@ -111,20 +158,92 @@ class SafeKVCacheManager:
         # Efficient filtering
         return cache_tensor.index_select(0, indices)
 
+    def _ensure_buffers_initialized(
+        self,
+        batch_size: int,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        max_seq_len: int,
+        dtype: torch.dtype,
+        cache_type: str = "base",
+    ) -> None:
+        """
+        Ensure pre-allocated buffers are initialized for the given dimensions.
+
+        Args:
+            batch_size: Batch size
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+            head_dim: Dimension of each attention head
+            max_seq_len: Maximum sequence length
+            dtype: Data type for buffers
+            cache_type: "base" or "draft"
+        """
+        cache = self.base_cache if cache_type == "base" else self.draft_cache
+        if cache is not None and len(cache) > 0:
+            # Check if existing buffers match dimensions
+            first_key = list(cache.values())[0][0]
+            if (
+                first_key.shape[0] == batch_size
+                and first_key.shape[1] == num_heads
+                and first_key.shape[2] == max_seq_len
+                and first_key.shape[3] == head_dim
+                and first_key.dtype == dtype
+                and len(cache) == num_layers
+            ):
+                # Buffers already initialized with correct dimensions
+                return
+
+        # Allocate new buffers
+        device_obj = (
+            torch.device(self.device) if isinstance(self.device, str) else self.device
+        )
+        new_cache = {}
+        for layer_idx in range(num_layers):
+            key_buffer = torch.zeros(
+                (batch_size, num_heads, max_seq_len, head_dim),
+                dtype=dtype,
+                device=device_obj,
+            )
+            value_buffer = torch.zeros(
+                (batch_size, num_heads, max_seq_len, head_dim),
+                dtype=dtype,
+                device=device_obj,
+            )
+            new_cache[layer_idx] = [key_buffer, value_buffer]
+
+        if cache_type == "base":
+            self.base_cache = new_cache
+            self.base_current_seq_lens = [0] * batch_size
+        else:
+            self.draft_cache = new_cache
+            self.draft_current_seq_lens = [0] * batch_size
+
+        # Update configuration
+        self.max_seq_len = max_seq_len
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_layers = num_layers
+        self.dtype = dtype
+        self._buffers_initialized = True
+
     def filter_kv_cache(
         self,
         cache: Optional[Dict[int, List[torch.Tensor]]],
         active_indices: Optional[torch.Tensor] = None,
+        current_seq_lens: Optional[List[int]] = None,
     ) -> Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
         """
-        Filter entire KV cache by active indices.
+        Filter entire KV cache by active indices and return sliced views.
 
         Args:
-            cache: Dict mapping layer_idx -> [key_tensor, value_tensor]
+            cache: Dict mapping layer_idx -> [key_buffer, value_buffer]
             active_indices: Optional tensor of active indices
+            current_seq_lens: Optional list of current sequence lengths per batch position
 
         Returns:
-            Tuple of (key, value) tuples per layer, or None if filtering fails
+            Tuple of (key, value) tuples per layer, sliced to current_seq_len, or None if filtering fails
         """
         if cache is None or len(cache) == 0:
             return None
@@ -133,16 +252,42 @@ class SafeKVCacheManager:
         if indices is None or indices.numel() == 0:
             return None
 
+        # Get current sequence lengths for active indices
+        if current_seq_lens is None:
+            # Use max length across all sequences (conservative)
+            max_len = (
+                max(self.base_current_seq_lens) if self.base_current_seq_lens else 0
+            )
+            seq_lens = [max_len] * indices.numel()
+        else:
+            # Use provided sequence lengths, indexed by active_indices
+            if isinstance(indices, torch.Tensor):
+                indices_list = indices.cpu().tolist()
+            else:
+                indices_list = list(indices)
+            seq_lens = [
+                current_seq_lens[i] if i < len(current_seq_lens) else 0
+                for i in indices_list
+            ]
+
         filtered_layers = []
         for layer_idx in sorted(cache.keys()):
-            key_tensor, value_tensor = cache[layer_idx]
-            filtered_key = self.filter_cache_layer(key_tensor, indices)
-            filtered_value = self.filter_cache_layer(value_tensor, indices)
+            key_buffer, value_buffer = cache[layer_idx]
+            filtered_key = self.filter_cache_layer(key_buffer, indices)
+            filtered_value = self.filter_cache_layer(value_buffer, indices)
 
             if filtered_key is None or filtered_value is None:
                 return None  # Filtering failed
 
-            filtered_layers.append((filtered_key, filtered_value))
+            # Slice to current sequence length (return view, not copy)
+            # Handle variable lengths by using max length (padding will be handled by attention mask)
+            max_seq_len = max(seq_lens) if seq_lens else filtered_key.shape[2]
+            filtered_layers.append(
+                (
+                    filtered_key[:, :, :max_seq_len, :],
+                    filtered_value[:, :, :max_seq_len, :],
+                )
+            )
 
         return tuple(filtered_layers)
 
@@ -153,90 +298,107 @@ class SafeKVCacheManager:
         tokens_appended: Optional[List[int]] = None,
     ) -> None:
         """
-        Update base cache with new KV cache for active sequences.
+        Update base cache with new KV cache using in-place assignment to pre-allocated buffers.
 
         Args:
             new_kv: New KV cache tuple for all active sequences
-            active_indices: List of active sequence indices (for filtering if needed)
+            active_indices: List of active sequence indices (batch positions)
             tokens_appended: Optional list of number of tokens appended per sequence
         """
         if new_kv is None or len(new_kv) == 0:
             return
 
-        # Initialize cache if needed
-        if self.base_cache is None:
-            self.base_cache = {}
+        # Infer dimensions from first KV cache if not initialized
+        if not self._buffers_initialized or self.base_cache is None:
+            first_key, first_value = new_kv[0]
+            batch_dim = first_key.shape[0]
+            num_heads = first_key.shape[1]
+            new_seq_len = first_key.shape[2]
+            head_dim = first_key.shape[3]
+            num_layers = len(new_kv)
+            dtype = first_key.dtype
 
-        # Convert active_indices to tensor if needed
-        if isinstance(active_indices, torch.Tensor):
-            active_tensor = active_indices
-        else:
-            if len(new_kv) > 0:
-                device = new_kv[0][0].device
-                active_tensor = torch.tensor(
-                    active_indices, dtype=torch.long, device=device
+            # Determine max_seq_len if not set
+            max_seq_len = self.max_seq_len
+            if max_seq_len is None:
+                # Estimate: use current sequence length + generous buffer (e.g., 2x)
+                # This is a conservative estimate; caller should set max_seq_len explicitly
+                estimated_max = new_seq_len * 4  # 4x buffer for safety
+                max_seq_len = estimated_max
+                logger.warning(
+                    f"max_seq_len not set, estimating {max_seq_len} from first KV cache. "
+                    "Consider setting max_seq_len explicitly for better memory efficiency."
                 )
-            else:
-                return
 
+            # Ensure batch size is set
+            if self.current_batch_size == 0:
+                self.current_batch_size = batch_dim
+                self.base_current_seq_lens = [0] * batch_dim
+
+            # Initialize buffers
+            self._ensure_buffers_initialized(
+                batch_size=self.current_batch_size,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                max_seq_len=max_seq_len,
+                dtype=dtype,
+                cache_type="base",
+            )
+
+        # Convert active_indices to list if tensor
+        if isinstance(active_indices, torch.Tensor):
+            active_indices_list = active_indices.cpu().tolist()
+        else:
+            active_indices_list = list(active_indices)
+
+        # Update each layer with in-place assignment
         for layer_idx, (key, value) in enumerate(new_kv):
-            # key/value shape: [active_count, num_heads, seq_len, head_dim]
-            batch_dim = key.shape[0]
+            if layer_idx not in self.base_cache:
+                raise RuntimeError(
+                    f"Layer {layer_idx} not found in pre-allocated cache. "
+                    "This should not happen if buffers were initialized correctly."
+                )
 
-            # Append to existing cache or create new
-            if layer_idx in self.base_cache:
-                existing_key = self.base_cache[layer_idx][0]
-                existing_value = self.base_cache[layer_idx][1]
+            key_buffer, value_buffer = self.base_cache[layer_idx]
+            new_seq_len = key.shape[2]  # Length of new KV cache
 
-                # Check if existing cache batch dimension matches
-                if existing_key.shape[0] == batch_dim:
-                    # Direct append along sequence dimension (dim=2)
-                    self.base_cache[layer_idx][0] = torch.cat(
-                        [existing_key, key.detach().contiguous()], dim=2
+            # Update each active sequence
+            for i, batch_pos in enumerate(active_indices_list):
+                if batch_pos >= len(self.base_current_seq_lens):
+                    logger.warning(
+                        f"batch_pos {batch_pos} >= len(current_seq_lens) {len(self.base_current_seq_lens)}, skipping"
                     )
-                    self.base_cache[layer_idx][1] = torch.cat(
-                        [existing_value, value.detach().contiguous()], dim=2
-                    )
-                elif existing_key.shape[
-                    0
-                ] == self.current_batch_size and batch_dim == len(active_indices):
-                    # Filter existing cache to active indices, then append
-                    filtered_key = self.filter_cache_layer(existing_key, active_tensor)
-                    filtered_value = self.filter_cache_layer(
-                        existing_value, active_tensor
+                    continue
+
+                current_pos = self.base_current_seq_lens[batch_pos]
+                new_pos = current_pos + new_seq_len
+
+                # Safety check: ensure we don't exceed max_seq_len
+                if new_pos > self.max_seq_len:
+                    raise RuntimeError(
+                        f"KV cache overflow: attempting to write {new_pos} tokens "
+                        f"but max_seq_len is {self.max_seq_len}. "
+                        f"batch_pos={batch_pos}, current_pos={current_pos}, new_seq_len={new_seq_len}"
                     )
 
-                    if filtered_key is not None and filtered_value is not None:
-                        self.base_cache[layer_idx][0] = torch.cat(
-                            [filtered_key, key.detach().contiguous()], dim=2
-                        )
-                        self.base_cache[layer_idx][1] = torch.cat(
-                            [filtered_value, value.detach().contiguous()], dim=2
-                        )
-                    else:
-                        # Filtering failed - reset with new cache
-                        self.base_cache[layer_idx] = [
-                            key.detach().contiguous(),
-                            value.detach().contiguous(),
-                        ]
-                else:
-                    # Batch dimension mismatch - reset
-                    self.base_cache[layer_idx] = [
-                        key.detach().contiguous(),
-                        value.detach().contiguous(),
-                    ]
-            else:
-                # New layer - initialize
-                self.base_cache[layer_idx] = [
-                    key.detach().contiguous(),
-                    value.detach().contiguous(),
-                ]
+                # In-place assignment: write new KV cache at current position
+                key_buffer[batch_pos, :, current_pos:new_pos, :] = (
+                    key[i].detach().contiguous()
+                )
+                value_buffer[batch_pos, :, current_pos:new_pos, :] = (
+                    value[i].detach().contiguous()
+                )
 
-        # Update sequence lengths if tokens_appended is provided
-        if tokens_appended is not None and len(tokens_appended) == len(active_indices):
-            # Get global sequence IDs for active indices
+                # Update current sequence length
+                self.base_current_seq_lens[batch_pos] = new_pos
+
+        # Update sequence lengths if tokens_appended is provided (for compatibility)
+        if tokens_appended is not None and len(tokens_appended) == len(
+            active_indices_list
+        ):
             for i, (batch_idx, tokens_added) in enumerate(
-                zip(active_indices, tokens_appended)
+                zip(active_indices_list, tokens_appended)
             ):
                 global_id = self.batch_to_global_map.get(batch_idx, None)
                 if global_id is not None:
@@ -249,52 +411,141 @@ class SafeKVCacheManager:
         self,
         new_kv: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]],
     ) -> None:
-        """Update draft cache with new tokens."""
+        """
+        Update draft cache with new tokens using in-place assignment to pre-allocated buffers.
+
+        Args:
+            new_kv: New KV cache tuple for all active sequences
+        """
         if new_kv is None or len(new_kv) == 0:
             return
 
-        # Initialize cache if needed
-        if self.draft_cache is None:
-            self.draft_cache = {}
+        # Infer dimensions from first KV cache if not initialized
+        if self.draft_cache is None or len(self.draft_cache) == 0:
+            first_key, first_value = new_kv[0]
+            batch_dim = first_key.shape[0]
+            num_heads = first_key.shape[1]
+            new_seq_len = first_key.shape[2]
+            head_dim = first_key.shape[3]
+            num_layers = len(new_kv)
+            dtype = first_key.dtype
 
+            # Determine max_seq_len if not set (use same as base cache if available)
+            max_seq_len = self.max_seq_len
+            if max_seq_len is None:
+                estimated_max = new_seq_len * 4
+                max_seq_len = estimated_max
+                logger.warning(
+                    f"max_seq_len not set for draft cache, estimating {max_seq_len}. "
+                    "Consider setting max_seq_len explicitly."
+                )
+
+            # Ensure batch size is set
+            if self.current_batch_size == 0:
+                self.current_batch_size = batch_dim
+                self.draft_current_seq_lens = [0] * batch_dim
+
+            # Initialize buffers
+            self._ensure_buffers_initialized(
+                batch_size=self.current_batch_size,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                max_seq_len=max_seq_len,
+                dtype=dtype,
+                cache_type="draft",
+            )
+
+        # Update each layer with in-place assignment
         for layer_idx, (key, value) in enumerate(new_kv):
-            if layer_idx in self.draft_cache:
-                existing_key = self.draft_cache[layer_idx][0]
-                existing_value = self.draft_cache[layer_idx][1]
+            if layer_idx not in self.draft_cache:
+                raise RuntimeError(
+                    f"Layer {layer_idx} not found in pre-allocated draft cache."
+                )
 
-                # Verify batch dimension matches
-                if existing_key.shape[0] == key.shape[0]:
-                    # Append along sequence dimension (dim=2 for [B, H, L, D])
-                    self.draft_cache[layer_idx][0] = torch.cat(
-                        [existing_key, key.detach().contiguous()], dim=2
+            key_buffer, value_buffer = self.draft_cache[layer_idx]
+            new_seq_len = key.shape[2]
+            batch_dim = key.shape[0]
+
+            # Update each sequence in batch
+            for batch_pos in range(batch_dim):
+                if batch_pos >= len(self.draft_current_seq_lens):
+                    logger.warning(
+                        f"batch_pos {batch_pos} >= len(draft_current_seq_lens), skipping"
                     )
-                    self.draft_cache[layer_idx][1] = torch.cat(
-                        [existing_value, value.detach().contiguous()], dim=2
+                    continue
+
+                current_pos = self.draft_current_seq_lens[batch_pos]
+                new_pos = current_pos + new_seq_len
+
+                # Safety check
+                if new_pos > self.max_seq_len:
+                    raise RuntimeError(
+                        f"Draft KV cache overflow: attempting to write {new_pos} tokens "
+                        f"but max_seq_len is {self.max_seq_len}. "
+                        f"batch_pos={batch_pos}, current_pos={current_pos}, new_seq_len={new_seq_len}"
                     )
-                else:
-                    # Batch mismatch - reset
-                    self.draft_cache[layer_idx] = [
-                        key.detach().contiguous(),
-                        value.detach().contiguous(),
-                    ]
-            else:
-                # New layer - initialize
-                self.draft_cache[layer_idx] = [
-                    key.detach().contiguous(),
-                    value.detach().contiguous(),
-                ]
+
+                # In-place assignment
+                key_buffer[batch_pos, :, current_pos:new_pos, :] = (
+                    key[batch_pos].detach().contiguous()
+                )
+                value_buffer[batch_pos, :, current_pos:new_pos, :] = (
+                    value[batch_pos].detach().contiguous()
+                )
+
+                # Update current sequence length
+                self.draft_current_seq_lens[batch_pos] = new_pos
 
     def get_base_past_kv(
         self, active_indices: Optional[torch.Tensor] = None
     ) -> Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
-        """Get filtered base past_key_values for active sequences."""
-        return self.filter_kv_cache(self.base_cache, active_indices)
+        """
+        Get filtered base past_key_values for active sequences.
+
+        Returns sliced views of pre-allocated buffers, sliced to current sequence length.
+        """
+        return self.filter_kv_cache(
+            self.base_cache, active_indices, self.base_current_seq_lens
+        )
 
     def get_draft_past_kv(
         self, active_indices: Optional[torch.Tensor] = None
     ) -> Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
-        """Get filtered draft past_key_values for active sequences."""
-        return self.filter_kv_cache(self.draft_cache, active_indices)
+        """
+        Get filtered draft past_key_values for active sequences.
+
+        Returns sliced views of pre-allocated buffers, sliced to current sequence length.
+        """
+        return self.filter_kv_cache(
+            self.draft_cache, active_indices, self.draft_current_seq_lens
+        )
+
+    def get_current_cache(
+        self,
+        cache_type: str = "base",
+        active_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
+        """
+        Get current cache as sliced views of pre-allocated buffers.
+
+        This is the main accessor method that returns views sliced to current sequence length.
+        Compatible with PyTorch attention operations.
+
+        Args:
+            cache_type: "base" or "draft"
+            active_indices: Optional tensor of active indices
+
+        Returns:
+            Tuple of (key, value) tuples per layer, sliced to current_seq_len
+        """
+        cache = self.base_cache if cache_type == "base" else self.draft_cache
+        current_seq_lens = (
+            self.base_current_seq_lens
+            if cache_type == "base"
+            else self.draft_current_seq_lens
+        )
+        return self.filter_kv_cache(cache, active_indices, current_seq_lens)
 
     def set_sequence_metadata(
         self,
@@ -359,10 +610,9 @@ class SafeKVCacheManager:
         """
         Realign KV cache to match new sequence lengths after unpadding/repadding.
 
-        This compacts KV cache to remove padding entries and ensure each sequence's
-        KV cache matches its actual token length. The global_sequence_ids list should
-        be in the same order as the current batch (i.e., batch_idx i corresponds to
-        global_sequence_ids[i]).
+        With pre-allocated buffers, this method updates the current_seq_lens tracking
+        to reflect the new sequence lengths. The actual KV data in buffers remains unchanged
+        (views will automatically reflect the new lengths).
 
         Args:
             global_sequence_ids: List of global sequence IDs in current batch order
@@ -381,6 +631,11 @@ class SafeKVCacheManager:
             if cache_type == "base"
             else self.draft_sequence_lengths
         )
+        current_seq_lens = (
+            self.base_current_seq_lens
+            if cache_type == "base"
+            else self.draft_current_seq_lens
+        )
 
         if cache is None or len(cache) == 0:
             # No cache to realign, just update lengths
@@ -388,92 +643,22 @@ class SafeKVCacheManager:
                 lengths_dict[global_id] = new_length
             return
 
-        # Realign each layer
-        # Assumption: global_sequence_ids[i] corresponds to batch position i in current cache
-        for layer_idx in sorted(cache.keys()):
-            key_tensor, value_tensor = cache[layer_idx]
-            # Shape: [batch_size, num_heads, seq_len, head_dim]
-
-            batch_size, num_heads, current_seq_len, head_dim = key_tensor.shape
-
-            if batch_size != len(global_sequence_ids):
+        # Update current_seq_lens for each batch position
+        # Assumption: global_sequence_ids[i] corresponds to batch position i
+        for batch_idx, (global_id, new_length) in enumerate(
+            zip(global_sequence_ids, new_sequence_lengths)
+        ):
+            # Clamp new_length to max_seq_len (safety check)
+            if self.max_seq_len is not None and new_length > self.max_seq_len:
                 logger.warning(
-                    f"Batch size mismatch: cache has {batch_size}, "
-                    f"but {len(global_sequence_ids)} sequences provided. "
-                    f"Skipping realignment for layer {layer_idx}."
+                    f"new_length {new_length} > max_seq_len {self.max_seq_len}, clamping"
                 )
-                continue
+                new_length = self.max_seq_len
 
-            # For each sequence, extract KV up to its new length
-            realigned_keys = []
-            realigned_values = []
-
-            for batch_idx, (global_id, new_length) in enumerate(
-                zip(global_sequence_ids, new_sequence_lengths)
-            ):
-                # Clamp new_length to current_seq_len (can't extract more than exists)
-                extract_length = min(new_length, current_seq_len)
-
-                # Extract KV for this sequence up to extract_length
-                # Shape: [num_heads, extract_length, head_dim]
-                seq_key = key_tensor[batch_idx, :, :extract_length, :].clone()
-                seq_value = value_tensor[batch_idx, :, :extract_length, :].clone()
-
-                # If new_length > current_seq_len, we need to pad (shouldn't happen normally)
-                if new_length > current_seq_len:
-                    pad_length = new_length - current_seq_len
-                    seq_key = F.pad(
-                        seq_key, (0, 0, 0, pad_length), mode="constant", value=0.0
-                    )
-                    seq_value = F.pad(
-                        seq_value, (0, 0, 0, pad_length), mode="constant", value=0.0
-                    )
-
-                realigned_keys.append(seq_key)
-                realigned_values.append(seq_value)
-
-                # Update length tracking
-                lengths_dict[global_id] = new_length
-
-            if realigned_keys:
-                # Stack realigned KV: [batch_size, num_heads, max_new_length, head_dim]
-                max_new_length = max(new_sequence_lengths)
-
-                # Pad to max length if needed
-                padded_keys = []
-                padded_values = []
-                for key, value, new_length in zip(
-                    realigned_keys, realigned_values, new_sequence_lengths
-                ):
-                    if new_length < max_new_length:
-                        pad_length = max_new_length - new_length
-                        # Pad along sequence dimension (dim=1): (left, right) for 1D, but we need (0, 0, 0, pad_length) for 3D
-                        # F.pad for 3D: (pad_left_dim2, pad_right_dim2, pad_left_dim1, pad_right_dim1, pad_left_dim0, pad_right_dim0)
-                        # We want to pad only the sequence dimension (dim=1), so: (0, 0, 0, pad_length, 0, 0)
-                        key_padded = F.pad(
-                            key, (0, 0, 0, pad_length, 0, 0), mode="constant", value=0.0
-                        )
-                        value_padded = F.pad(
-                            value,
-                            (0, 0, 0, pad_length, 0, 0),
-                            mode="constant",
-                            value=0.0,
-                        )
-                        padded_keys.append(key_padded)
-                        padded_values.append(value_padded)
-                    else:
-                        padded_keys.append(key)
-                        padded_values.append(value)
-
-                # Stack: [batch_size, num_heads, max_new_length, head_dim]
-                new_key = torch.stack(padded_keys, dim=0)
-                new_value = torch.stack(padded_values, dim=0)
-
-                # Update cache for this layer
-                cache[layer_idx] = [
-                    new_key.detach().contiguous(),
-                    new_value.detach().contiguous(),
-                ]
+            # Update tracking
+            if batch_idx < len(current_seq_lens):
+                current_seq_lens[batch_idx] = new_length
+            lengths_dict[global_id] = new_length
 
         # Update batch size
         self.current_batch_size = len(global_sequence_ids)
