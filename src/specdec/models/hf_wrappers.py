@@ -766,22 +766,35 @@ class HFWrapper(LanguageModel):
             # Fallback: use current_seq_lens as total (assumes no new input)
             total_seq_lens = current_seq_lens
 
+        # CRITICAL: Get model dtype for SDPA compatibility
+        # SDPA expects float masks with additive semantics (0.0 = keep, -inf = mask)
+        model_dtype = self._torch_dtype
+        if hasattr(self, "_model") and hasattr(self._model, "dtype"):
+            model_dtype = self._model.dtype
+        elif hasattr(self, "_model") and hasattr(self._model, "config"):
+            # Fallback: try to get dtype from config
+            if hasattr(self._model.config, "torch_dtype"):
+                model_dtype = self._model.config.torch_dtype
+
         # Construct attention mask: [batch_size, 1, 1, target_length]
-        # CRITICAL: target_length must equal cache_len + input_len to match tensor dimensions
-        # But we mask based on actual valid lengths (current_seq_lens[b] + input_len)
-        attention_mask = torch.zeros(
+        # CRITICAL: Use additive masking for SDPA (0.0 = attend, -inf = mask)
+        # Initialize with -inf (masked) for all positions
+        min_value = torch.finfo(model_dtype).min
+        attention_mask = torch.full(
             (batch_size, 1, 1, target_length),
-            dtype=torch.long,
+            min_value,
+            dtype=model_dtype,
             device=device,
         )
 
-        # Set mask to 1 for valid positions (0 to total_seq_len-1)
+        # Set mask to 0.0 for valid positions (0 to total_seq_len-1)
+        # SDPA treats 0.0 as "attend" and -inf as "mask"
         # total_seq_len = current_seq_lens[b] + input_len (actual valid sequence length)
         for b, total_len in enumerate(total_seq_lens):
             # Clamp total_len to target_length (safety check)
             valid_len = min(total_len, target_length)
             if valid_len > 0:
-                attention_mask[b, 0, 0, :valid_len] = 1
+                attention_mask[b, 0, 0, :valid_len] = 0.0
 
         return attention_mask
 

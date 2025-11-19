@@ -80,17 +80,58 @@ class SafeKVCacheManager:
         self._buffers_initialized = False
 
     def reset(self) -> None:
-        """Reset all cache state."""
-        self.base_cache = None
-        self.draft_cache = None
-        self.base_current_seq_lens = []
-        self.draft_current_seq_lens = []
-        self.current_batch_size = 0
+        """
+        Reset cache state while preserving pre-allocated buffers.
+
+        CRITICAL: This acts as a ring buffer reset - we keep the heavy GPU tensors
+        (base_cache, draft_cache) alive to prevent VRAM fragmentation and OOM errors
+        during consecutive runs in K-sweep benchmarks. Only the sequence length pointers
+        are reset to zero, allowing the same VRAM block to be reused.
+        """
+        # PRESERVE buffers to act as ring buffer (prevent OOM/fragmentation)
+        # Do NOT clear self.base_cache or self.draft_cache - keep GPU tensors alive
+
+        # Only reset sequence length pointers (ring buffer pointers)
+        # Preserve batch_size from existing state if buffers exist
+        if self.base_cache is not None:
+            # Reset pointers to 0 for all batch positions, preserving batch size
+            batch_size = (
+                self.current_batch_size
+                if self.current_batch_size > 0
+                else (
+                    len(self.base_current_seq_lens) if self.base_current_seq_lens else 0
+                )
+            )
+            self.base_current_seq_lens = [0] * batch_size if batch_size > 0 else []
+        else:
+            self.base_current_seq_lens = []
+
+        if self.draft_cache is not None:
+            # Reset pointers to 0 for all batch positions, preserving batch size
+            batch_size = (
+                self.current_batch_size
+                if self.current_batch_size > 0
+                else (
+                    len(self.draft_current_seq_lens)
+                    if self.draft_current_seq_lens
+                    else 0
+                )
+            )
+            self.draft_current_seq_lens = [0] * batch_size if batch_size > 0 else []
+        else:
+            self.draft_current_seq_lens = []
+
+        # Reset metadata tracking (these are lightweight)
+        # Note: current_batch_size is preserved if buffers exist (for ring buffer reuse)
+        # Only reset if no buffers exist
+        if self.base_cache is None and self.draft_cache is None:
+            self.current_batch_size = 0
         self.active_indices = None
         self.base_sequence_lengths = {}
         self.draft_sequence_lengths = {}
         self.batch_to_global_map = {}
-        self._buffers_initialized = False
+
+        # Note: _buffers_initialized flag is preserved - buffers remain initialized
 
     def set_batch_size(self, batch_size: int) -> None:
         """Set current batch size - resets cache if batch size changes."""
