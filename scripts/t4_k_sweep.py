@@ -84,12 +84,13 @@ def warmup_run(
         # Enable KV cache for warmup
         os.environ["SPECDEC_ENABLE_KV_APPEND"] = "1"
 
-        # Run warmup generation
+        # Run warmup generation with greedy decoding (deterministic)
         _ = pipeline.generate_batch(
             prompts=[prompt],
             max_tokens=warmup_tokens,
-            temperature=0.7,
-            do_sample=False,
+            temperature=1e-5,  # Near-zero for greedy (avoid divide-by-zero)
+            do_sample=False,  # Greedy decoding
+            top_p=1.0,  # Disable top-p sampling
         )
 
         # Synchronize to ensure warmup completes
@@ -162,11 +163,14 @@ def run_benchmark(
             # Time the generation
             start_time = time.time()
 
+            # Enforce greedy decoding for deterministic acceptance rates
+            # This ensures draft and base models use the same sampling strategy
             results = pipeline.generate_batch(
                 prompts=[prompt],
                 max_tokens=max_tokens,
-                temperature=0.7,
-                do_sample=False,
+                temperature=1e-5,  # Near-zero for greedy (avoid divide-by-zero)
+                do_sample=False,  # Greedy decoding
+                top_p=1.0,  # Disable top-p sampling
             )
 
             # Force synchronization after generation

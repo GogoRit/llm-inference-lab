@@ -1779,6 +1779,15 @@ class SpeculativePipeline(SpeculativeDecoder):
         temperature = temperature or self.config["temperature"]
         do_sample = do_sample if do_sample is not None else self.config["do_sample"]
 
+        # Extract top_p from kwargs (default to 1.0 to disable top-p sampling)
+        top_p = kwargs.get("top_p", self.config.get("top_p", 1.0))
+
+        # CRITICAL: Log sampling parameters at the start for debugging acceptance rate issues
+        self.logger.info(
+            f"Sampling Params: temp={temperature:.6f}, top_p={top_p:.6f}, "
+            f"do_sample={do_sample}"
+        )
+
         # Baseline mode: non-speculative generation using only base model
         if not self.speculative_enabled:
             return self._generate_batch_baseline(
@@ -2467,10 +2476,16 @@ class SpeculativePipeline(SpeculativeDecoder):
                     )
 
                 # Apply temperature stabilization for draft model
-                # Use lower effective temperature to improve acceptance rate
-                draft_temperature = (
-                    max(temperature / 1.5, 0.1) if temperature is not None else 0.7
-                )
+                # For greedy decoding (temperature near zero, do_sample=False), use same temperature
+                # Otherwise, use lower effective temperature to improve acceptance rate
+                if not do_sample and temperature is not None and temperature < 0.01:
+                    # Greedy decoding: use same temperature for both models
+                    draft_temperature = temperature
+                else:
+                    # Sampling mode: use lower temperature for draft to improve acceptance
+                    draft_temperature = (
+                        max(temperature / 1.5, 0.1) if temperature is not None else 0.7
+                    )
 
                 # Prepare past_key_values for draft model using centralized KV cache manager
                 # ZERO-COPY: Pass current_seq_lens to model for proper attention masking
@@ -2890,11 +2905,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                         try:
                             # Use input_ids with draft tokens appended for parallel prefill processing
                             # We only need to generate 1 additional token (the bonus token)
+                            # CRITICAL: Use same temperature and do_sample as draft for greedy decoding
                             base_tokens, base_logits = self.base_lm.generate_tokens(
                                 verify_input_ids,  # Input with draft tokens appended (or original if no draft tokens)
                                 max_new_tokens=1,  # Only generate 1 token (bonus token) - draft tokens processed in prefill
-                                temperature=1.0,  # Temperature=1.0 for deterministic argmax
-                                do_sample=False,  # Always use greedy for verification
+                                temperature=temperature,  # Use same temperature as draft for consistency
+                                do_sample=do_sample,  # Use same do_sample as draft for consistency
                                 stream=verify_stream,
                                 past_key_values=base_past_kv,
                                 attention_mask=verify_attention_mask,  # Updated attention mask
@@ -3001,14 +3017,15 @@ class SpeculativePipeline(SpeculativeDecoder):
                             verify_input_ids, base_vocab_size, "base_input"
                         )
 
-                    # For verification, always use greedy (argmax) to ensure deterministic matching
+                    # For verification, use same parameters as draft for deterministic matching
                     # Use input_ids with draft tokens appended for parallel prefill processing
                     # We only need to generate 1 additional token (the bonus token)
+                    # CRITICAL: Use same temperature and do_sample as draft for greedy decoding
                     base_tokens, base_logits = self.base_lm.generate_tokens(
                         verify_input_ids,  # Input with draft tokens appended (or original if no draft tokens)
                         max_new_tokens=1,  # Only generate 1 token (bonus token) - draft tokens processed in prefill
-                        temperature=1.0,  # Temperature=1.0 for deterministic argmax
-                        do_sample=False,  # Always use greedy for verification
+                        temperature=temperature,  # Use same temperature as draft for consistency
+                        do_sample=do_sample,  # Use same do_sample as draft for consistency
                         past_key_values=base_past_kv,
                         attention_mask=verify_attention_mask,  # Updated attention mask
                         position_ids=verify_position_ids,  # Updated position IDs
