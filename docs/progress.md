@@ -14,7 +14,7 @@ The long-term goal is to provide open, reproducible baselines for speculative de
 
 ## Current Status Snapshot
 
-**As of 2025-11-18**
+**As of 2025-11-19**
 
 | Phase | Status | Key Deliverable | Completion Date |
 |-------|--------|----------------|-----------------|
@@ -29,17 +29,18 @@ The long-term goal is to provide open, reproducible baselines for speculative de
 | **3C** | Complete | CUDA/Triton kernels with registry system | 2025-10 |
 | **3C.5** | Complete | KV cache integration and validation | 2025-10-31 |
 | **3D** | Complete | GPU optimization and CUDA validation | 2025-11-03 |
-| **4A** | In Progress | Performance optimization and stabilization | 2025-11-04 |
+| **4A** | In Progress | Zero-Copy architecture and critical bug fixes | 2025-11-04 |
 | **4B** | Planned | Advanced quantization (INT8/INT4) | TBD |
 | **4C** | Planned | Layer/model parallelism for 7B+ models | TBD |
 | **4D** | Planned | Speculative tree decoding | TBD |
 
 **Summary Metrics**:
-- Total Lines of Code: ~3,200+
+- Total Lines of Code: ~4,300+
 - Test Coverage: 174 tests passing, 8 skipped, 4 deselected
 - Code Quality: 0 linting errors (Black, isort, flake8, mypy)
 - Phase 3D GPT2/DistilGPT2 (historical baseline): ~17.4 tok/s (CUDA T4, 32 tokens)
 - Phase 4A Llama 3.2 T4 small-batch sweep: BS=1: 8.45 tok/s, BS=2: 4.98 tok/s, BS=4: 4.68 tok/s (K=1, Llama 3.2 3B+1B, Tesla T4)
+- Phase 4A Zero-Copy: Constant verification time ~62ms (K=1-6, Tesla T4)
 - Success Rate: 100% across all validation runs
 
 ---
@@ -653,9 +654,62 @@ Phase 3D (Expected H100):        ~100 tok/s (CUDA H100, target)
 
 ---
 
-### Phase 4A: Performance Optimization and Stabilization (In Progress)
+### Phase 4A: Zero-Copy Architecture and Performance Optimization (In Progress)
 
-**Objective**: Optimize hot paths, reduce overhead, and stabilize codebase for paper submission and Tesla T4 testing.
+**Objective**: Implement Zero-Copy speculative decoding architecture, fix critical bugs, and optimize hot paths for paper submission and Tesla T4 testing.
+
+**Architectural Pivot (November 2025)**:
+
+We moved away from our initial "Pad-Append-Repad" strategy (similar to EqSpec/Ragged Tensor implementations). While theoretically correct, that approach introduced significant memory movement overhead (up to 40% of compute time) due to physical tensor slicing and concatenation.
+
+We have replaced this with a **Zero-Copy Speculative Decoding Engine** designed specifically for memory-constrained hardware (Tesla T4, 16GB).
+
+**Key Architectural Implementations**:
+
+1. **Pre-allocated Ring Buffer:**
+   - Replaced dynamic `torch.cat` with a static KV cache buffer allocated at initialization.
+   - Implemented a "Clamping" logic to cap context windows at 4096 tokens, preventing OOM errors on T4 GPUs when using models like Llama 3.2 (which default to 128k context).
+
+2. **In-Place CUDA Operations:**
+   - Developed custom CUDA kernels to write tokens directly into the pre-allocated buffer at specific indices.
+   - Implemented Python-side pointer arithmetic to manage sequence lengths without physical memory movement.
+
+3. **Pointer-Based Rollback:**
+   - Replaced tensor slicing with integer pointer manipulation.
+   - When draft tokens are rejected, we simply decrement the `current_seq_len` pointer. The invalidated data remains in VRAM but is masked out in subsequent steps, reducing rejection overhead to O(1).
+
+4. **Parallel Verification:**
+   - Refactored the verification step to process all K draft tokens in a single forward pass (prefill phase) rather than K sequential autoregressive steps.
+   - Updated HuggingFace wrappers to append draft tokens to input IDs and correctly mask the attention matrix for the combined sequence.
+
+**Recent Critical Fixes (November 2025)**:
+
+1. **Sequential Verification Bug Fix (2025-11-19)**:
+   - **Issue**: Verification time scaled linearly with K (60ms per token), indicating sequential autoregressive generation instead of parallel prefill.
+   - **Root Cause**: Base model was called with `max_new_tokens=k`, forcing K sequential generation steps.
+   - **Fix**: Append draft tokens to input_ids before verification, then call base model with `max_new_tokens=1` (only generate bonus token). Draft tokens are processed in parallel during prefill.
+   - **Impact**: Achieved constant verification time (~62ms) regardless of K value.
+   - **Files Modified**: `src/specdec/core/pipeline.py`, `src/scheduler/speculative_scheduler.py`
+
+2. **Off-by-One Indexing Error Fix (2025-11-19)**:
+   - **Issue**: IndexError when `accepted_len` equals draft size (K), causing crashes at intermediate K values.
+   - **Root Cause**: Bonus token logits were indexed at `prompt_base_logits[0, accepted_len, :]` instead of `prompt_base_logits[0, accepted_len - 1, :]`.
+   - **Fix**: Corrected index calculation to `accepted_len - 1` with bounds checking and safety checks for `accepted_len > 0`.
+   - **Impact**: Eliminated crashes, enabling full K-sweep benchmarks.
+   - **Files Modified**: `src/specdec/core/pipeline.py`
+
+3. **Variable Scope Error Fix (2025-11-19)**:
+   - **Issue**: UnboundLocalError for `verify_input_ids` when draft generation failed or returned 0 tokens.
+   - **Root Cause**: Variable was only defined inside conditional blocks, not initialized before all code paths.
+   - **Fix**: Initialize `verify_input_ids`, `verify_attention_mask`, and `verify_position_ids` before all verification paths, with proper handling for empty draft tokens (K=0 case).
+   - **Impact**: Robust error handling for edge cases.
+   - **Files Modified**: `src/specdec/core/pipeline.py`
+
+4. **Greedy Decoding Enforcement (2025-11-19)**:
+   - **Issue**: Low acceptance rate (~10%) for Llama 3.2 due to non-deterministic sampling causing draft and base models to diverge.
+   - **Fix**: Enforced greedy decoding in benchmark script (`temperature=1e-5`, `do_sample=False`, `top_p=1.0`). Updated pipeline to use same temperature for draft and base models in greedy mode. Added logging of sampling parameters.
+   - **Impact**: Improved acceptance rate by ensuring deterministic, consistent sampling between models.
+   - **Files Modified**: `scripts/t4_k_sweep.py`, `src/specdec/core/pipeline.py`
 
 **Completed Optimizations**:
 - **Hot Path Logging**: Removed `print()` statements from verify loop and scheduler hot paths, gated with `SPECDEC_DEBUG` flag
@@ -698,6 +752,14 @@ Phase 3D (Expected H100):        ~100 tok/s (CUDA H100, target)
 - Tesla T4 validation: 800 samples, 100% success
 - Performance: Stable (5.88 tok/s vs 5.97 tok/s baseline, within error margin)
 - Conclusion: Optimizations validated, no regression, ready for batch processing
+
+**Zero-Copy Architecture Next Steps**:
+
+1. **Fix HF Cache Integration:** Wrap our static buffer in a custom `transformers.Cache` object to ensure Llama 3.2 correctly utilizes cached states during the multi-token verification pass.
+
+2. **Restore Baseline Throughput:** Bring the parallel implementation back to the baseline of ~30 TPS before applying speculation.
+
+3. **Continuous Batching:** Once single-stream latency is optimized, implement iteration-level scheduling to handle concurrent requests.
 
 **Next Phase: 4A.1 - Batch Processing Optimization** (In Progress: 2025-11-05)
 - **Completed**: Removed all print() statements from batch processing hot paths
@@ -993,6 +1055,31 @@ speculative decoding experiments. https://github.com/GogoRit/llm-inference-lab
 
 ---
 
-**Last Updated**: 2025-11-18  
-**Current Status**: Phase 4A In Progress – Llama 3.2 T4 Batch Scaling Experiments Complete  
-**Next Milestone**: Fix Baseline Mode → Llama 3.2 K-Sweep → A100/H100 Validation → Phase 4B (Quantization)
+---
+
+### Zero-Copy Architecture Benchmarking Results (Tesla T4)
+
+We conducted K-Sweep benchmarks on Llama 3.2 3B (Base and Instruct) with the Zero-Copy architecture.
+
+**Successes:**
+- **Constant Verification Time:** We achieved a flat verification latency of ~62ms regardless of K (checking 1 token takes the same time as checking 5).
+- **Memory Stability:** The clamping and ring-buffer logic resolved previous OOM crashes, stabilizing VRAM usage around 10GB.
+- **Speedup Mechanism:** At K=3, we observed a theoretical speedup mechanism of >6x based on raw verify times.
+
+**Current Regressions:**
+- **Throughput Drop:** While the mechanism works, enabling the full parallel pipeline currently degrades TPS (from ~10 TPS to ~0.7 TPS).
+- **Root Cause:** The integration with the HuggingFace `LlamaModel` likely breaks the internal KV cache utilization during the parallel verify step, causing the model to re-compute the full attention matrix (quadratic complexity) rather than using the cached states.
+
+**Comparison with Previous Approaches**:
+
+| Strategy | Memory Management | Rejection Cost | Status |
+|----------|-------------------|----------------|--------|
+| **Standard PyTorch** | `torch.cat` (Alloc + Copy) | N/A | Baseline |
+| **Pad-Append (EqSpec)** | Unpad -> Append -> Repad | High (Memory Move) | Deprecated |
+| **Zero-Copy (Ours)** | Static Buffer + Pointers | Low (Pointer Update) | **Active** |
+
+---
+
+**Last Updated**: 2025-11-19  
+**Current Status**: Phase 4A In Progress – Zero-Copy Architecture Implemented, Critical Bugs Fixed  
+**Next Milestone**: Fix HF Cache Integration → Restore Baseline Throughput → Continuous Batching → Phase 4B (Quantization)

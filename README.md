@@ -1,6 +1,40 @@
-# LLM Inference Lab
+# Zero-Copy Speculative Decoding Engine
 
-LLM Inference Lab is a transparent, research-grade inference runtime for reproducible speculative decoding experiments across CPU, MPS, and CUDA.
+A high-performance LLM inference engine built from scratch, optimized for latency reduction on memory-constrained hardware (e.g., NVIDIA T4, Consumer GPUs).
+
+## Project Overview
+
+This project explores advanced techniques in Speculative Decoding to improve generation throughput without sacrificing output quality. Unlike standard implementations that rely on expensive memory operations to handle ragged tensors, this engine utilizes a **Zero-Copy** architecture based on pre-allocated memory arenas and pointer manipulation.
+
+## Key Architecture
+
+### 1. Pre-allocated Ring Buffer (KV Cache)
+
+Standard engines re-allocate memory at every decoding step. We allocate a static buffer (e.g., 4096 tokens) at startup. New tokens are written in-place, eliminating memory fragmentation and allocation overhead.
+
+### 2. Pointer-Based "Rewinding"
+
+In speculative decoding, rejecting draft tokens typically requires slicing tensors (rollback). We implement rollback by simply moving an integer pointer (`current_seq_len`). This reduces the cost of rejection to O(1), making aggressive speculation strategies viable even on lower-bandwidth GPUs.
+
+### 3. Parallel Verification
+
+The engine verifies K draft tokens in a single GPU forward pass. By treating draft tokens as a "mini-prompt" (prefill), we decouple verification latency from the draft length. Benchmarks on a Tesla T4 show constant verification time (~62ms) for K=1 through K=6.
+
+## Current Status: Research Prototype
+
+The engine is currently in the **Alpha** stage.
+
+- **Core Logic:** Implemented (Ring Buffer, Zero-Copy Rollback, Parallel Verify).
+- **Hardware Support:** Optimized for Tesla T4 (16GB VRAM) via context clamping.
+- **Performance:** The parallel verification mechanism is functional, but integration with standard HuggingFace model wrappers is currently undergoing optimization to resolve cache utilization regressions.
+
+## Comparison with Previous Approaches
+
+| Strategy | Memory Management | Rejection Cost | Status |
+|----------|-------------------|----------------|--------|
+| **Standard PyTorch** | `torch.cat` (Alloc + Copy) | N/A | Baseline |
+| **Pad-Append (EqSpec)** | Unpad -> Append -> Repad | High (Memory Move) | Deprecated |
+| **Zero-Copy (Ours)** | Static Buffer + Pointers | Low (Pointer Update) | **Active** |
 
 ## Strategy Note
 
@@ -378,13 +412,20 @@ CUDA validation completed successfully on Kaggle T4 hardware. Full K-sweep runs 
 - GPU compute optimization - Phase 1 (verify-loop kernel optimized, redundant syncs removed)
 
 **Remaining Roadmap**:
-- **Phase 4A.1**: GPU compute optimization - Phase 2 (profile utilization improvement, further optimizations)
-- **Dynamic batching**: Group sequences by length to reduce padding waste
-- **Larger GPU validation**: A100/H100 benchmarking for higher throughput targets
-- **Tokenizer-aware optimizations**: Reduce CPU-bound overhead
-- **Phase 4B**: Advanced quantization (INT8/INT4) for memory efficiency
-- **Phase 4C**: Multi-GPU support for 7B+ models
-- **Phase 4D**: Speculative tree decoding for improved acceptance rates
+- [x] **Zero-Copy Architecture**: Pre-allocated ring buffer, pointer-based rollback (Complete)
+- [x] **Parallel Verification**: Single forward pass for K draft tokens (Complete)
+- [x] **Sequential Verification Bug Fix**: Constant verify time achieved (~62ms) (Complete)
+- [x] **Off-by-One Indexing Fix**: Full K-sweep enabled (Complete)
+- [x] **Greedy Decoding Enforcement**: Improved acceptance rates (Complete)
+- [ ] **HF Cache Integration**: Fix HuggingFace cache utilization during parallel verify (Current Focus)
+- [ ] **Restore Baseline Throughput**: Bring parallel implementation to ~30 TPS baseline
+- [ ] **Continuous Batching**: Iteration-level scheduling for concurrent requests
+- [ ] **Phase 4A.1**: GPU compute optimization - Phase 2 (profile utilization improvement)
+- [ ] **Dynamic batching**: Group sequences by length to reduce padding waste
+- [ ] **Larger GPU validation**: A100/H100 benchmarking for higher throughput targets
+- [ ] **Phase 4B**: Advanced quantization (INT8/INT4) for memory efficiency
+- [ ] **Phase 4C**: Multi-GPU support for 7B+ models
+- [ ] **Phase 4D**: Speculative tree decoding for improved acceptance rates
 
 ### Phase 4B: Advanced Quantization (Planned)
 
@@ -421,4 +462,11 @@ speculative decoding experiments. https://github.com/GogoRit/llm-inference-lab
 
 ---
 
-**Status**: Phase 4A In Progress – Llama 3.2 T4 Batch Scaling Experiments Complete (2025-11-18)
+**Status**: Phase 4A In Progress – Zero-Copy Architecture Implemented, Critical Bugs Fixed (2025-11-19)
+
+**Recent Achievements (November 2025)**:
+- **Zero-Copy Architecture**: Pre-allocated ring buffer, pointer-based rollback implemented
+- **Parallel Verification**: Constant verification time (~62ms) achieved for K=1-6
+- **Sequential Verification Bug Fix**: Fixed linear scaling issue, enabling parallel prefill
+- **Off-by-One Indexing Fix**: Corrected bonus token retrieval, enabling full K-sweep
+- **Greedy Decoding Enforcement**: Improved acceptance rates with deterministic sampling
