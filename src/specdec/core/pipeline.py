@@ -3399,11 +3399,25 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 1
                             ]  # Number of draft tokens generated
 
-                            if accepted_len < k:
+                            if accepted_len > 0 and accepted_len < k:
                                 # We have logits at the mismatch position from verification
-                                # Use prompt_base_logits[0, accepted_len, :] for bonus token
+                                # CRITICAL FIX: If we accept L tokens, the logit generating the next token
+                                # (the bonus) is the output of processing the L-th token.
+                                # In 0-indexed notation, that is index L-1.
+                                # Safety check: accepted_len > 0 ensures we don't use index -1
+                                bonus_logit_idx = accepted_len - 1
+
+                                # Verify the index is within bounds
+                                if bonus_logit_idx >= prompt_base_logits.shape[1]:
+                                    self.logger.error(
+                                        f"IndexError: bonus_logit_idx {bonus_logit_idx} out of bounds "
+                                        f"for prompt_base_logits shape {prompt_base_logits.shape}"
+                                    )
+                                    # Fallback: use the last available logit
+                                    bonus_logit_idx = prompt_base_logits.shape[1] - 1
+
                                 bonus_logits = prompt_base_logits[
-                                    0, accepted_len, :
+                                    0, bonus_logit_idx, :
                                 ]  # [vocab_size]
 
                                 # Get generation parameters from kwargs or config
@@ -3431,7 +3445,8 @@ class SpeculativePipeline(SpeculativeDecoder):
                                 ):
                                     self.logger.debug(
                                         f"EQSPEC: Sampled bonus token {bonus_token_tensor.item()} "
-                                        f"from existing logits at position {accepted_len}"
+                                        f"from existing logits at position {bonus_logit_idx} "
+                                        f"(accepted_len={accepted_len})"
                                     )
                             elif accepted_len == k:
                                 # All draft tokens accepted - need forward pass for bonus token
