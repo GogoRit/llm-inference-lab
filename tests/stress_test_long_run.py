@@ -172,12 +172,12 @@ def run_stress_test(
         issues.append(f"Very slow generation: {tokens_per_sec:.1f} tok/s")
 
     if issues:
-        print("⚠️  ISSUES DETECTED:")
+        print("WARNING: ISSUES DETECTED:")
         for issue in issues:
             print(f"  - {issue}")
         return False
     else:
-        print("✅ Stress test passed: No major issues detected")
+        print("Stress test passed: No major issues detected")
         return True
 
 

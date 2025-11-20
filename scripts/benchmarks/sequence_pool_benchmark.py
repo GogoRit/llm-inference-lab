@@ -21,6 +21,7 @@ import torch
 try:
     from specdec.core.pipeline import SpeculativePipeline
     from specdec.models.hf_wrappers import HuggingFaceLanguageModel
+
     HAS_MODELS = True
 except ImportError:
     HAS_MODELS = False
@@ -37,7 +38,7 @@ def generate_synthetic_prompts(
 ) -> list:
     """
     Generate synthetic prompts with specified length distribution.
-    
+
     Args:
         num_prompts: Number of prompts to generate
         length_distribution: "normal" or "skewed"
@@ -45,12 +46,12 @@ def generate_synthetic_prompts(
         std_length: Standard deviation for normal distribution
         min_length: Minimum prompt length
         max_length: Maximum prompt length
-    
+
     Returns:
         List of prompt strings (just dummy text, length matters)
     """
     prompts = []
-    
+
     if length_distribution == "normal":
         lengths = np.random.normal(mean_length, std_length, num_prompts)
     elif length_distribution == "skewed":
@@ -58,22 +59,22 @@ def generate_synthetic_prompts(
         lengths = np.random.exponential(mean_length / 2, num_prompts)
     else:
         raise ValueError(f"Unknown distribution: {length_distribution}")
-    
+
     # Clamp to valid range
     lengths = np.clip(lengths, min_length, max_length).astype(int)
-    
+
     # Generate prompts (just dummy text, actual content doesn't matter)
     for length in lengths:
         prompt = " ".join(["word"] * length)
         prompts.append(prompt)
-    
+
     return prompts, lengths.tolist()
 
 
 def measure_memory_usage():
     """Measure current GPU memory usage in MB."""
     if torch.cuda.is_available():
-        return torch.cuda.memory_allocated() / (1024 ** 2)
+        return torch.cuda.memory_allocated() / (1024**2)
     return 0.0
 
 
@@ -85,7 +86,7 @@ def run_benchmark(
 ) -> dict:
     """
     Run a single benchmark iteration.
-    
+
     Returns:
         Dictionary with metrics
     """
@@ -94,15 +95,15 @@ def run_benchmark(
         os.environ["SPECDEC_ENABLE_SEQUENCE_POOL"] = "1"
     else:
         os.environ["SPECDEC_ENABLE_SEQUENCE_POOL"] = "0"
-    
+
     # Clear CUDA cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    
+
     # Measure memory before
     mem_before = measure_memory_usage()
-    
+
     # Run generation
     start_time = time.time()
     try:
@@ -117,20 +118,20 @@ def run_benchmark(
         print(f"Error during generation: {e}")
         success = False
         results = []
-    
+
     end_time = time.time()
     elapsed_time = end_time - start_time
-    
+
     # Measure memory after
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     mem_after = measure_memory_usage()
     mem_used = mem_after - mem_before
-    
+
     # Calculate metrics
     total_tokens = sum(len(r.get("generated_tokens", [])) for r in results)
     tokens_per_sec = total_tokens / elapsed_time if elapsed_time > 0 else 0.0
-    
+
     return {
         "success": success,
         "elapsed_time": elapsed_time,
@@ -147,16 +148,16 @@ def main():
     print("SEQUENCE POOL MICROBENCHMARK")
     print("=" * 80)
     print()
-    
+
     if not HAS_MODELS:
         print("Models not available. Exiting.")
         return
-    
+
     # Configuration
     num_prompts = 8
     max_tokens = 20
     num_runs = 3
-    
+
     # Test configurations
     test_configs = [
         {
@@ -172,12 +173,12 @@ def main():
             "std_length": 10,
         },
     ]
-    
+
     # Initialize pipeline (you'll need to provide actual models)
     print("Note: This benchmark requires actual model initialization.")
     print("Please modify this script to use your models.")
     print()
-    
+
     # For now, just demonstrate the synthetic prompt generation
     print("Generating synthetic prompts...")
     for config in test_configs:
@@ -188,12 +189,14 @@ def main():
             mean_length=config["mean_length"],
             std_length=config["std_length"],
         )
-        
+
         print(f"  Generated {len(prompts)} prompts")
-        print(f"  Length stats: min={min(lengths)}, max={max(lengths)}, "
-              f"mean={np.mean(lengths):.1f}, std={np.std(lengths):.1f}")
+        print(
+            f"  Length stats: min={min(lengths)}, max={max(lengths)}, "
+            f"mean={np.mean(lengths):.1f}, std={np.std(lengths):.1f}"
+        )
         print(f"  Length distribution: {lengths}")
-    
+
     print()
     print("=" * 80)
     print("BENCHMARK COMPLETE")
@@ -204,7 +207,7 @@ def main():
     print("2. Uncomment the benchmark runs below")
     print("3. Run: python benchmarks/benchmark_sequence_pool.py")
     print()
-    
+
     # Example benchmark structure (commented out)
     """
     pipeline = SpeculativePipeline(...)  # Initialize with your models
@@ -254,6 +257,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

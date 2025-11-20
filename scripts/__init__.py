@@ -1,15 +1,14 @@
 """
-Utility Scripts Module
+Scripts Module
 
-This module contains utility scripts for common tasks such as setup,
-deployment, monitoring, and maintenance.
+This module contains utility scripts for benchmarking, testing, and development.
 
 Scripts:
-- setup.py: Environment setup and dependency installation
-- deploy.py: Deployment automation
-- monitor.py: System monitoring and health checks
-- benchmark.py: Automated benchmarking
-- cleanup.py: Resource cleanup and maintenance
+- comprehensive_k_sweep.py: Main K-sweep benchmarking script
+- benchmarks/sequence_pool_benchmark.py: Sequence pool performance tests
+- dev/smoke_cuda.py: CUDA smoke tests
+- k_sweep/: K-sweep utilities (runner, plotting, results, utils)
+- microbench_verify.py: Micro-benchmark for verification
 """
 
 import sys

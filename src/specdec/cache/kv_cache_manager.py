@@ -393,6 +393,32 @@ class SafeKVCacheManager:
         else:
             active_indices_list = list(active_indices)
 
+        # Get sequence length from first layer (same for all layers)
+        first_key, _ = new_kv[0]
+        new_seq_len = first_key.shape[2]  # Length of new KV cache
+
+        # Calculate new positions for all active sequences (once, before layer loop)
+        new_positions = {}
+        for i, batch_pos in enumerate(active_indices_list):
+            if batch_pos >= len(self.base_current_seq_lens):
+                logger.warning(
+                    f"batch_pos {batch_pos} >= len(current_seq_lens) {len(self.base_current_seq_lens)}, skipping"
+                )
+                continue
+
+            current_pos = self.base_current_seq_lens[batch_pos]
+            new_pos = current_pos + new_seq_len
+
+            # Safety check: ensure we don't exceed max_seq_len
+            if new_pos > self.max_seq_len:
+                raise RuntimeError(
+                    f"KV cache overflow: attempting to write {new_pos} tokens "
+                    f"but max_seq_len is {self.max_seq_len}. "
+                    f"batch_pos={batch_pos}, current_pos={current_pos}, new_seq_len={new_seq_len}"
+                )
+
+            new_positions[batch_pos] = (current_pos, new_pos)
+
         # Update each layer with in-place assignment
         for layer_idx, (key, value) in enumerate(new_kv):
             if layer_idx not in self.base_cache:
@@ -402,26 +428,13 @@ class SafeKVCacheManager:
                 )
 
             key_buffer, value_buffer = self.base_cache[layer_idx]
-            new_seq_len = key.shape[2]  # Length of new KV cache
 
             # Update each active sequence
             for i, batch_pos in enumerate(active_indices_list):
-                if batch_pos >= len(self.base_current_seq_lens):
-                    logger.warning(
-                        f"batch_pos {batch_pos} >= len(current_seq_lens) {len(self.base_current_seq_lens)}, skipping"
-                    )
+                if batch_pos not in new_positions:
                     continue
 
-                current_pos = self.base_current_seq_lens[batch_pos]
-                new_pos = current_pos + new_seq_len
-
-                # Safety check: ensure we don't exceed max_seq_len
-                if new_pos > self.max_seq_len:
-                    raise RuntimeError(
-                        f"KV cache overflow: attempting to write {new_pos} tokens "
-                        f"but max_seq_len is {self.max_seq_len}. "
-                        f"batch_pos={batch_pos}, current_pos={current_pos}, new_seq_len={new_seq_len}"
-                    )
+                current_pos, new_pos = new_positions[batch_pos]
 
                 # In-place assignment: write new KV cache at current position
                 key_buffer[batch_pos, :, current_pos:new_pos, :] = (
@@ -431,8 +444,9 @@ class SafeKVCacheManager:
                     value[i].detach().contiguous()
                 )
 
-                # Update current sequence length
-                self.base_current_seq_lens[batch_pos] = new_pos
+        # Update current sequence length ONCE after processing all layers
+        for batch_pos, (current_pos, new_pos) in new_positions.items():
+            self.base_current_seq_lens[batch_pos] = new_pos
 
         # Update sequence lengths if tokens_appended is provided (for compatibility)
         if tokens_appended is not None and len(tokens_appended) == len(

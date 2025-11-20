@@ -62,7 +62,7 @@ def test_pad_unpad_lossless():
             f"  Unpadded: {unpadded.tolist()}"
         )
 
-    print("✅ PASSED: Unpad then repad is lossless")
+    print("PASSED: Unpad then repad is lossless")
 
 
 def test_unpad_append_repad():
@@ -117,7 +117,7 @@ def test_unpad_append_repad():
         lengths == expected_lengths
     ), f"Lengths mismatch: {lengths} != {expected_lengths}"
 
-    print("✅ PASSED: Unpad → append → repad works correctly")
+    print("PASSED: Unpad -> append -> repad works correctly")
 
 
 def test_position_ids_monotone_contiguous():
@@ -188,7 +188,7 @@ def test_position_ids_monotone_contiguous():
         seq_positions == expected_positions
     ), f"Single sequence positions not correct: {seq_positions}"
 
-    print("✅ PASSED: Position IDs are monotone and contiguous")
+    print("PASSED: Position IDs are monotone and contiguous")
 
 
 def test_attention_mask_excludes_padding():
@@ -234,7 +234,7 @@ def test_attention_mask_excludes_padding():
                 t == pad_token_id for t in padding_tokens
             ), f"Sequence {i}: Padding tokens should be {pad_token_id}, got {padding_tokens}"
 
-    print("✅ PASSED: Attention masks correctly exclude padding")
+    print("PASSED: Attention masks correctly exclude padding")
 
 
 def test_empty_batch():
@@ -260,7 +260,7 @@ def test_empty_batch():
     unpadded = unpad_sequences(batch_tensor, attention_mask)
     assert unpadded == [], f"Unpadded empty batch should be empty: {unpadded}"
 
-    print("✅ PASSED: Empty batch handled correctly")
+    print("PASSED: Empty batch handled correctly")
 
 
 def test_single_sequence():
@@ -289,7 +289,7 @@ def test_single_sequence():
     assert len(unpadded) == 1, "Should have one sequence"
     assert torch.equal(unpadded[0], seq), "Unpadded sequence should match original"
 
-    print("✅ PASSED: Single sequence handled correctly")
+    print("PASSED: Single sequence handled correctly")
 
 
 def run_all_tests():
@@ -309,13 +309,13 @@ def run_all_tests():
 
         print()
         print("=" * 80)
-        print("✅ ALL TESTS PASSED")
+        print("ALL TESTS PASSED")
         print("=" * 80)
         return True
     except AssertionError as e:
         print()
         print("=" * 80)
-        print(f"❌ TEST FAILED: {e}")
+        print(f"TEST FAILED: {e}")
         print("=" * 80)
         import traceback
 
@@ -324,7 +324,7 @@ def run_all_tests():
     except Exception as e:
         print()
         print("=" * 80)
-        print(f"❌ ERROR: {e}")
+        print(f"ERROR: {e}")
         print("=" * 80)
         import traceback
 

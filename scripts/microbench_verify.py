@@ -161,11 +161,13 @@ def benchmark_verify_prefix():
         print(f"\nAverage speedup: {avg_speedup:.2f}x")
 
         if avg_speedup >= 5.0:
-            print("✅ Target speedup (5x) achieved!")
+            print("Target speedup (5x) achieved!")
         else:
-            print(f"⚠️  Target speedup (5x) not achieved. Current: {avg_speedup:.2f}x")
+            print(
+                f"WARNING: Target speedup (5x) not achieved. Current: {avg_speedup:.2f}x"
+            )
     else:
-        print("\n⚠️  No valid speedup measurements available")
+        print("\nWARNING: No valid speedup measurements available")
 
 
 if __name__ == "__main__":

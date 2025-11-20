@@ -37,7 +37,9 @@ def main():
     if torch.cuda.is_available():
         print(f"CUDA device count: {torch.cuda.device_count()}")
         print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        print(
+            f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB"
+        )
     print(f"MPS available: {torch.backends.mps.is_available()}")
 
     # Determine device
@@ -70,10 +72,7 @@ def main():
 
         # Test generation
         res = pipe.generate(
-            "Say hi in 1 sentence.",
-            max_tokens=16,
-            temperature=0.7,
-            do_sample=True
+            "Say hi in 1 sentence.", max_tokens=16, temperature=0.7, do_sample=True
         )
 
         print(f"Generated text: {res['text']}")
@@ -82,9 +81,11 @@ def main():
         print(f"AMP enabled: {res.get('amp_enabled', 'unknown')}")
         print(f"Acceptance rate: {res.get('acceptance_rate', 0.0):.3f}")
         print(f"Tokens/sec: {res.get('tokens_per_sec', 0.0):.2f}")
-        
+
         if device == "cuda":
-            print(f"CUDA memory allocated: {res.get('cuda_mem_allocated_mb', 0):.1f} MB")
+            print(
+                f"CUDA memory allocated: {res.get('cuda_mem_allocated_mb', 0):.1f} MB"
+            )
             print(f"CUDA memory peak: {res.get('cuda_mem_peak_mb', 0):.1f} MB")
 
         # Validation
@@ -97,21 +98,30 @@ def main():
         # Check dtype (may vary based on device capabilities)
         actual_dtype = res.get("dtype", "unknown")
         if device in ["cuda", "mps"]:
-            assert actual_dtype in ["float16", "bfloat16", "torch.float16", "torch.bfloat16"], f"Unexpected dtype: {actual_dtype}"
+            assert actual_dtype in [
+                "float16",
+                "bfloat16",
+                "torch.float16",
+                "torch.bfloat16",
+            ], f"Unexpected dtype: {actual_dtype}"
         else:
-            assert actual_dtype in ["float32", "torch.float32"], f"Expected float32 on CPU, got {actual_dtype}"
+            assert actual_dtype in [
+                "float32",
+                "torch.float32",
+            ], f"Expected float32 on CPU, got {actual_dtype}"
 
         print("-" * 60)
-        print("✅ All smoke tests passed!")
-        print(f"✅ Device: {device.upper()}")
-        print(f"✅ Dtype: {actual_dtype}")
-        print(f"✅ AMP: {res.get('amp_enabled', False)}")
-        print(f"✅ Generated {len(res.get('generated_tokens', []))} tokens")
+        print("All smoke tests passed!")
+        print(f"Device: {device.upper()}")
+        print(f"Dtype: {actual_dtype}")
+        print(f"AMP: {res.get('amp_enabled', False)}")
+        print(f"Generated {len(res.get('generated_tokens', []))} tokens")
         print("=" * 60)
 
     except Exception as e:
-        print(f"❌ Smoke test failed: {e}")
+        print(f"Smoke test failed: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 
