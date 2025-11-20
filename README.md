@@ -214,3 +214,7 @@ export SPECDEC_BATCH_SIZE=4
 and adjust the output directory accordingly. For batch size four, max tokens was reduced to thirty two tokens in order to respect the memory limits of Tesla T4.
 
 These commands reproduce the T4 results where speculative decoding reaches around eight and a half tokens per second at batch size one, and where throughput and acceptance both drop at larger batch sizes. The non speculative Llama 3.2 baseline used the same script with the draft model argument omitted and the baseline mode enabled, as documented in the engineering appendix.
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
