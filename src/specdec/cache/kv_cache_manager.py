@@ -409,12 +409,15 @@ class SafeKVCacheManager:
             current_pos = self.base_current_seq_lens[batch_pos]
             new_pos = current_pos + new_seq_len
 
-            # Safety check: ensure we don't exceed max_seq_len
+            # CRITICAL: Hard assertion for ring buffer overflow (correctness testing)
+            # For CPU correctness, we require max_seq_len to be large enough.
+            # Wrap-around logic can be added later for production use.
             if new_pos > self.max_seq_len:
                 raise RuntimeError(
-                    f"KV cache overflow: attempting to write {new_pos} tokens "
+                    f"Ring buffer overflow: attempting to write {new_pos} tokens "
                     f"but max_seq_len is {self.max_seq_len}. "
-                    f"batch_pos={batch_pos}, current_pos={current_pos}, new_seq_len={new_seq_len}"
+                    f"batch_pos={batch_pos}, current_pos={current_pos}, new_seq_len={new_seq_len}. "
+                    f"Increase max_seq_len or disable wrap-around for correctness testing."
                 )
 
             new_positions[batch_pos] = (current_pos, new_pos)

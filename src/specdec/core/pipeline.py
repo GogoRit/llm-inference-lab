@@ -318,8 +318,25 @@ class SpeculativePipeline(SpeculativeDecoder):
         self.implementation = self.config.get("implementation", "fake")
         self.force_device = self.config.get("force_device")
 
-        # Phase 3D: ensure deterministic mode if requested via env
-        ensure_deterministic()
+        # Parse deterministic mode: check config first, then environment variable
+        # This flag controls whether duplication detection is disabled for correctness testing
+        # When True: draft==target, greedy decoding, no duplication filtering
+        config_deterministic = self.config.get("deterministic", False)
+        env_deterministic = os.getenv("SPECDEC_DETERMINISTIC", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.deterministic_mode = config_deterministic or env_deterministic
+
+        # Apply deterministic settings if enabled
+        if self.deterministic_mode:
+            ensure_deterministic()
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            self.logger.info(
+                "Deterministic mode enabled: duplication detection disabled for correctness testing"
+            )
 
         # Phase 3D: structured profiler (off unless SPECDEC_PROFILE=1)
         self.structured_profiler = create_structured_profiler(
@@ -336,18 +353,12 @@ class SpeculativePipeline(SpeculativeDecoder):
         self.graph_input_tensor = None
         # Use CUDA streams for parallelization instead
 
-        # Set deterministic flags
-        self.deterministic = self.config.get("deterministic", False)
-        if self.deterministic:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-
-        # Log startup configuration
-        self._log_startup_config()
-
         # Initialize models with dependency injection
         self.base_lm = base_lm or self._create_base_model()
         self.draft_lm = draft_lm or self._create_draft_model()
+
+        # Log startup configuration (after models are loaded to show actual model names)
+        self._log_startup_config()
 
         # CRITICAL: Initialize KV cache manager AFTER models are created
         # to get max_position_embeddings from model configs
@@ -555,10 +566,29 @@ class SpeculativePipeline(SpeculativeDecoder):
         device = self.force_device or self.device
         dtype = "float16" if device == "mps" else "float32"
 
+        # Use actual model names if models are already loaded, otherwise use config
+        if (
+            hasattr(self, "base_lm")
+            and self.base_lm
+            and hasattr(self.base_lm, "_model_name")
+        ):
+            base_model_name = self.base_lm._model_name
+        else:
+            base_model_name = self.config.get("base_model", "unknown")
+
+        if (
+            hasattr(self, "draft_lm")
+            and self.draft_lm
+            and hasattr(self.draft_lm, "_model_name")
+        ):
+            draft_model_name = self.draft_lm._model_name
+        else:
+            draft_model_name = self.config.get("draft_model", "unknown")
+
         self.logger.info(
             f"Startup config: impl={self.implementation}, device={device}, "
-            f"dtype={dtype}, base_model={self.config['base_model']}, "
-            f"draft_model={self.config['draft_model']}, max_draft={self.max_draft}, "
+            f"dtype={dtype}, base_model={base_model_name}, "
+            f"draft_model={draft_model_name}, max_draft={self.max_draft}, "
             f"max_tokens={self.config.get('max_new_tokens', 64)}"
         )
 
@@ -705,6 +735,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             policy=self.policy,
             tokenizer=tokenizer,
             base_lm=self.base_lm,
+            deterministic_mode=self.deterministic_mode,
             logger=self.logger,
         )
 
@@ -1216,23 +1247,11 @@ class SpeculativePipeline(SpeculativeDecoder):
                 # CUDA graph capture removed - incompatible with dynamic speculative decoding
                 # All paths use standard verification now
 
-                # CRITICAL FIX: Append draft tokens to input_ids for parallel verification
-                # The draft tokens will be processed in parallel during prefill, and we only need
-                # to generate 1 additional token (the bonus token) for verification
-                # Handle the case where draft_tokens might be empty (k=0 or generation failure)
-                if (
-                    draft_tokens is not None
-                    and draft_tokens.numel() > 0
-                    and draft_tokens.shape[1] > 0
-                ):
-                    verify_input_ids = torch.cat([current_input, draft_tokens], dim=1)
-                else:
-                    # Fallback: if no draft tokens, use original input (K=0 case)
-                    verify_input_ids = current_input
-                    if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
-                        self.logger.debug(
-                            f"Step {step}: No draft tokens available, using original input for verification"
-                        )
+                # CRITICAL FIX: Don't append draft tokens. Generate k+1 tokens from prompt
+                # and compare first k with draft tokens. This allows us to get logits
+                # at each position for proper verification.
+                # Use prompt only (don't append draft tokens)
+                verify_input_ids = current_input
 
                 # Single validation point before model call
                 base_vocab_size = get_vocab_size(self.base_lm)
@@ -1258,9 +1277,17 @@ class SpeculativePipeline(SpeculativeDecoder):
                     verify_time_ms = verify_info.get("verification_time_ms", 0.0)
                 else:
                     verify_start = time.time()
+                    # CRITICAL FIX: Generate k+1 tokens to get logits for all K draft positions + bonus token
+                    # Don't append draft tokens - generate k+1 from prompt and compare first k with draft
+                    k = (
+                        draft_tokens.shape[1]
+                        if draft_tokens is not None and draft_tokens.numel() > 0
+                        else 0
+                    )
+                    max_new_tokens_for_verification = k + 1 if k > 0 else 1
                     base_tokens, base_logits = self.base_lm.generate_tokens(
-                        verify_input_ids,  # Input with draft tokens appended
-                        max_new_tokens=1,  # Only generate 1 token (bonus token) - draft tokens processed in prefill
+                        current_input,  # Use prompt only, not appended draft tokens
+                        max_new_tokens=max_new_tokens_for_verification,  # Generate k+1 to get logits for all positions
                         temperature=temperature,
                         do_sample=do_sample,
                         **kwargs,
@@ -1639,6 +1666,10 @@ class SpeculativePipeline(SpeculativeDecoder):
         if tokenizer is None:
             raise ValueError("Base model must have a tokenizer for baseline mode")
 
+        # CRITICAL: Set padding_side BEFORE any tokenizer calls to avoid warnings
+        if hasattr(tokenizer, "padding_side"):
+            tokenizer.padding_side = "left"
+
         encoded = tokenizer(
             prompts,
             padding=True,
@@ -1946,6 +1977,7 @@ class SpeculativePipeline(SpeculativeDecoder):
             tokenizer=tokenizer,
             device=self.device,
             kv_cache_manager=self.kv_cache_manager,
+            deterministic_mode=self.deterministic_mode,
             logger=self.logger,
         )
 
@@ -2063,6 +2095,20 @@ class SpeculativePipeline(SpeculativeDecoder):
             else 0
         )
         mem_used_mb = (mem_after - mem_before) / (1024 * 1024)
+
+        # Calculate aggregate metrics for summary
+        total_proposed = batch_metrics["total_proposed"]
+        total_accepted = batch_metrics["total_accepted"]
+        acceptance_rate = total_accepted / max(total_proposed, 1)
+        total_generated = sum(len(r["generated_tokens"]) for r in results)
+
+        # Log clean INFO-level summary
+        self.logger.info(
+            f"specdec_run: prompts={batch_size}, max_tokens={max_tokens}, "
+            f"k={self.max_draft}, acceptance_rate={acceptance_rate:.2f}, "
+            f"proposed={total_proposed}, accepted={total_accepted}, "
+            f"deterministic={self.deterministic_mode}"
+        )
 
         if mem_after > 0:
             self.logger.info(

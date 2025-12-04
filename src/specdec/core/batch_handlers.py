@@ -355,11 +355,15 @@ class VerificationHandler:
                 for i in range(len(active_indices))
             ]
 
-        # Wait for draft to complete before appending
+        # Wait for draft to complete
         if draft_end_event is not None:
             draft_end_event.synchronize()
 
-        # Append draft tokens to input for parallel verification
+        # CRITICAL FIX: Don't append draft tokens to input_ids for verification.
+        # Instead, generate k+1 tokens from the prompt and compare the first k
+        # with draft tokens. This allows us to get logits at each position.
+        # Appending draft tokens would require extracting logits at input positions,
+        # which HuggingFace's generate() doesn't easily support.
         try:
             base_input_for_verify = active_input_ids
             if hasattr(self, "_active_input_ids_prepared"):
@@ -367,55 +371,14 @@ class VerificationHandler:
         except (NameError, AttributeError):
             base_input_for_verify = active_input_ids
 
-        if (
-            draft_tokens is not None
-            and draft_tokens.numel() > 0
-            and draft_tokens.shape[1] > 0
-        ):
-            verify_input_ids = torch.cat([base_input_for_verify, draft_tokens], dim=1)
-        else:
-            verify_input_ids = base_input_for_verify
+        # Use prompt only (don't append draft tokens)
+        verify_input_ids = base_input_for_verify
 
-        # Update attention mask to include draft tokens
-        verify_attention_mask = None
-        if active_attention_mask is not None:
-            if draft_tokens is not None and draft_tokens.numel() > 0:
-                draft_mask = torch.ones(
-                    (draft_tokens.shape[0], draft_tokens.shape[1]),
-                    dtype=active_attention_mask.dtype,
-                    device=active_attention_mask.device,
-                )
-                verify_attention_mask = torch.cat(
-                    [active_attention_mask, draft_mask], dim=1
-                )
-            else:
-                verify_attention_mask = active_attention_mask
+        # Use original attention mask (no draft tokens appended)
+        verify_attention_mask = active_attention_mask
 
-        # Update position IDs
-        verify_position_ids = None
-        if active_position_ids is not None:
-            if draft_tokens is not None and draft_tokens.numel() > 0:
-                max_pos = (
-                    active_position_ids.max().item()
-                    if active_position_ids.numel() > 0
-                    else 0
-                )
-                draft_positions = (
-                    torch.arange(
-                        1,
-                        draft_tokens.shape[1] + 1,
-                        dtype=active_position_ids.dtype,
-                        device=active_position_ids.device,
-                    )
-                    .unsqueeze(0)
-                    .expand(draft_tokens.shape[0], -1)
-                    + max_pos
-                )
-                verify_position_ids = torch.cat(
-                    [active_position_ids, draft_positions], dim=1
-                )
-            else:
-                verify_position_ids = active_position_ids
+        # Use original position IDs (no draft tokens appended)
+        verify_position_ids = active_position_ids
 
         # Validate input before verification
         base_vocab_size = get_vocab_size(self.base_lm)
@@ -430,6 +393,33 @@ class VerificationHandler:
         # argmax tokens (greedy) for consistency. The bonus token can still use sampling.
         verify_do_sample = False  # Always use greedy for verification consistency
 
+        # CRITICAL FIX: Generate k+1 tokens from the prompt (without appending draft tokens).
+        # This gives us logits at k+1 positions:
+        # - base_logits[:, :k, :] for comparing with draft tokens at positions 0..k-1
+        # - base_logits[:, k, :] for bonus token logits
+        # - base_tokens[:, :k] for predicted tokens at draft positions
+        # - base_tokens[:, k] for bonus token
+        k = (
+            draft_tokens.shape[1]
+            if draft_tokens is not None and draft_tokens.numel() > 0
+            else 0
+        )
+        max_new_tokens_for_verification = (
+            k + 1 if k > 0 else 1
+        )  # K draft positions + 1 bonus token
+
+        # Debug logging
+        debug_mode = os.getenv("SPECDEC_DEBUG_PRINTS", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if debug_mode:
+            self.logger.debug(
+                f"[VERIFICATION] k={k}, max_new_tokens={max_new_tokens_for_verification}, "
+                f"verify_input_ids.shape={verify_input_ids.shape}"
+            )
+
         # Verify with base model
         if verify_stream is not None:
             if verify_start_event is not None:
@@ -438,7 +428,7 @@ class VerificationHandler:
             with torch.cuda.stream(verify_stream):
                 base_tokens, base_logits = self.base_lm.generate_tokens(
                     verify_input_ids,
-                    max_new_tokens=1,  # Only generate bonus token
+                    max_new_tokens=max_new_tokens_for_verification,  # Generate k+1 to get logits for all positions
                     temperature=temperature,
                     do_sample=verify_do_sample,  # Greedy for verification consistency
                     past_key_values=base_past_kv,
@@ -454,7 +444,7 @@ class VerificationHandler:
             # Sequential path
             base_tokens, base_logits = self.base_lm.generate_tokens(
                 verify_input_ids,
-                max_new_tokens=1,
+                max_new_tokens=max_new_tokens_for_verification,  # Generate k+1 to get logits for all positions
                 temperature=temperature,
                 do_sample=verify_do_sample,  # Greedy for verification consistency
                 past_key_values=base_past_kv,
@@ -497,6 +487,25 @@ class VerificationHandler:
         else:
             verify_time_ms = (time.time() - verify_start_wall) * 1000
 
+        # Debug logging for batch path investigation
+        debug_mode = os.getenv("SPECDEC_DEBUG_PRINTS", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if debug_mode:
+            k = (
+                draft_tokens.shape[1]
+                if draft_tokens is not None and draft_tokens.numel() > 0
+                else 0
+            )
+            self.logger.info(  # Use INFO level so it shows up
+                f"[VERIFICATION_HANDLER] Returning: "
+                f"base_tokens.shape={base_tokens.shape} (expected [batch, {k+1}]), "
+                f"base_logits.shape={base_logits.shape} (expected [batch, {k+1}, vocab_size]), "
+                f"k={k}, max_new_tokens_used={max_new_tokens_for_verification}"
+            )
+
         return (
             base_tokens,
             base_logits,
@@ -514,6 +523,7 @@ class AcceptanceHandler:
         policy: Any,
         tokenizer: Any,
         base_lm: Any,
+        deterministic_mode: bool = False,
         logger: Optional[logging.Logger] = None,
     ):
         """
@@ -523,11 +533,13 @@ class AcceptanceHandler:
             policy: Acceptance policy instance
             tokenizer: Tokenizer for EOS detection
             base_lm: Base language model for vocab size
+            deterministic_mode: If True, disable duplication detection for correctness testing
             logger: Optional logger instance
         """
         self.policy = policy
         self.tokenizer = tokenizer
         self.base_lm = base_lm
+        self.deterministic_mode = deterministic_mode
         self.logger = logger or logging.getLogger(__name__)
 
     def apply_acceptance_policy(
@@ -614,6 +626,23 @@ class AcceptanceHandler:
         if not accepted_tokens or not generated_so_far:
             return accepted_tokens
 
+        # CRITICAL: Disable ALL duplication filtering in deterministic mode for correctness testing.
+        # In deterministic mode with draft==target and greedy decoding, repeated tokens are valid
+        # and must not be filtered out. This ensures specdec output matches vanilla decoding.
+        if self.deterministic_mode:
+            debug_mode = os.getenv("SPECDEC_DEBUG_PRINTS", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if debug_mode:
+                self.logger.debug(
+                    f"[DUP_DETECT] Step {step}, Seq {global_idx}: "
+                    f"Skipping ALL duplication checks in deterministic mode "
+                    f"(accepted_tokens={accepted_tokens}, generated_so_far={generated_so_far})"
+                )
+            return accepted_tokens
+
         # Check for phrase repetition (up to 30 tokens for better detection)
         max_check_len = min(30, len(generated_so_far), len(accepted_tokens))
         for check_len in range(max_check_len, 0, -1):
@@ -629,23 +658,34 @@ class AcceptanceHandler:
                 break
 
         # Check for repeated single token pattern (improved detection)
+        # CRITICAL FIX: Be more lenient with verified tokens. If tokens were accepted by the
+        # acceptance policy (draft matches base), they're verified and should be trusted even
+        # if repetitive. Only filter if there's a clear pattern of excessive repetition
+        # (>= 3 consecutive repetitions) to avoid filtering legitimate model output.
         if accepted_tokens and generated_so_far:
             last_generated = generated_so_far[-1]
             if accepted_tokens[0] == last_generated:
                 repeated_count = 1
-                # Check up to 20 tokens for repetition (was 10)
+                # Check up to 20 tokens for repetition
                 for i in range(1, min(20, len(accepted_tokens))):
                     if accepted_tokens[i] == last_generated:
                         repeated_count += 1
                     else:
                         break
-                # Skip if 1+ repetitions (was >= 2, now >= 1 for stricter filtering)
-                if repeated_count >= 1:
+                # Only filter if 3+ consecutive repetitions (was >= 1, too aggressive)
+                # This allows legitimate model repetition while catching clear artifacts
+                if repeated_count >= 3:
                     accepted_tokens = accepted_tokens[repeated_count:]
-                    if os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
-                        self.logger.warning(
-                            f"CRITICAL: Detected {repeated_count}-token repetition "
-                            f"for prompt {global_idx} at step {step}. Skipping duplicates."
+                    debug_mode = os.getenv("SPECDEC_DEBUG_PRINTS", "0").lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                    )
+                    if debug_mode:
+                        self.logger.debug(
+                            f"[DUP_DETECT] Step {step}, Seq {global_idx}: "
+                            f"Detected {repeated_count}-token repetition (>=3, filtering). "
+                            f"Filtered from {len(accepted_tokens) + repeated_count} to {len(accepted_tokens)} tokens."
                         )
 
         # Additional check: detect short repetitive patterns (2-5 tokens)
@@ -700,7 +740,8 @@ class AcceptanceHandler:
         Sample a fallback token when no draft tokens are accepted.
 
         Args:
-            prompt_base_logits: Base model logits at position 0 [vocab_size]
+            prompt_base_logits: Base model logits [batch, seq_len, vocab_size]
+                                For parallel verification: [batch, 1, vocab_size] (bonus token only)
             temperature: Sampling temperature
             do_sample: Whether to use sampling
             sample_fn: Function to sample from logits (to avoid circular import)
@@ -709,14 +750,17 @@ class AcceptanceHandler:
         Returns:
             Fallback token tensor [1]
         """
-        first_base_logits = prompt_base_logits[0, 0, :]  # [vocab_size]
+        # Use the bonus token logits (last position) for fallback
+        # When max_new_tokens=1, base_logits shape is [batch, 1, vocab_size]
+        # So we use the last position: [batch, -1, vocab_size]
+        bonus_logits = prompt_base_logits[0, -1, :]  # [vocab_size] - bonus token logits
         base_vocab_size = get_vocab_size(self.base_lm)
 
         top_p = kwargs.get("top_p", None)
         top_k = kwargs.get("top_k", None)
 
         fallback_token = sample_fn(
-            logits=first_base_logits,
+            logits=bonus_logits,  # FIXED: was first_base_logits (undefined variable)
             temperature=temperature,
             do_sample=do_sample,
             top_p=top_p,

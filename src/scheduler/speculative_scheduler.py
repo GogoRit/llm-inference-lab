@@ -305,15 +305,21 @@ class SpeculativeScheduler:
         """Batched verification for K>1."""
         start_time = time.time()
 
-        # For batched verification, we can potentially process multiple
-        # draft sequences in parallel, but for now we'll use single verification
-        # with optimized batching
+        # CRITICAL FIX: Generate k+1 tokens from prompt (don't append draft tokens to input_ids).
+        # This gives us logits at k+1 positions for proper verification:
+        # - base_logits[:, :k, :] for comparing with draft tokens
+        # - base_logits[:, k, :] for bonus token
+        k = (
+            draft_tokens.shape[1]
+            if draft_tokens is not None and draft_tokens.numel() > 0
+            else 0
+        )
+        max_new_tokens_for_verification = k + 1 if k > 0 else 1
+
         # For verification, always use greedy (argmax) to ensure deterministic matching
-        # CRITICAL FIX: input_ids now contains draft tokens appended, so we only need to generate 1 token (bonus token)
-        # The draft tokens are processed in parallel during prefill
         base_tokens, base_logits = base_model.generate_tokens(
-            input_ids,
-            max_new_tokens=1,  # Only generate 1 token (bonus token) - draft tokens processed in prefill
+            input_ids,  # Use prompt only (draft tokens not appended)
+            max_new_tokens=max_new_tokens_for_verification,  # Generate k+1 to get logits for all positions
             temperature=1.0,  # Temperature=1.0 for deterministic argmax
             do_sample=False,  # Always use greedy for verification
             **kwargs,

@@ -30,6 +30,18 @@ The engine implements three core ideas.
 
 The implementation integrates with Hugging Face models while maintaining a separate kernel registry for CUDA, Triton, and pure PyTorch backends so that all features have safe fallbacks.
 
+## Deterministic Mode
+
+The engine supports a **deterministic mode** for correctness verification. When enabled, speculative decoding must produce bit-identical output to vanilla greedy decoding under the following conditions:
+
+- **Perfect draft**: `draft_model == base_model` (same model used for both draft and verification)
+- **Greedy decoding**: `do_sample=False` (no sampling, deterministic token selection)
+- **Deterministic mode enabled**: Set via `SPECDEC_DETERMINISTIC=1` environment variable or `deterministic=True` in config
+
+In deterministic mode, duplication detection is **disabled** to allow valid repeated tokens that match vanilla decoding behavior. This ensures that speculative decoding preserves correctness even when models produce repetitive outputs.
+
+**Contract**: Under deterministic conditions, speculative decoding output must match vanilla greedy decoding token-by-token. This is enforced by the test suite in `tests/test_specdec_cpu_correctness.py` and `tests/test_deterministic_mode.py`.
+
 ## Current Status
 
 The project is in an active research prototype stage.

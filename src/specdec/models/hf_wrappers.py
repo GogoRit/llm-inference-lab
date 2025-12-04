@@ -1155,6 +1155,9 @@ class HFWrapper(LanguageModel):
 
     def encode_with_attention_mask(self, text: str) -> Dict[str, torch.Tensor]:
         """Encode text to token IDs with attention mask."""
+        # Ensure padding_side is set before encoding
+        if hasattr(self._tokenizer, "padding_side"):
+            self._tokenizer.padding_side = "left"  # type: ignore
         inputs = self._tokenizer(  # type: ignore
             text, return_tensors="pt", padding=True, truncation=True
         )
