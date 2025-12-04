@@ -23,9 +23,13 @@ class TestVerifyPrefix:
         # Set up known matches
         logits[0, 0, draft_ids[0, 0]] = 10.0  # Match
         logits[0, 1, draft_ids[0, 1]] = 10.0  # Match
-        logits[0, 2, draft_ids[0, 2] + 1] = 10.0  # No match
+        # No match: use a different token ID (ensure it's within bounds)
+        no_match_idx = (draft_ids[0, 2] + 1) % V
+        logits[0, 2, no_match_idx] = 10.0  # No match
 
-        logits[1, 0, draft_ids[1, 0] + 1] = 10.0  # No match
+        # No match for second batch: ensure within bounds
+        no_match_idx_1 = (draft_ids[1, 0] + 1) % V
+        logits[1, 0, no_match_idx_1] = 10.0  # No match
 
         # Test kernel
         accept_len, accepted_mask = verify_prefix(logits, draft_ids)
