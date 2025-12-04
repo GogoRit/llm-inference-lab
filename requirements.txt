@@ -32,3 +32,6 @@ black>=23.7.0,<24.0.0
 isort>=5.12.0,<6.0.0
 flake8>=6.0.0,<7.0.0
 mypy>=1.5.0,<2.0.0
+
+# Build tools (for CUDA kernels, optional but recommended)
+ninja>=1.11.0,<2.0.0
