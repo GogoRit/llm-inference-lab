@@ -428,9 +428,14 @@ def main():
     import csv
     csv_path = output_dir / "summary.csv"
     if all_results:
-        fieldnames = list(all_results[0].keys())
+        # Collect all possible fieldnames from all results
+        all_fieldnames = set()
+        for result in all_results:
+            all_fieldnames.update(result.keys())
+        fieldnames = sorted(list(all_fieldnames))
+        
         with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(all_results)
         logger.info(f"CSV saved to {csv_path}")
