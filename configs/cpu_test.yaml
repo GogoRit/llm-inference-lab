@@ -1,0 +1,17 @@
+# CPU test configuration for quick validation
+base_model: "gpt2"
+draft_model: "distilgpt2"
+
+device: "cpu"
+dtype: "float32"
+batch_size: 1
+max_tokens: 4
+iterations: 1
+
+k_values: [1]
+
+kv_append_enabled: true
+draft_force_hf_generate: false
+deterministic: false
+run_baseline: true
+

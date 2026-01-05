@@ -60,6 +60,7 @@ def run_comprehensive_k_sweep(
     use_prompt_suite: bool = True,
     t4_warmup: bool = False,
     reuse_pipeline: bool = False,
+    mode: str = "batch",
 ):
     """
     Run comprehensive K-sweep test.
@@ -82,6 +83,7 @@ def run_comprehensive_k_sweep(
         use_prompt_suite: If True and single_prompt is None, use PROMPT_SUITE
         t4_warmup: Enable T4-specific warmup and memory management
         reuse_pipeline: Reuse pipeline across K values (more efficient, T4-style)
+        mode: Generation mode ("batch" uses ring-buffer KV, "single" uses concatenation KV)
 
     Returns:
         Tuple of (results, detailed_results, run_metadata)
@@ -108,9 +110,12 @@ def run_comprehensive_k_sweep(
         batch_size = os.getenv("SPECDEC_BATCH_SIZE", "8")
         parallel_streams = os.getenv("SPECDEC_PARALLEL_STREAMS", "1")
         dtype_env = os.getenv("SPECDEC_DTYPE", "auto")
+        kv_append_env = os.getenv("SPECDEC_ENABLE_KV_APPEND", "auto")
         print(f"[STARTUP] SPECDEC_BATCH_SIZE: {batch_size}", flush=True)
         print(f"[STARTUP] SPECDEC_PARALLEL_STREAMS: {parallel_streams}", flush=True)
         print(f"[STARTUP] SPECDEC_DTYPE: {dtype_env}", flush=True)
+        print(f"[STARTUP] SPECDEC_ENABLE_KV_APPEND: {kv_append_env}", flush=True)
+        print(f"[STARTUP] Mode: {mode}", flush=True)
 
         # GPU memory
         total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
@@ -126,6 +131,35 @@ def run_comprehensive_k_sweep(
         print(f"[STARTUP] Running on {resolved_device} (not CUDA)", flush=True)
 
     print("=" * 80, flush=True)
+
+    # Log generation mode and KV append configuration
+    print(f"[STARTUP] Generation Mode: {mode}", flush=True)
+    if mode == "batch":
+        kv_append_default = "1"  # Default enabled for batch mode
+        kv_append_env = os.getenv("SPECDEC_ENABLE_KV_APPEND", kv_append_default)
+        print(
+            f"[STARTUP] KV Append: {kv_append_env} (default={kv_append_default} for batch mode, ring-buffer path)",
+            flush=True,
+        )
+    else:
+        kv_append_env = os.getenv("SPECDEC_ENABLE_KV_APPEND", "1")
+        print(
+            f"[STARTUP] KV Append: {kv_append_env} (WARNING: single mode uses concatenation, not ring-buffer)",
+            flush=True,
+        )
+    
+    # Log draft generation mode
+    draft_force_hf = os.getenv("SPECDEC_DRAFT_FORCE_HF_GENERATE", "0")
+    if draft_force_hf == "1":
+        print(
+            "[STARTUP] Draft Generation: HF generate() path (SPECDEC_DRAFT_FORCE_HF_GENERATE=1, no Python loop)",
+            flush=True,
+        )
+    else:
+        print(
+            "[STARTUP] Draft Generation: Auto (async loop for K>1 if CUDA stream available, else HF generate())",
+            flush=True,
+        )
 
     # Phase 3D: Dry-run mode (env flag only, minimal surface change)
     if os.getenv("SPECDEC_DRY_RUN", "0").lower() in ("1", "true", "yes"):
@@ -400,15 +434,27 @@ def run_comprehensive_k_sweep(
         k_failures = 0
 
         # OPTIMIZATION: Use batching to process multiple prompts at once
-        # For single prompt mode, use batch_size=1 (single generation)
-        # For prompt suite, use configured batch size
-        if len(prompts_to_use) == 1:
-            BATCH_SIZE = 1  # Single prompt = single generation
+        # Mode determines whether to use batch path (ring-buffer KV) or single path (concatenation KV)
+        if mode == "single":
+            # Single mode: use generate() path (concatenation KV, not zero-copy)
+            BATCH_SIZE = 1
             use_batch = False
+            logger.info(
+                "  Mode: single (WARNING: uses concatenation KV, not ring-buffer zero-copy)"
+            )
+        elif len(prompts_to_use) == 1:
+            # Batch mode with single prompt: still use generate_batch() with batch_size=1
+            # This ensures ring-buffer KV path is used
+            BATCH_SIZE = 1
+            use_batch = True
+            logger.info(
+                "  Mode: batch (single prompt, but using batch path for ring-buffer KV)"
+            )
         else:
+            # Batch mode with multiple prompts
             BATCH_SIZE = int(os.getenv("SPECDEC_BATCH_SIZE", "8"))
             use_batch = True
-        logger.info(f"  Using batch size: {BATCH_SIZE} (batch mode: {use_batch})")
+            logger.info(f"  Mode: batch (batch size: {BATCH_SIZE})")
 
         # Heartbeat tracking
         last_heartbeat_time = time.time()
@@ -509,14 +555,26 @@ def run_comprehensive_k_sweep(
                     if resolved_device == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize()
 
-                    # Generate for batch
+                    # Generate for batch or single
                     batch_start_time = time.time()
-                    batch_results = pipeline.generate_batch(
-                        prompts=batch_prompts,
-                        max_tokens=max_tokens,
-                        temperature=0.7,
-                        do_sample=True,
-                    )
+                    if use_batch:
+                        batch_results = pipeline.generate_batch(
+                            prompts=batch_prompts,
+                            max_tokens=max_tokens,
+                            temperature=0.7,
+                            do_sample=True,
+                        )
+                    else:
+                        # Single mode: use generate() path (not recommended for benchmarks)
+                        batch_results = [
+                            pipeline.generate(
+                                prompt=prompt,
+                                max_tokens=max_tokens,
+                                temperature=0.7,
+                                do_sample=True,
+                            )
+                            for prompt in batch_prompts
+                        ]
 
                     # GPU sync after batch to measure actual GPU time
                     if resolved_device == "cuda" and torch.cuda.is_available():
@@ -565,10 +623,12 @@ def run_comprehensive_k_sweep(
                         if not isinstance(generated_tokens_list, list):
                             generated_tokens_list = []
                         generated_tokens_count = len(generated_tokens_list)
-                        kv_appended = result.get("kv_appended_tokens_total", 0)
+                        kv_appended = result.get("kv_appended_tokens_total", result.get("kv_appended_tokens", 0))
                         kv_append_time = result.get("kv_append_time_ms", 0.0)
                         kv_append_enabled = result.get("kv_append_enabled", False)
                         kv_append_backend = result.get("kv_append_backend", "unknown")
+                        verify_backend = result.get("verify_backend", "unknown")
+                        draft_generation_mode = result.get("draft_generation_mode", "unknown")
 
                         # Validate metrics are not NaN or inf
                         if np.isnan(tokens_per_sec) or np.isinf(tokens_per_sec):
@@ -639,6 +699,9 @@ def run_comprehensive_k_sweep(
                             "kv_append_time_ms": kv_append_time,
                             "kv_append_enabled": kv_append_enabled,
                             "kv_append_backend": kv_append_backend,
+                            "verify_backend": verify_backend,
+                            "draft_generation_mode": draft_generation_mode,
+                            "mode": mode,  # Record generation mode
                             # For backward compatibility, `text` mirrors the generated completion (truncated).
                             "text": (
                                 completion_text[:100] + "..."
@@ -665,6 +728,7 @@ def run_comprehensive_k_sweep(
                             "accepted": accepted,
                             "kv_appended_tokens": kv_appended,
                             "kv_append_time_ms": kv_append_time,
+                            "kv_append_enabled": kv_append_enabled,  # Include for aggregation
                         }
                         k_results.append(result_data)
                         iter_results.append(result_data)
@@ -801,6 +865,13 @@ def run_comprehensive_k_sweep(
             accepted_counts = [r["accepted"] for r in valid_results]
             kv_appended_counts = [r["kv_appended_tokens"] for r in valid_results]
             kv_append_times = [r["kv_append_time_ms"] for r in valid_results]
+            kv_append_enabled_list = [
+                r.get("kv_append_enabled", False) for r in valid_results
+            ]
+            # Get most common kv_append_enabled value (should be consistent across results)
+            kv_append_enabled = (
+                kv_append_enabled_list[0] if kv_append_enabled_list else False
+            )
 
             # Clamp acceptance rate mean to [0.0, 1.0] for human readability
             # (raw values in detailed_results remain unclamped for debugging)
@@ -825,6 +896,7 @@ def run_comprehensive_k_sweep(
                     "kv_appended_tokens_std": np.std(kv_appended_counts),
                     "kv_append_time_ms_mean": np.mean(kv_append_times),
                     "kv_append_time_ms_std": np.std(kv_append_times),
+                    "kv_append_enabled": kv_append_enabled,  # Record KV append status
                     "proposed_mean": np.mean(proposed_counts),
                     "proposed_std": np.std(proposed_counts),
                     "accepted_mean": np.mean(accepted_counts),
@@ -833,6 +905,7 @@ def run_comprehensive_k_sweep(
                     "dtype": (
                         "float16" if resolved_device in ["cuda", "mps"] else "float32"
                     ),
+                    "mode": mode,  # Record generation mode
                 }
             )
 
@@ -993,5 +1066,5 @@ def run_comprehensive_k_sweep(
     return (
         results,
         detailed_results,
-        {"kernel_info": kinfo, "deterministic": deterministic},
+        {"kernel_info": kinfo, "deterministic": deterministic, "mode": mode},
     )

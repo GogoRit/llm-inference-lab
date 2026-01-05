@@ -1,0 +1,32 @@
+# T4 GPT2 + DistilGPT2 benchmark configuration
+# This config runs baseline and speculative decoding experiments on T4
+
+base_model: "gpt2"
+draft_model: "distilgpt2"  # Set to null for baseline-only run
+
+device: "cuda"
+dtype: "float16"
+batch_size: 1
+max_tokens: 32
+iterations: 10
+
+# K values to sweep (can be list or max_k for range 1..max_k)
+k_values: [1, 2, 3, 4]
+
+# KV cache settings
+kv_append_enabled: true  # Enable ring-buffer KV cache (default for batch mode)
+
+# Draft generation settings
+draft_force_hf_generate: false  # Set to true to force HF generate() path (no Python loop)
+
+# Deterministic mode
+deterministic: false
+
+# Whether to run baseline (non-speculative) comparison
+run_baseline: true
+
+# Prompts to use (defaults to 10-prompt suite if not specified)
+# prompts:
+#   - "Explain KV cache simply."
+#   - "What is the capital of France?"
+

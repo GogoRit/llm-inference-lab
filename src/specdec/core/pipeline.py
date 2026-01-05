@@ -1910,13 +1910,24 @@ class SpeculativePipeline(SpeculativeDecoder):
         if hasattr(self.draft_lm, "clear_kv_cache"):
             self.draft_lm.clear_kv_cache()
 
+        # For batch mode, default KV append to enabled (ring-buffer path)
+        # User can still disable via SPECDEC_ENABLE_KV_APPEND=0
+        kv_append_env = os.getenv("SPECDEC_ENABLE_KV_APPEND", "1")  # Default "1" for batch mode
         kv_cache_enabled = (
-            os.getenv("SPECDEC_ENABLE_KV_APPEND", "0") == "1"
+            kv_append_env == "1"
             and hasattr(self.base_lm, "supports_kv_append")
             and self.base_lm.supports_kv_append()
         )
 
         self.kv_cache_manager.set_batch_size(batch_size)
+
+        # Debug assertion: if batch mode and kv_append enabled, ensure ring buffer is initialized
+        if kv_cache_enabled and os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+            # This will be checked after first forward pass, but log expectation here
+            self.logger.debug(
+                f"[DEBUG] Batch mode with KV append enabled: "
+                f"Expecting ring buffer initialization after first forward pass"
+            )
 
         handlers = self._create_batch_handlers()
         current_input_ids = [batch_input_ids[i].clone() for i in range(batch_size)]
@@ -2060,8 +2071,17 @@ class SpeculativePipeline(SpeculativeDecoder):
 
                 kernel_info = get_kernel_info()
                 kv_append_backend = kernel_info.get("kv_append_backend", "unknown")
+                verify_backend = kernel_info.get("verify_backend", "unknown")
             except ImportError:
                 kv_append_backend = "unavailable"
+                verify_backend = "unavailable"
+            
+            # Get draft generation mode from draft model if available
+            draft_generation_mode = "unknown"
+            if hasattr(self.draft_lm, "_last_draft_generation_mode"):
+                draft_generation_mode = self.draft_lm._last_draft_generation_mode
+            elif hasattr(self.draft_lm, "get_draft_generation_mode"):
+                draft_generation_mode = self.draft_lm.get_draft_generation_mode()
 
             results.append(
                 {
@@ -2082,10 +2102,12 @@ class SpeculativePipeline(SpeculativeDecoder):
                     "draft_avg_ms": avg_draft_time,
                     "verify_avg_ms": avg_verify_time,
                     "batch_metrics": batch_metrics,
-                    "kv_append_enabled": False,
+                    "kv_append_enabled": kv_cache_enabled,  # Use actual value, not hardcoded False
                     "kv_append_backend": kv_append_backend,
-                    "kv_appended_tokens": 0,
-                    "kv_append_time_ms": 0.0,
+                    "verify_backend": verify_backend,
+                    "draft_generation_mode": draft_generation_mode,
+                    "kv_appended_tokens": 0,  # TODO: Track actual KV appended tokens in batch path
+                    "kv_append_time_ms": 0.0,  # TODO: Track actual KV append time in batch path
                 }
             )
 
@@ -2102,12 +2124,27 @@ class SpeculativePipeline(SpeculativeDecoder):
         acceptance_rate = total_accepted / max(total_proposed, 1)
         total_generated = sum(len(r["generated_tokens"]) for r in results)
 
+        # Debug assertion: verify ring buffer was used if kv_append enabled
+        if kv_cache_enabled and os.getenv("SPECDEC_DEBUG", "0").lower() in ("1", "true", "yes"):
+            if self.kv_cache_manager.base_cache is None:
+                self.logger.warning(
+                    "[DEBUG] KV append enabled but base_cache not initialized - "
+                    "ring buffer may not have been used"
+                )
+            elif len(self.kv_cache_manager.base_current_seq_lens) > 0:
+                max_seq_len = max(self.kv_cache_manager.base_current_seq_lens)
+                if max_seq_len > 0:
+                    self.logger.debug(
+                        f"[DEBUG] Ring buffer used: max_seq_len={max_seq_len}, "
+                        f"pointers={self.kv_cache_manager.base_current_seq_lens}"
+                    )
+
         # Log clean INFO-level summary
         self.logger.info(
             f"specdec_run: prompts={batch_size}, max_tokens={max_tokens}, "
             f"k={self.max_draft}, acceptance_rate={acceptance_rate:.2f}, "
             f"proposed={total_proposed}, accepted={total_accepted}, "
-            f"deterministic={self.deterministic_mode}"
+            f"deterministic={self.deterministic_mode}, kv_append_enabled={kv_cache_enabled}"
         )
 
         if mem_after > 0:

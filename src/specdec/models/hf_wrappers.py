@@ -187,8 +187,31 @@ class HFWrapper(LanguageModel):
                     input_ids, vocab_size, "generate_tokens"
                 )
 
-            # Use async generation if stream is provided and device is CUDA
-            if stream is not None and self._device == "cuda":
+            # Check if force HF generate() path is requested (for fair K-sweeps, avoids Python loop)
+            force_hf_generate = os.getenv("SPECDEC_DRAFT_FORCE_HF_GENERATE", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            
+            # Determine draft generation mode for logging
+            draft_generation_mode = "unknown"
+            if force_hf_generate:
+                draft_generation_mode = "hf_generate"
+            elif stream is not None and self._device == "cuda" and max_new_tokens > 1:
+                draft_generation_mode = "async_loop"
+            else:
+                draft_generation_mode = "hf_generate"
+            
+            # Use async generation if stream is provided and device is CUDA, UNLESS force_hf_generate is set
+            if (
+                stream is not None
+                and self._device == "cuda"
+                and not force_hf_generate
+                and max_new_tokens > 1  # Only use async for K > 1
+            ):
+                # Store mode for later retrieval
+                self._last_draft_generation_mode = "async_loop"
                 return self._generate_tokens_async(
                     input_ids,
                     max_new_tokens,
@@ -198,6 +221,9 @@ class HFWrapper(LanguageModel):
                     past_key_values=past_key_values,
                     **kwargs,
                 )
+            
+            # Store mode for later retrieval
+            self._last_draft_generation_mode = draft_generation_mode
 
             with torch.no_grad():
                 # Move input to device if needed
