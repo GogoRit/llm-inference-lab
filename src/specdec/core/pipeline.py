@@ -289,8 +289,12 @@ class SpeculativePipeline(SpeculativeDecoder):
         # Override config with provided parameters
         if base_model:
             self.config["base_model"] = base_model
-        if draft_model:
+        # Explicitly handle draft_model=None to enable baseline mode
+        if draft_model is not None:
             self.config["draft_model"] = draft_model
+        elif draft_model is None and "draft_model" in self.config:
+            # Explicitly set to None/empty to disable draft model
+            self.config["draft_model"] = None
         if max_draft:
             self.config["max_draft"] = max_draft
         if device is not None and device != "auto":
