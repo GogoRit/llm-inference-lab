@@ -117,7 +117,18 @@ def run_specdec(
     for k in k_values:
         logger.info(f"Running K={k}...")
         # Configure controller with desired K value
-        from src.specdec.policies.controllers import FixedKController
+        # Import from the installed package (works in both local and Colab)
+        try:
+            from specdec.policies.controllers import FixedKController
+        except ImportError:
+            # Fallback for direct script execution
+            import sys
+            from pathlib import Path
+            script_dir = Path(__file__).parent
+            src_dir = script_dir.parent / "src"
+            if str(src_dir) not in sys.path:
+                sys.path.insert(0, str(src_dir))
+            from specdec.policies.controllers import FixedKController
         pipeline.controller = FixedKController(k=k)
         
         for i in range(iterations):
