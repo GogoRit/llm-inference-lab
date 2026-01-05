@@ -116,6 +116,10 @@ def run_specdec(
     
     for k in k_values:
         logger.info(f"Running K={k}...")
+        # Configure controller with desired K value
+        from src.specdec.policies.controllers import FixedKController
+        pipeline.controller = FixedKController(k=k)
+        
         for i in range(iterations):
             iter_start = time.time()
             batch_results = pipeline.generate_batch(
@@ -123,7 +127,6 @@ def run_specdec(
                 max_tokens=max_tokens,
                 temperature=0.0,
                 do_sample=False,
-                k=k,
             )
             iter_time = time.time() - iter_start
             
@@ -377,14 +380,7 @@ def main():
     
     # Run specdec if draft_model is set
     if draft_model:
-        # Create specdec pipeline (with draft model)
-        specdec_pipeline = SpeculativePipeline(
-            base_model=base_model,
-            draft_model=draft_model,
-            device=resolved_device,
-            implementation="hf",
-        )
-        specdec_results = run_specdec(specdec_pipeline, prompts, max_tokens, iterations, k_values, resolved_device)
+        specdec_results = run_specdec(pipeline, prompts, max_tokens, iterations, k_values, resolved_device)
         all_results.extend(specdec_results)
     
     # Aggregate results

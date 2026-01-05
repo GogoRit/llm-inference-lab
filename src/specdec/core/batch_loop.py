@@ -205,6 +205,8 @@ class BatchGenerationLoop:
                 )
 
             # Step 1: Generate draft tokens
+            # Remove 'k' from kwargs if present to avoid conflict (k is already passed explicitly)
+            draft_kwargs = {key: val for key, val in kwargs.items() if key != "k"}
             (
                 draft_tokens,
                 draft_logits,
@@ -224,7 +226,7 @@ class BatchGenerationLoop:
                 draft_stream=draft_stream,
                 kv_cache_enabled=kv_cache_enabled,
                 verify_stream=verify_stream,
-                **kwargs,
+                **draft_kwargs,
             )
 
             # Step 2: Verify draft tokens
